@@ -1,0 +1,1 @@
+"""CLI 入口（record / extract / build_jsonl / stats / train_* / run_agent / smoke_test）。"""

@@ -1,0 +1,112 @@
+"""RealtimeAgent CLI 入口（M1 规则 / M2 学习快层）。
+
+用法（dry-run 默认安全）：
+    python -m idv_agent.scripts.run_agent --mode rule --duration 30
+    python -m idv_agent.scripts.run_agent --mode fast --fast-ckpt checkpoints/fast_controller/final.pt --duration 30
+    python -m idv_agent.scripts.run_agent --mode rule --send-input   # 真发送（仅自定义剧本/训练模式！）
+
+注意：
+- 默认 dry-run（只打印命令不发键鼠）。
+- --send-input 需要 pydirectinput，且**仅限官方自定义剧本/训练模式**（合规红线）。
+- F12 紧急退出，释放所有按住的键。
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from idv_agent.agent.action_executor import ActionExecutor
+from idv_agent.agent.memory import MatchMemory
+from idv_agent.agent.realtime_agent import RealtimeAgent
+from idv_agent.agent.rule_agent import RuleAgent
+from idv_agent.capture.screen_capture import CaptureConfig
+
+
+def parse_region(s: str):
+    parts = [int(x) for x in s.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("--region 需要 4 个整数：left,top,w,h")
+    return tuple(parts)
+
+
+def build_policy(args, device):
+    if args.mode == "rule":
+        from idv_agent.model.policy import RulePolicy
+        rp = RulePolicy(RuleAgent())
+        # 感知占位：给规则 agent 一个空 spatial（M1 未接视觉时先走 MOVE_LOOK 扫视）
+        return rp, None
+    if args.mode == "fast":
+        from idv_agent.configs.intent import INTENT_VECTOR_DIM
+        from idv_agent.configs.schema import NUM_CATEGORIES, NUM_CONTINUOUS
+        from idv_agent.model.dummy_vision import DummyVisionEncoder
+        from idv_agent.model.fast_controller import FastController
+        from idv_agent.model.policy import LearnedPolicy
+        from idv_agent.training.bc_fast import FastControllerWithSkeleton
+        from idv_agent.training.utils import load_checkpoint
+
+        vision = DummyVisionEncoder(hidden_size=args.vision_hidden)
+        _fast = FastController(
+            vision_encoder=vision, vision_hidden_size=args.vision_hidden,
+            intent_dim=INTENT_VECTOR_DIM, skeleton_dim=args.skeleton_dim,
+            num_categories=NUM_CATEGORIES, num_continuous=NUM_CONTINUOUS,
+        )
+        model = FastControllerWithSkeleton(
+            fast=_fast, skeleton_vocab_size=args.skeleton_vocab_size,
+            skeleton_dim=args.skeleton_dim,
+        ).to(device)
+        if args.fast_ckpt is not None and Path(args.fast_ckpt).exists():
+            ckpt = load_checkpoint(args.fast_ckpt, model, map_location=device)
+            print(f"[run_agent] 加载 fast ckpt step={ckpt.get('step','?')}")
+        else:
+            print("[run_agent] 无 ckpt → 随机初始化（仅供调试，行为不可控）")
+        policy = LearnedPolicy(model, device, image_size=args.image_size)
+        return policy, model
+    raise ValueError(f"未知 mode: {args.mode}")
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["rule", "fast"], default="rule",
+                   help="rule=M1规则闭环，fast=M2学习快层")
+    p.add_argument("--title", default="Identity V")
+    p.add_argument("--region", type=parse_region, default=None)
+    p.add_argument("--duration", type=float, default=30.0)
+    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--image-size", type=int, default=224)
+    p.add_argument("--vision-hidden", type=int, default=96)
+    p.add_argument("--skeleton-dim", type=int, default=32)
+    p.add_argument("--skeleton-vocab-size", type=int, default=16)
+    p.add_argument("--fast-ckpt", type=Path, default=None)
+    p.add_argument("--send-input", action="store_true", help="真发送键鼠（仅沙盒！）")
+    p.add_argument("--device", default="cpu")
+    args = p.parse_args()
+
+    import torch
+    device = torch.device(args.device)
+    policy, _ = build_policy(args, device)
+
+    capture_cfg = CaptureConfig(
+        fps=args.fps,
+        region=args.region,
+        window_title=args.title,
+    )
+    executor = ActionExecutor(dry_run=not args.send_input)
+    agent = RealtimeAgent(
+        policy=policy,
+        executor=executor,
+        capture_config=capture_cfg,
+        target_fps=args.fps,
+        memory=MatchMemory(),
+        slow_planner=None,   # M1 暂不接 VLM；M2 接入 slow_planner 需手动构造
+        device=device,
+    )
+    print(f"[run_agent] mode={args.mode}, dry_run={not args.send_input}, duration={args.duration}s")
+    max_frames = int(args.fps * args.duration)
+    agent.run(max_frames=max_frames)
+    print(f"[run_agent] 结束，帧数={agent.frame_count}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

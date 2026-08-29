@@ -1,0 +1,26 @@
+# 核心深度学习（版本对齐源码中 2080 Ti 约束）
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+transformers>=5.8
+peft>=0.19
+accelerate>=1.13
+sentencepiece
+
+# 模型源 / 多模态工具
+modelscope
+qwen-vl-utils
+
+# 采集与注入
+dxcam
+pynput
+pygetwindow
+pydirectinput
+
+# 视觉 / 数据处理
+opencv-python
+Pillow
+pandas
+numpy
+
+# 测试
+pytest
