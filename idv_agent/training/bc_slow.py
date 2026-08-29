@@ -198,6 +198,7 @@ def train_actor_critic(
                     numeric_labels=batch["numeric_action"],
                     attention_mask=batch.get("attention_mask"),
                     image_grid_thw=batch.get("image_grid_thw"),
+                    mm_token_type_ids=batch.get("mm_token_type_ids"),
                 )
                 loss = out.loss
             scaler.scale(loss).backward()
@@ -214,6 +215,7 @@ def train_actor_critic(
                 numeric_labels=batch["numeric_action"],
                 attention_mask=batch.get("attention_mask"),
                 image_grid_thw=batch.get("image_grid_thw"),
+                mm_token_type_ids=batch.get("mm_token_type_ids"),
             )
             loss = out.loss
             loss.backward()

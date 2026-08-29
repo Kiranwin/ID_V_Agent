@@ -156,35 +156,46 @@ class DecodeStateTracker:
         self.vault_key = keymap_vault
         self.params = params or ExtractParams()
         self._status = DecodeStatus()
+        # 退出（退出键或超时）后为 True：需等 interact_key 释放后才能重新进入破译态，
+        # 防止"Q 一直按住时退出键 tap 松开后的下一帧立即重入"（跨帧重入）。
+        self._await_release = False
 
     def status(self) -> DecodeStatus:
         return self._status
 
+    def _q_pressed(self, frame: FrameState) -> bool:
+        """Q 在本帧被按住（decode 需持续按住 Q，用 level 判定；短 tap 不视为破译）。"""
+        return self.interact_key in frame.held_durations_ms
+
+    def _exit_key_pressed(self, frame: FrameState) -> bool:
+        """退出键按下（level）或本帧刚被抬起（edge，覆盖两帧间的短退出 tap）。"""
+        return bool(self._EXIT_KEYS.intersection(frame.held_durations_ms)
+                    or self._EXIT_KEYS.intersection(frame.just_released_durations_ms))
+
     def on_frame(self, ts: int, frame: FrameState) -> DecodeStatus:
         """逐帧推进状态机。frame 携带本帧按键（按住/刚抬起）信息。"""
         st = self._status
+        has_exit = self._exit_key_pressed(frame)
+        q_held = self.interact_key in frame.held_durations_ms
+        timeout = bool(st.active and (ts - st.start_ts) / 1e6 > self.params.max_decode_duration_s * 1000.0)
 
-        # 退出条件：按下 WASD/技能/道具/地图/表情
-        if st.active and self._EXIT_KEYS.intersection(frame.held_durations_ms):
-            st = DecodeStatus(active=False)
-            self._status = st
-            return st
+        # 1) 退出：破译中遇退出键（含短 tap）或超时
+        if st.active and (has_exit or timeout):
+            self._status = DecodeStatus(active=False)
+            self._await_release = True     # 退出后须等 Q 释放才能再进入
+            return self._status
 
-        # 破译超时强制退出
-        if st.active and (ts - st.start_ts) / 1e6 > self.params.max_decode_duration_s * 1000.0:
-            st = DecodeStatus(active=False)
-            self._status = st
-            return st
+        # 2) 清除「等待释放」：Q 已不再按住 → 允许后续重新进入
+        if self._await_release and not q_held:
+            self._await_release = False
 
-        # 进入破译：Q 被按下（仅当无退出键同时按住时，避免"退出被重新进入抵消"）
-        if (not st.active
-                and self.interact_key in frame.held_durations_ms
-                and not self._EXIT_KEYS.intersection(frame.held_durations_ms)):
-            st = DecodeStatus(active=True, start_ts=ts)
-            self._status = st
-            return st
+        # 3) 进入破译：Q 被按住，且未在等待释放、无退出键
+        if (not st.active and not self._await_release
+                and not has_exit and self._q_pressed(frame)):
+            self._status = DecodeStatus(active=True, start_ts=ts)
+            return self._status
 
-        # 校准：破译中按 Space（保持破译态，标记校准）
+        # 4) 校准：破译中按 Space（保持破译态，标记校准）
         if st.active and self.vault_key in frame.held_durations_ms:
             st.calibration = True
             self._status = st

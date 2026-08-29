@@ -50,7 +50,7 @@ def test_decode_exit_not_rerun():
 
 
 def test_decode_reenter_after_exit_key_released():
-    """退出键松开后，再次按 Q 应能重新进入破译态（不能过度限制）。"""
+    """退出键松开且 Q 释放后再按 Q 才能重新进入破译态（防止"Q 一直按住"的重入）。"""
     import pandas as pd
     from idv_agent.labels.state_machine import DecodeStateTracker, StateReplay
 
@@ -59,7 +59,8 @@ def test_decode_reenter_after_exit_key_released():
         {"timestamp_ns": 0, "kind": "key_down", "code": "key:q", "value": 1},
         {"timestamp_ns": 500_000_000, "kind": "key_down", "code": "key:w", "value": 1},
         {"timestamp_ns": 600_000_000, "kind": "key_up", "code": "key:w", "value": 0},
-        {"timestamp_ns": 700_000_000, "kind": "key_down", "code": "key:q", "value": 1},
+        # Q 保持按住（未释放）：即便 W 已松开也不应重入
+        {"timestamp_ns": 700_000_000, "kind": "key_down", "code": "key:q", "value": 1},  # 无实质效果
     ])
     pos = pd.DataFrame(columns=["timestamp_ns", "x", "y"])
     replay = StateReplay(events, pos, end_ts_ns=end)
@@ -68,7 +69,35 @@ def test_decode_reenter_after_exit_key_released():
     tracker.on_frame(0, replay.frame_state(0, 0))
     tracker.on_frame(500_000_000, replay.frame_state(500_000_000, 0))
     assert not tracker.status().active, "W 使破译退出"
-    # W 松开(600ms)后, 700ms 再按 Q → 应重新进入
+    # Q 一直按住：不应重入（防跨帧重入）
     st = tracker.on_frame(700_000_000, replay.frame_state(700_000_000, 600_000_000))
-    assert st.active, "松开退出键后再按 Q 应重新进入破译态"
+    assert not st.active, "Q 未释放前不应重新进入破译态"
+
+
+def test_decode_reenter_after_q_released():
+    """Q 完全释放后再按 Q → 重新进入破译态。"""
+    import pandas as pd
+    from idv_agent.labels.state_machine import DecodeStateTracker, StateReplay
+
+    end = 5_000_000_000
+    events = pd.DataFrame([
+        {"timestamp_ns": 0, "kind": "key_down", "code": "key:q", "value": 1},
+        {"timestamp_ns": 500_000_000, "kind": "key_down", "code": "key:w", "value": 1},
+        {"timestamp_ns": 600_000_000, "kind": "key_up", "code": "key:w", "value": 0},
+        {"timestamp_ns": 700_000_000, "kind": "key_up", "code": "key:q", "value": 0},      # Q 释放
+        {"timestamp_ns": 800_000_000, "kind": "key_down", "code": "key:q", "value": 1},    # 再按 Q
+    ])
+    pos = pd.DataFrame(columns=["timestamp_ns", "x", "y"])
+    replay = StateReplay(events, pos, end_ts_ns=end)
+    tracker = DecodeStateTracker()
+
+    tracker.on_frame(0, replay.frame_state(0, 0))
+    tracker.on_frame(500_000_000, replay.frame_state(500_000_000, 0))
+    assert not tracker.status().active, "W 使破译退出"
+    # 中间帧(750ms)：Q 已释放且不再按住 → 清除等待释放
+    tracker.on_frame(750_000_000, replay.frame_state(750_000_000, 500_000_000))
+    # 再按 Q(800ms) → 应重入
+    st = tracker.on_frame(800_000_000, replay.frame_state(800_000_000, 750_000_000))
+    assert st.active, "Q 释放后再按 Q 应重新进入破译态"
+
 

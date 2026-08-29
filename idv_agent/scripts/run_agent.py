@@ -37,6 +37,7 @@ def build_policy(args, device):
         # 感知占位：给规则 agent 一个空 spatial（M1 未接视觉时先走 MOVE_LOOK 扫视）
         return rp, None
     if args.mode == "fast":
+        import torch
         from idv_agent.configs.intent import INTENT_VECTOR_DIM
         from idv_agent.configs.schema import NUM_CATEGORIES, NUM_CONTINUOUS
         from idv_agent.model.dummy_vision import DummyVisionEncoder
@@ -48,18 +49,40 @@ def build_policy(args, device):
         vision_hidden = args.vision_hidden
         skeleton_dim = args.skeleton_dim
         sk_vocab_size = args.skeleton_vocab_size
+        use_siglip = args.use_siglip
         ckpt = None
         if args.fast_ckpt is not None and Path(args.fast_ckpt).exists():
             import torch as _torch
             ckpt = _torch.load(args.fast_ckpt, map_location="cpu", weights_only=False)
+            if "model_state" not in ckpt:
+                raise ValueError(f"{args.fast_ckpt} 不是有效的 FastController checkpoint（缺 model_state）")
             meta = ckpt.get("extra", {}) or ckpt
             vision_hidden = int(meta.get("vision_hidden_size", vision_hidden))
             skeleton_dim = int(meta.get("skeleton_dim", skeleton_dim))
             sk_vocab_size = int(meta.get("skeleton_vocab_size", sk_vocab_size))
+            # 关键：视觉主干类型必须与训练一致。siglip 训练的 ckpt 若用 dummy 构造则视觉权重静默不匹配。
+            use_siglip = bool(meta.get("use_siglip", use_siglip))
+            if use_siglip:
+                vision_hidden = int(meta.get("vision_hidden_size", 768))
             print(f"[run_agent] ckpt 维度: vision_hidden={vision_hidden}, "
-                  f"skeleton_dim={skeleton_dim}, skeleton_vocab_size={sk_vocab_size}")
+                  f"skeleton_dim={skeleton_dim}, skeleton_vocab_size={sk_vocab_size}, "
+                  f"use_siglip={use_siglip}")
 
-        vision = DummyVisionEncoder(hidden_size=vision_hidden)
+        if use_siglip:
+            from idv_agent.model.siglip_vision_adapter import load_siglip_vision_encoder
+            try:
+                from modelscope import snapshot_download
+                siglip_path = snapshot_download("google/siglip2-base-patch16-224")
+            except Exception:
+                siglip_path = "google/siglip2-base-patch16-224"
+            vision, _, vision_hidden, _ = load_siglip_vision_encoder(
+                siglip_path, dtype=torch.float32, device=device, freeze=True,
+            )
+            print(f"[run_agent] 使用 SigLIP2 视觉主干 (hidden={vision_hidden})，"
+                  "注意：SigLIP 推理需真实模型权重可用")
+        else:
+            from idv_agent.model.dummy_vision import DummyVisionEncoder
+            vision = DummyVisionEncoder(hidden_size=vision_hidden)
         _fast = FastController(
             vision_encoder=vision, vision_hidden_size=vision_hidden,
             intent_dim=INTENT_VECTOR_DIM, skeleton_dim=skeleton_dim,
@@ -72,7 +95,7 @@ def build_policy(args, device):
         if ckpt is not None:
             missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
             if missing:
-                print(f"[run_agent] 警告：加载后缺失 {len(missing)} 个 key（维度可能不一致）：{missing}")
+                print(f"[run_agent] 警告：加载后缺失 {len(missing)} 个 key：{missing}")
             if unexpected:
                 print(f"[run_agent] 警告：{len(unexpected)} 个 key 未被使用")
             step = ckpt.get("step", "?")
@@ -97,6 +120,8 @@ def main() -> int:
     p.add_argument("--skeleton-dim", type=int, default=64, help="需与训练一致（bc_fast 默认 64）")
     p.add_argument("--skeleton-vocab-size", type=int, default=16)
     p.add_argument("--fast-ckpt", type=Path, default=None)
+    p.add_argument("--use-siglip", action="store_true",
+                   help="fast 模式：用 SigLIP2 vision（需真实权重）。有 ckpt 时以 ckpt 元数据为准")
     p.add_argument("--send-input", action="store_true", help="真发送键鼠（仅沙盒！）")
     p.add_argument("--device", default="cpu")
     args = p.parse_args()

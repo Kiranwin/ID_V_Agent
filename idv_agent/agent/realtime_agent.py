@@ -138,9 +138,8 @@ class RealtimeAgent:
                 print(f"[slow] error: {e}")
                 self.shared.last_plan_time = now
 
-    def run(self, max_frames: Optional[int] = None, send_input: bool = False,
-            slow_period_s: float = 2.0) -> None:
-        """运行主循环。send_input=True 且 executor 非 dry-run 时真实注入（合规：仅沙盒）。"""
+    def run(self, max_frames: Optional[int] = None, slow_period_s: float = 2.0) -> None:
+        """运行主循环。真实注入与否由构造时 executor 的 dry_run 决定（合规：仅沙盒）。"""
         # F12 紧急退出
         hotkeys = None
         try:
