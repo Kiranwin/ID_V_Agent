@@ -43,21 +43,40 @@ def build_policy(args, device):
         from idv_agent.model.fast_controller import FastController
         from idv_agent.model.policy import LearnedPolicy
         from idv_agent.training.bc_fast import FastControllerWithSkeleton
-        from idv_agent.training.utils import load_checkpoint
 
-        vision = DummyVisionEncoder(hidden_size=args.vision_hidden)
+        # 若给定了 ckpt，优先从 ckpt 的 extra 元数据恢复维度，避免与训练默认不一致导致静默部分加载
+        vision_hidden = args.vision_hidden
+        skeleton_dim = args.skeleton_dim
+        sk_vocab_size = args.skeleton_vocab_size
+        ckpt = None
+        if args.fast_ckpt is not None and Path(args.fast_ckpt).exists():
+            import torch as _torch
+            ckpt = _torch.load(args.fast_ckpt, map_location="cpu", weights_only=False)
+            meta = ckpt.get("extra", {}) or ckpt
+            vision_hidden = int(meta.get("vision_hidden_size", vision_hidden))
+            skeleton_dim = int(meta.get("skeleton_dim", skeleton_dim))
+            sk_vocab_size = int(meta.get("skeleton_vocab_size", sk_vocab_size))
+            print(f"[run_agent] ckpt 维度: vision_hidden={vision_hidden}, "
+                  f"skeleton_dim={skeleton_dim}, skeleton_vocab_size={sk_vocab_size}")
+
+        vision = DummyVisionEncoder(hidden_size=vision_hidden)
         _fast = FastController(
-            vision_encoder=vision, vision_hidden_size=args.vision_hidden,
-            intent_dim=INTENT_VECTOR_DIM, skeleton_dim=args.skeleton_dim,
+            vision_encoder=vision, vision_hidden_size=vision_hidden,
+            intent_dim=INTENT_VECTOR_DIM, skeleton_dim=skeleton_dim,
             num_categories=NUM_CATEGORIES, num_continuous=NUM_CONTINUOUS,
         )
         model = FastControllerWithSkeleton(
-            fast=_fast, skeleton_vocab_size=args.skeleton_vocab_size,
-            skeleton_dim=args.skeleton_dim,
+            fast=_fast, skeleton_vocab_size=sk_vocab_size,
+            skeleton_dim=skeleton_dim,
         ).to(device)
-        if args.fast_ckpt is not None and Path(args.fast_ckpt).exists():
-            ckpt = load_checkpoint(args.fast_ckpt, model, map_location=device)
-            print(f"[run_agent] 加载 fast ckpt step={ckpt.get('step','?')}")
+        if ckpt is not None:
+            missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+            if missing:
+                print(f"[run_agent] 警告：加载后缺失 {len(missing)} 个 key（维度可能不一致）：{missing}")
+            if unexpected:
+                print(f"[run_agent] 警告：{len(unexpected)} 个 key 未被使用")
+            step = ckpt.get("step", "?")
+            print(f"[run_agent] 加载 fast ckpt step={step}")
         else:
             print("[run_agent] 无 ckpt → 随机初始化（仅供调试，行为不可控）")
         policy = LearnedPolicy(model, device, image_size=args.image_size)
@@ -74,8 +93,8 @@ def main() -> int:
     p.add_argument("--duration", type=float, default=30.0)
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--image-size", type=int, default=224)
-    p.add_argument("--vision-hidden", type=int, default=96)
-    p.add_argument("--skeleton-dim", type=int, default=32)
+    p.add_argument("--vision-hidden", type=int, default=192, help="需与训练一致（bc_fast 默认 192）")
+    p.add_argument("--skeleton-dim", type=int, default=64, help="需与训练一致（bc_fast 默认 64）")
     p.add_argument("--skeleton-vocab-size", type=int, default=16)
     p.add_argument("--fast-ckpt", type=Path, default=None)
     p.add_argument("--send-input", action="store_true", help="真发送键鼠（仅沙盒！）")

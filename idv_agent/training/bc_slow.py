@@ -86,9 +86,12 @@ class SlowCollator:
             labels.append(lbl)
 
         images = [b["image"] for b in batch]           # tensor (default_collate 已 stack)
+        import numpy as np
         import torch
         pixel = torch.stack(images)
-        numeric = torch.as_tensor([b["numeric_action"] for b in batch], dtype=torch.float32)
+        numeric = torch.as_tensor(
+            np.array([b["numeric_action"] for b in batch], dtype=np.float32), dtype=torch.float32
+        )
         return {
             "pixel_values": pixel,
             "input_ids": torch.as_tensor(input_ids, dtype=torch.long),

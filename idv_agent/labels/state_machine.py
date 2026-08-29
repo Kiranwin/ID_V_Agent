@@ -176,8 +176,10 @@ class DecodeStateTracker:
             self._status = st
             return st
 
-        # 进入破译：Q 被按下（press 时 held 含 interact_key）
-        if not st.active and self.interact_key in frame.held_durations_ms:
+        # 进入破译：Q 被按下（仅当无退出键同时按住时，避免"退出被重新进入抵消"）
+        if (not st.active
+                and self.interact_key in frame.held_durations_ms
+                and not self._EXIT_KEYS.intersection(frame.held_durations_ms)):
             st = DecodeStatus(active=True, start_ts=ts)
             self._status = st
             return st
