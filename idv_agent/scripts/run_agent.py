@@ -123,8 +123,12 @@ def main() -> int:
     p.add_argument("--use-siglip", action="store_true",
                    help="fast 模式：用 SigLIP2 vision（需真实权重）。有 ckpt 时以 ckpt 元数据为准")
     p.add_argument("--send-input", action="store_true", help="真发送键鼠（仅沙盒！）")
+    p.add_argument("--dry-run", action="store_true", help="显式声明仅记录命令（默认行为）")
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
+
+    if args.send_input and args.dry_run:
+        p.error("--send-input 与 --dry-run 不能同时使用")
 
     import torch
     device = torch.device(args.device)

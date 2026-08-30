@@ -185,7 +185,15 @@ def extract_session(session_dir: Path,
     start_ts = int(meta.get("start_ts_ns") or (events["timestamp_ns"].min() if len(events) else 0))
     end_ts = int(meta.get("end_ts_ns") or (events["timestamp_ns"].max() if len(events) else start_ts + int(1e9)))
 
-    frame_ts = [int(start_ts + int(i / fps * 1e9)) for i in range(n_frames)] if n_frames else []
+    # 新录制优先使用真实抓帧时间戳；旧 session 无该文件时回退到线性网格。
+    frame_ts_path = session_dir / "frame_timestamps.csv"
+    if frame_ts_path.exists():
+        ts_df = pd.read_csv(frame_ts_path)
+        frame_ts = [int(x) for x in ts_df["timestamp_ns"].tolist()]
+        if n_frames and len(frame_ts) > n_frames:
+            frame_ts = frame_ts[:n_frames]
+    else:
+        frame_ts = [int(start_ts + int(i / fps * 1e9)) for i in range(n_frames)] if n_frames else []
 
     rows = build_frame_grid(events, positions, frame_ts, keymap, params)
     df = pd.DataFrame(rows)

@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Optional
 
 from .screen_capture import CaptureConfig
@@ -51,26 +51,34 @@ class EventLogger:
         self._events_fh.write("timestamp_ns,kind,code,value\n")
         self._positions_fh = self.positions_csv.open("w", encoding="utf-8")
         self._positions_fh.write("timestamp_ns,x,y\n")
+        self._lock = Lock()
         self._last_pos = None
 
     # ---- 写入 ----
     def log_event(self, kind: str, code: str, value: float = 1.0) -> None:
         ts = time.perf_counter_ns()
-        self._events_fh.write(f"{ts},{kind},{code},{value}\n")
-        self._events_fh.flush()
+        with self._lock:
+            if self._events_fh is None:
+                return
+            self._events_fh.write(f"{ts},{kind},{code},{value}\n")
+            self._events_fh.flush()
 
     def log_mouse_position(self, x: int, y: int) -> None:
         ts = time.perf_counter_ns()
-        self._positions_fh.write(f"{ts},{x},{y}\n")
-        self._positions_fh.flush()
+        with self._lock:
+            if self._positions_fh is None:
+                return
+            self._positions_fh.write(f"{ts},{x},{y}\n")
+            self._positions_fh.flush()
 
     def close(self) -> None:
-        if self._events_fh is not None:
-            self._events_fh.close()
-            self._events_fh = None
-        if self._positions_fh is not None:
-            self._positions_fh.close()
-            self._positions_fh = None
+        with self._lock:
+            if self._events_fh is not None:
+                self._events_fh.close()
+                self._events_fh = None
+            if self._positions_fh is not None:
+                self._positions_fh.close()
+                self._positions_fh = None
 
 
 class InputRecorder:
@@ -81,7 +89,7 @@ class InputRecorder:
         self._poll_position_hz = poll_position_hz
         self._stop = False
         self._threads: list[Thread] = []
-        self._listener = None
+        self._listeners = []
 
     def start(self) -> None:
         try:
@@ -104,7 +112,7 @@ class InputRecorder:
             ),
             on_scroll=lambda x, y, dx, dy: self.logger.log_event("scroll", f"key:scroll"),
         )
-        self._listener = kb_listener
+        self._listeners = [kb_listener, ms_listener]
         kb_listener.start()
         ms_listener.start()
         # 后台高频轮询鼠标位置（pynput 的 on_move 会刷屏，用 on_move 记录稀疏轮询）
@@ -121,9 +129,9 @@ class InputRecorder:
 
     def stop(self) -> None:
         self._stop = True
-        if self._listener is not None:
+        for listener in self._listeners:
             try:
-                self._listener.stop()
+                listener.stop()
             except Exception:
                 pass
         for t in self._threads:

@@ -101,3 +101,17 @@ def test_decode_reenter_after_q_released():
     assert st.active, "Q 释放后再按 Q 应重新进入破译态"
 
 
+def test_decode_single_q_tap_enters():
+    """第五人格按一次 Q 后自动破译：Q 在两帧间完成 tap 也必须进入。"""
+    import pandas as pd
+    from idv_agent.labels.state_machine import DecodeStateTracker, StateReplay
+
+    events = pd.DataFrame([
+        {"timestamp_ns": 10_000_000, "kind": "key_down", "code": "key:q", "value": 1},
+        {"timestamp_ns": 50_000_000, "kind": "key_up", "code": "key:q", "value": 0},
+    ])
+    pos = pd.DataFrame(columns=["timestamp_ns", "x", "y"])
+    replay = StateReplay(events, pos, end_ts_ns=2_000_000_000)
+    tracker = DecodeStateTracker()
+    st = tracker.on_frame(100_000_000, replay.frame_state(100_000_000, 0))
+    assert st.active, "一次 Q tap（按下+抬起均发生在帧间）应进入破译态"

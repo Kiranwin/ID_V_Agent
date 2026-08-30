@@ -16,7 +16,9 @@
 | 搭环境 / 硬件 / 反作弊须知 | [docs/04-环境与硬件.md](docs/04-环境与硬件.md) |
 | 录制 → 构建 → 训练 → 部署 实操 | [docs/05-操作手册.md](docs/05-操作手册.md) |
 | 里程碑与当前进度 | [docs/06-里程碑.md](docs/06-里程碑.md) |
+| 项目时间规划（周级执行表） | [docs/08-项目时间规划.md](docs/08-项目时间规划.md) |
 | 竞品与同类项目调研（VLA/游戏 Agent 可借鉴优点） | [docs/07-竞品调研.md](docs/07-竞品调研.md) |
+| 可行性评估与启动检查 | [docs/09-可行性与启动检查.md](docs/09-可行性与启动检查.md) |
 | 给 AI 助手（Claude/其他）的协作指南 | [AGENTS.md](AGENTS.md) |
 
 ## 架构一图流
@@ -76,7 +78,7 @@ pip install -r requirements.txt
 python -m idv_agent.scripts.smoke_test
 
 # 3. 真实录制（管理员权限，详见 docs/05）
-python -m idv_agent.scripts.record_session --list-windows
+python -m idv_agent.scripts.record --list-windows
 
 # 4. 数据统计（确认类别分布，P4 验证）
 python -m idv_agent.scripts.stats --session-dir data/sessions/<session_id>

@@ -32,7 +32,10 @@ class RulePolicy(Policy):
         self.rule_agent = rule_agent
 
     def decide(self, frame, state) -> PolicyOutput:
-        cat, cont = self.rule_agent.decide(state)
+        # RealtimeAgent 的 state 包含 intent/skeleton/memory/spatial；规则器
+        # 只消费结构化感知状态，避免把嵌套 spatial 误当成空输入。
+        spatial = state.get("spatial", state) if isinstance(state, dict) else state
+        cat, cont = self.rule_agent.decide(spatial)
         return PolicyOutput(category_id=int(cat), continuous=tuple(cont))
 
 

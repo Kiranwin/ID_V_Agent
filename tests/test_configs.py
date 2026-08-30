@@ -15,3 +15,18 @@ def test_schema_consistency():
     assert NUM_CONTINUOUS == 4
     assert INTENT_VECTOR_DIM == 16
     assert NUM_INTENT_CATEGORIES == 10
+
+
+def test_rule_policy_passes_spatial_state():
+    from idv_agent.model.policy import RulePolicy
+
+    class StubRule:
+        def decide(self, spatial):
+            assert spatial == {"visible": "yes", "distance": "near", "position": "center"}
+            return 4, (0.0, 0.0, 0.0, 0.0)
+
+    out = RulePolicy(StubRule()).decide(None, {
+        "spatial": {"visible": "yes", "distance": "near", "position": "center"},
+        "memory": {},
+    })
+    assert out.category_id == 4

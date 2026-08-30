@@ -76,6 +76,8 @@ class FrameState:
     mouse_y: Optional[int]
     mouse_dx: float = 0.0
     mouse_dy: float = 0.0
+    # 本帧新按下的键（按下边沿）。破译 Q 是一次性触发，不能只看 held。
+    just_pressed_durations_ms: Dict[str, float] = field(default_factory=dict)
     held_durations_ms: Dict[str, float] = field(default_factory=dict)   # 当前按住的键 → 总时长
     just_released_durations_ms: Dict[str, float] = field(default_factory=dict)  # 本帧刚抬起的键 → 总时长
 
@@ -96,12 +98,16 @@ class StateReplay:
 
     def frame_state(self, ts: int, prev_ts: Optional[int] = None) -> FrameState:
         held = {}
+        pressed: Dict[str, float] = {}
+        lo = 0 if prev_ts is None else prev_ts
         for iv in self.intervals:
             if iv.contains(ts):
                 held[iv.code] = iv.duration_ms
+            # 按下边沿落在 (prev_ts, ts]；首帧包含此前已发生的按下。
+            if (prev_ts is None and iv.press_ts <= ts) or (lo < iv.press_ts <= ts):
+                pressed[iv.code] = 0.0
         # 刚抬起：release_ts 落在 (prev_ts, ts] 区间内
         released: Dict[str, float] = {}
-        lo = 0 if prev_ts is None else prev_ts
         for iv in self._release_sorted:
             if lo < iv.release_ts <= ts:
                 released[iv.code] = iv.duration_ms
@@ -123,6 +129,7 @@ class StateReplay:
             timestamp_ns=ts,
             mouse_x=x, mouse_y=y,
             mouse_dx=dx, mouse_dy=dy,
+            just_pressed_durations_ms=pressed,
             held_durations_ms=held,
             just_released_durations_ms=released,
         )
@@ -164,8 +171,13 @@ class DecodeStateTracker:
         return self._status
 
     def _q_pressed(self, frame: FrameState) -> bool:
-        """Q 在本帧被按住（decode 需持续按住 Q，用 level 判定；短 tap 不视为破译）。"""
-        return self.interact_key in frame.held_durations_ms
+        """Q 触发边沿或仍按住。
+
+        第五人格按一次 Q 即进入自动破译，真实录制通常只有很短的
+        down/up 区间；因此必须同时检查按下边沿和 held level。
+        """
+        return (self.interact_key in frame.just_pressed_durations_ms
+                or self.interact_key in frame.held_durations_ms)
 
     def _exit_key_pressed(self, frame: FrameState) -> bool:
         """退出键按下（level）或本帧刚被抬起（edge，覆盖两帧间的短退出 tap）。"""

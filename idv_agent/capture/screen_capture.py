@@ -28,6 +28,7 @@ class ScreenCapture:
         self.config = config
         self._camera = None
         self._cv2 = None
+        self._region = None
 
     def _lazy_init(self) -> None:
         if self._camera is not None:
@@ -42,11 +43,26 @@ class ScreenCapture:
             raise RuntimeError("opencv-python 未安装") from e
         self._cv2 = cv2
         self._camera = dxcam.create(output_idx=0, output_color="BGR")
+        # dxcam 使用 (left, top, right, bottom)；对外配置保持更直观的
+        # (left, top, width, height)。未显式指定时按窗口标题解析一次区域。
+        if self.config.region is not None:
+            left, top, width, height = self.config.region
+            self._region = (left, top, left + width, top + height)
+        elif self.config.window_title:
+            try:
+                from idv_agent.capture.input_logger import find_window_region
+                found = find_window_region(self.config.window_title)
+                if found is not None:
+                    left, top, width, height = found
+                    self._region = (left, top, left + width, top + height)
+            except Exception:
+                # 找不到窗口时安全回退全屏，便于 headless/多显示器调试。
+                self._region = None
 
     def grab(self) -> Optional[np.ndarray]:
         """抓一帧。返回 BGR ndarray（下采样后），静态画面可能为 None。"""
         self._lazy_init()
-        frame = self._camera.grab(region=self.config.region)
+        frame = self._camera.grab(region=self._region)
         if frame is None:
             return None
         if self.config.output_size is not None:
@@ -66,3 +82,4 @@ class ScreenCapture:
             except Exception:
                 pass
             self._camera = None
+            self._region = None

@@ -30,7 +30,9 @@ def main(argv=None) -> int:
     p.add_argument("--output", type=Path, default=Path("data/sessions"),
                    help="会话根目录，自动创建 <timestamp>_<rand> 子目录")
     p.add_argument("--max-seconds", type=float, default=0.0,
-                   help=">0 时自动在 N 秒后结束（不指定则 F9 手工开始/停止）")
+                   help=">0 时自动在 N 秒后结束（不指定则 Ctrl+C 停止）")
+    p.add_argument("--max-frames", type=int, default=10000,
+                   help="最多保存帧数（默认 10000，设 0 表示不限；避免产生缺失图片样本）")
     args = p.parse_args(argv)
 
     if args.list_windows:
@@ -48,6 +50,7 @@ def main(argv=None) -> int:
 
     events_csv = session_dir / "events.csv"
     positions_csv = session_dir / "mouse_positions.csv"
+    frame_ts_csv = session_dir / "frame_timestamps.csv"
 
     import cv2
     print(f"[record] 会话目录: {session_dir}  (管理员权限运行确保 hook 可用)")
@@ -58,28 +61,31 @@ def main(argv=None) -> int:
     start_ts = time.perf_counter_ns()
     start_wall = time.perf_counter()
     n_frames = 0
-    last_frame_meta = []
+    frame_timestamps = []
     try:
         with ScreenCapture(cfg) as cap:
             deadline = None
-            print("[record] 按 F9 开始/F10 结束（或 --max-seconds 自动结束）")
+            print("[record] 录制已开始；Ctrl+C 结束（或 --max-seconds 自动结束）")
             while True:
                 if args.max_seconds > 0 and time.perf_counter() - start_wall >= args.max_seconds:
                     break
-                # 简易手工控制：间隔轮询检测 F9/F10 不适用 headless；用 max_seconds 或 Ctrl+C
+                if args.max_frames > 0 and n_frames >= args.max_frames:
+                    print(f"[record] 达到 --max-frames={args.max_frames}，自动停止")
+                    break
+                # 录制控制：使用 --max-seconds 或 Ctrl+C，避免依赖全局热键权限。
                 frame = cap.grab()
                 if frame is None:
                     time.sleep(1 / args.fps)
                     continue
-                if n_frames < 10000:
-                    p = frames_dir / f"{n_frames:08d}.jpg"
-                    # 下采样到 ~1334x750 保持体积 / 帧率
-                    h, w = frame.shape[:2]
-                    if w > 1334:
-                        scale = 1334 / w
-                        frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
-                    _save_frame(cv2, frame, p)
-                last_frame_meta.append((n_frames, time.perf_counter_ns()))
+                capture_ts = time.perf_counter_ns()
+                p = frames_dir / f"{n_frames:08d}.jpg"
+                # 下采样到 ~1334x750 保持体积 / 帧率
+                h, w = frame.shape[:2]
+                if w > 1334:
+                    scale = 1334 / w
+                    frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
+                _save_frame(cv2, frame, p)
+                frame_timestamps.append((n_frames, capture_ts))
                 n_frames += 1
                 time.sleep(1 / args.fps)
     except KeyboardInterrupt:
@@ -88,11 +94,19 @@ def main(argv=None) -> int:
         recorder.stop()
 
     end_ts = time.perf_counter_ns()
+    # 保留真实采样时钟，提取阶段优先使用它，避免 sleep/抓帧抖动造成对齐偏差。
+    with frame_ts_csv.open("w", encoding="utf-8") as f:
+        f.write("frame_id,timestamp_ns\n")
+        for frame_id, ts in frame_timestamps:
+            f.write(f"{frame_id},{ts}\n")
+    duration_s = max((end_ts - start_ts) / 1e9, 1e-9)
+    effective_fps = n_frames / duration_s
     # 帧时间戳：以录制起止为准做线性网格（简单近似）
     meta = {
         "session_id": session_id,
         "target_fps": args.fps,
         "num_frames": n_frames,
+        "effective_fps": effective_fps,
         "start_ts_ns": start_ts,
         "end_ts_ns": end_ts,
         "window_title": args.window_title,
