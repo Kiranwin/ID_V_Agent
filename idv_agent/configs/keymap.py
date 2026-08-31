@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -25,7 +26,9 @@ class SurvivorKeymap:
     interact: str = "key:q"        # 交互（破译/治疗/救援/校准）；长按/短按靠持续时长区分
     vault: str = "key:space"       # 翻窗/翻板；破译中做校准时也是 Space
     skill_1: str = "key:f"         # 一技能（部分角色 F）
-    skill_2: str = "key:e"         # 二技能（部分角色 E）
+    # 当前首要闭环不训练技能；E 在律师配置中登记为治疗键，避免被误标成二技能。
+    heal: str = "key:e"            # 治疗（语义需后续视觉/场景标注）
+    skill_2: Optional[str] = None  # 二技能暂未绑定；其它角色可按需覆盖
     map_view: str = "key:tab"
     emote: str = "key:v"
 

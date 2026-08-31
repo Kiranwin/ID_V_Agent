@@ -17,6 +17,11 @@ def test_schema_consistency():
     assert NUM_INTENT_CATEGORIES == 10
 
 
+def test_survivor_keymap_heal_binding():
+    assert DEFAULT_SURVIVOR_KEYMAP.heal == "key:e"
+    assert DEFAULT_SURVIVOR_KEYMAP.skill_2 is None
+
+
 def test_rule_policy_passes_spatial_state():
     from idv_agent.model.policy import RulePolicy
 
