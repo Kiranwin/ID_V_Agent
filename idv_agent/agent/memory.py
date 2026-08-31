@@ -32,6 +32,8 @@ class MatchMemory:
         self.hunter_last_ts: float = 0.0
         self.cipher_progress: dict[str, float] = {}       # 密码机名 -> 进度 0..1
         self.dungeon_position: Optional[str] = None       # 地窖位置
+        self.cipher_last_detection: dict = {}
+        self.cipher_detection_count: int = 0
         # MatchMemory 不是 dataclass；这里必须实例化真实列表，不能使用
         # dataclasses.field（否则 summary() 会拿到 Field 对象并在运行时崩溃）。
         self.teammate_hooked: list[str] = []
@@ -56,6 +58,13 @@ class MatchMemory:
             self.door_open = True
         elif event.kind == "dungeon_seen":
             self.dungeon_position = event.position
+        elif event.kind == "cipher_detection":
+            self.cipher_detection_count += 1
+            self.cipher_last_detection = {
+                "position": event.position,
+                "detail": event.detail,
+                "ts": event.ts,
+            }
 
     # ---- 查询 ----
     def hunter_threat(self, threshold_s: float = 8.0) -> float:
@@ -74,6 +83,8 @@ class MatchMemory:
             "hunter_threat": round(self.hunter_threat(), 3),
             "cipher_progress": dict(self.cipher_progress),
             "dungeon_position": self.dungeon_position,
+            "cipher_detection_count": self.cipher_detection_count,
+            "cipher_last_detection": dict(self.cipher_last_detection),
             "teammates_hooked": list(self.teammate_hooked),
             "door_open": self.door_open,
             "n_events": len(self.events),

@@ -47,6 +47,19 @@ def test_match_memory_summary_has_real_collections():
     assert summary["n_events"] == 1
 
 
+def test_match_memory_records_cipher_detection():
+    from idv_agent.agent.memory import MatchMemory, MemoryEvent
+
+    memory = MatchMemory()
+    memory.add_event(MemoryEvent(
+        kind="cipher_detection", position="right",
+        detail='{"visible":"yes","source":"highlight"}',
+    ))
+    summary = memory.summary()
+    assert summary["cipher_detection_count"] == 1
+    assert summary["cipher_last_detection"]["position"] == "right"
+
+
 def test_run_agent_send_input_requires_admin(monkeypatch):
     """安全回归：非管理员进程不得进入真发送路径。"""
     import ctypes

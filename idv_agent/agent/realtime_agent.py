@@ -81,6 +81,7 @@ class RealtimeAgent:
         memory: Optional[MatchMemory] = None,
         slow_planner=None,               # Optional[SlowPlanner]
         cipher_template: Optional[str] = None,
+        cipher_detection_interval_s: float = 4.0,
         device: torch.device = torch.device("cpu"),
     ):
         self.policy = policy
@@ -90,6 +91,9 @@ class RealtimeAgent:
         self.memory = memory or MatchMemory()
         self.slow_planner = slow_planner
         self.device = device
+        if cipher_detection_interval_s < 0.5:
+            raise ValueError("cipher_detection_interval_s 必须 >= 0.5s")
+        self.cipher_detection_interval_s = float(cipher_detection_interval_s)
         # 需要 .fast 字段的 Policy（LearnedPolicy）需要 decoder 和 skeleton 注入——
         # 由调用方在构造 LearnedPolicy 时已持有模型。decoder 在此统一构造。
         from idv_agent.configs.keymap import DEFAULT_SURVIVOR_KEYMAP
@@ -107,6 +111,7 @@ class RealtimeAgent:
         self.frame_count = 0
         self.slow_count = 0
         self._slow_thread: Optional[threading.Thread] = None
+        self._last_cipher_detection_at: float = 0.0
 
     def _on_event(self, kind: str, detail: dict) -> None:
         """感知事件 → 写记忆 → 触发(慢层重规划由调用方决定)。"""
@@ -191,10 +196,25 @@ class RealtimeAgent:
                         with self.shared.lock:
                             self.shared.last_frame = frame
 
-                    # 感知（事件检测——P8 占位）
-                    spatial = self.perception.on_frame(frame)
-                    with self.shared.lock:
-                        self.shared.spatial = dict(spatial)
+                    # 密码机感知由慢层低频执行；快层复用最近结果，避免每帧
+                    # 模板匹配。首次帧立即检测，默认间隔 4 秒（可调 3~5s）。
+                    detect_now = (
+                        self._last_cipher_detection_at <= 0.0
+                        or time.perf_counter() - self._last_cipher_detection_at
+                        >= self.cipher_detection_interval_s
+                    )
+                    if detect_now:
+                        spatial = self.perception.on_frame(frame)
+                        self._last_cipher_detection_at = time.perf_counter()
+                        with self.shared.lock:
+                            self.shared.spatial = dict(spatial)
+                        from idv_agent.agent.memory import MemoryEvent
+                        import json
+                        self.memory.add_event(MemoryEvent(
+                            kind="cipher_detection",
+                            position=spatial.get("position"),
+                            detail=json.dumps(spatial, ensure_ascii=False),
+                        ))
 
                     # 决策
                     t0 = time.perf_counter()

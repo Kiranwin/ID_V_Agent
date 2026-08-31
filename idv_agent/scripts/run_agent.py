@@ -117,6 +117,8 @@ def main(argv=None) -> int:
     p.add_argument("--region", type=parse_region, default=None)
     p.add_argument("--duration", type=float, default=30.0)
     p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--cipher-detect-interval", type=float, default=4.0,
+                   help="密码机慢层检测间隔（秒，建议 3~5）")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--vision-hidden", type=int, default=192, help="需与训练一致（bc_fast 默认 192）")
     p.add_argument("--skeleton-dim", type=int, default=64, help="需与训练一致（bc_fast 默认 64）")
@@ -157,12 +159,16 @@ def main(argv=None) -> int:
         memory=MatchMemory(),
         slow_planner=None,   # M1 暂不接 VLM；M2 接入 slow_planner 需手动构造
         cipher_template=str(args.cipher_template) if args.cipher_template else None,
+        cipher_detection_interval_s=args.cipher_detect_interval,
         device=device,
     )
     print(f"[run_agent] mode={args.mode}, dry_run={not args.send_input}, duration={args.duration}s")
     max_frames = int(args.fps * args.duration)
     agent.run(max_frames=max_frames)
     print(f"[run_agent] 结束，帧数={agent.frame_count}")
+    mem = agent.memory.summary()
+    print(f"[cipher] detections={mem.get('cipher_detection_count', 0)} "
+          f"last={mem.get('cipher_last_detection', {})}")
     for stage, stats in agent.latency.summary().items():
         print(f"[latency] {stage}: mean={stats['mean']:.2f}ms "
               f"p50={stats['p50']:.2f}ms p95={stats['p95']:.2f}ms "

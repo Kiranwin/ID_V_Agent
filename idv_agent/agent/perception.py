@@ -46,6 +46,7 @@ class CipherDetection:
             "position": self.position,
             "distance": self.distance,
             "confidence": round(float(self.confidence), 3),
+            "source": self.source,
         }
 
 
