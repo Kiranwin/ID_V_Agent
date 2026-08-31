@@ -1,0 +1,68 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from idv_agent.scripts.build_vla_chunks import build
+from idv_agent.vla.action_chunk import (
+    ACTION_CHUNK_HORIZON,
+    HISTORY_FRAMES,
+    VLA_SCHEMA_VERSION,
+    validate_record,
+)
+
+
+def _record():
+    return {
+        "schema_version": VLA_SCHEMA_VERSION,
+        "episode_id": "ep1",
+        "anchor_frame": 3,
+        "task": {"name": "find_cipher_and_decode", "instruction": "找到密码机"},
+        "observations": {
+            "frames": [
+                {"path": f"frames/{i:08d}.jpg", "frame_index": i, "timestamp_ns": i * 1000}
+                for i in (0, 1, 2)
+            ],
+            "fps": 30,
+            "history_actions": [],
+        },
+        "action_chunk": [
+            {"nav": "forward", "interaction": "none", "camera_dx": 0,
+             "camera_dy": 0, "duration_frames": 6}
+            for _ in range(4)
+        ],
+        "quality": {"source": "teacher", "outcome": "success"},
+    }
+
+
+def test_vla_record_contract_is_independent_of_legacy_schema():
+    record = _record()
+    validate_record(record)
+    assert len(record["observations"]["frames"]) == HISTORY_FRAMES
+    assert len(record["action_chunk"]) == ACTION_CHUNK_HORIZON
+
+
+def test_vla_record_rejects_absolute_frame_path():
+    record = _record()
+    record["observations"]["frames"][0]["path"] = "C:/secret/frame.jpg"
+    with pytest.raises(ValueError, match="相对路径"):
+        validate_record(record)
+
+
+def test_build_vla_chunks(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(60):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    with (session / "per_frame_actions.csv").open("w", encoding="utf-8", newline="") as f:
+        f.write("frame_id,timestamp_ns,category_name,move_x,move_y,cam_dx,cam_dy\n")
+        for i in range(60):
+            f.write(f"{i},{i * 1000},MOVE,0,1,0.1,0\n")
+    output = tmp_path / "vla.jsonl"
+    count = build(session, output, stride=3, macro_frames=6, outcome="success")
+    assert count == 10
+    rec = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    validate_record(rec)
+    assert rec["action_chunk"][0]["nav"] == "forward"
+    assert rec["action_chunk"][0]["camera_dx"] == 0.1
