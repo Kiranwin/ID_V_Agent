@@ -16,9 +16,17 @@ VLA_SCHEMA_VERSION = "vla.action_chunk.v1"
 HISTORY_FRAMES = 3
 ACTION_CHUNK_HORIZON = 4
 MACRO_FRAMES = 6
+# A frame is observed before its label is allowed to become a target.  One
+# frame leaves room for capture/inference latency and prevents same-frame label
+# leakage; deployments can increase this after measuring latency.
+DEFAULT_ACTION_DELAY_FRAMES = 1
 
 NAV_ACTIONS = ("forward", "left", "right", "stop_observe")
 INTERACTION_ACTIONS = ("none", "tap_q", "hold_decode", "release")
+INTENTS = (
+    "search_cipher", "align_cipher", "approach_cipher", "start_decode",
+    "decode", "recover_target", "avoid_obstacle", "stop_safety",
+)
 OUTCOMES = ("success", "partial", "failure", "unknown")
 SOURCES = ("human", "teacher", "model")
 
@@ -95,6 +103,9 @@ def validate_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -
         if not isinstance(frame.get("frame_index"), int) or frame["frame_index"] < 0:
             raise _err(f"observations.frames[{i}].frame_index", "必须是非负整数")
         _finite_number(frame.get("timestamp_ns"), f"observations.frames[{i}].timestamp_ns")
+    timestamps = [int(frame["timestamp_ns"]) for frame in frames]
+    if timestamps != sorted(timestamps) or len(set(timestamps)) != len(timestamps):
+        raise _err("observations.frames", "timestamp_ns 必须严格递增")
     fps = _finite_number(obs.get("fps"), "observations.fps")
     if fps <= 0 or fps > 240:
         raise _err("observations.fps", "必须在 (0, 240] 内")
@@ -115,6 +126,25 @@ def validate_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -
     for i, action in enumerate(chunk):
         _validate_action(action, f"action_chunk[{i}]")
 
+    alignment = record.get("alignment")
+    if not isinstance(alignment, Mapping):
+        raise _err("alignment", "必须是对象")
+    delay = alignment.get("action_delay_frames")
+    if not isinstance(delay, int) or isinstance(delay, bool) or delay < 0 or delay > 30:
+        raise _err("alignment.action_delay_frames", "必须是 0..30 的整数")
+    if alignment.get("mode") != "causal_future":
+        raise _err("alignment.mode", "必须是 causal_future")
+    if "action_start_frame" not in alignment or not isinstance(alignment["action_start_frame"], int):
+        raise _err("alignment.action_start_frame", "必须是整数")
+    for name in ("observation_end_timestamp_ns", "action_start_timestamp_ns", "action_end_timestamp_ns"):
+        _finite_number(alignment.get(name), f"alignment.{name}")
+    if not (alignment["observation_end_timestamp_ns"] <
+            alignment["action_start_timestamp_ns"] <= alignment["action_end_timestamp_ns"]):
+        raise _err("alignment", "观测结束、动作起止时间必须严格有序")
+    intent = record.get("intent", "")
+    if intent and intent not in INTENTS:
+        raise _err("intent", f"必须是 {INTENTS}")
+
     quality = record.get("quality", {})
     if not isinstance(quality, Mapping):
         raise _err("quality", "必须是对象")
@@ -122,4 +152,3 @@ def validate_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -
         raise _err("quality.source", f"必须是 {SOURCES}")
     if quality.get("outcome", "unknown") not in OUTCOMES:
         raise _err("quality.outcome", f"必须是 {OUTCOMES}")
-

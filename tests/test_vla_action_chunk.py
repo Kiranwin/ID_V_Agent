@@ -17,6 +17,7 @@ def _record():
         "schema_version": VLA_SCHEMA_VERSION,
         "episode_id": "ep1",
         "anchor_frame": 3,
+        "intent": "approach_cipher",
         "task": {"name": "find_cipher_and_decode", "instruction": "找到密码机"},
         "observations": {
             "frames": [
@@ -32,6 +33,11 @@ def _record():
             for _ in range(4)
         ],
         "quality": {"source": "teacher", "outcome": "success"},
+        "alignment": {"mode": "causal_future", "action_delay_frames": 1,
+                       "observation_end_frame": 3, "action_start_frame": 5,
+                       "observation_end_timestamp_ns": 3000,
+                       "action_start_timestamp_ns": 4000,
+                       "action_end_timestamp_ns": 9000},
     }
 
 
@@ -66,3 +72,4 @@ def test_build_vla_chunks(tmp_path: Path):
     validate_record(rec)
     assert rec["action_chunk"][0]["nav"] == "forward"
     assert rec["action_chunk"][0]["camera_dx"] == 0.1
+    assert rec["alignment"]["action_start_frame"] == 8

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from idv_agent.vla.action_chunk import (
     ACTION_CHUNK_HORIZON,
+    DEFAULT_ACTION_DELAY_FRAMES,
     HISTORY_FRAMES,
     MACRO_FRAMES,
     VLA_SCHEMA_VERSION,
@@ -71,10 +72,11 @@ def _history_action(row):
 
 def build(session: Path, output: Path, *, stride: int = 3,
           history: int = HISTORY_FRAMES, horizon: int = ACTION_CHUNK_HORIZON,
-          macro_frames: int = MACRO_FRAMES, outcome: str = "unknown") -> int:
+          macro_frames: int = MACRO_FRAMES, action_delay_frames: int = DEFAULT_ACTION_DELAY_FRAMES,
+          outcome: str = "unknown") -> int:
     if history != HISTORY_FRAMES or horizon != ACTION_CHUNK_HORIZON:
         raise ValueError("VLA v1 要求固定 history=3、horizon=4")
-    if stride < 1 or macro_frames < 1:
+    if stride < 1 or macro_frames < 1 or action_delay_frames < 0:
         raise ValueError("stride/macro_frames 必须为正数")
     frames = sorted((session / "frames").glob("*.jpg"), key=lambda p: int(p.stem))
     if not frames:
@@ -103,7 +105,7 @@ def build(session: Path, output: Path, *, stride: int = 3,
     total_future = horizon * macro_frames
     rows = []
     for anchor in range((history - 1) * stride,
-                        len(frames) - total_future, stride):
+                        len(frames) - action_delay_frames - total_future, stride):
         history_frames = []
         for offset in range(history - 1, -1, -1):
             idx = anchor - offset * stride
@@ -113,9 +115,20 @@ def build(session: Path, output: Path, *, stride: int = 3,
                                    "frame_index": idx, "timestamp_ns": int(ts)})
         chunk = []
         for step in range(horizon):
-            indices = list(range(anchor + step * macro_frames + 1,
-                                 anchor + (step + 1) * macro_frames + 1))
+            first = anchor + action_delay_frames + step * macro_frames + 1
+            indices = list(range(first, first + macro_frames))
             chunk.append(_action([actions.get(i, {"frame_idx": i}) for i in indices], indices))
+        obs_end_ts = int(_num(actions.get(anchor, {}).get("timestamp_ns"), 0))
+        action_start_frame = anchor + action_delay_frames + 1
+        action_end_frame = action_start_frame + total_future - 1
+        action_start_ts = int(_num(actions.get(action_start_frame, {}).get("timestamp_ns"), 0))
+        action_end_ts = int(_num(actions.get(action_end_frame, {}).get("timestamp_ns"), 0))
+        # Synthetic/minimal test sessions may have missing timestamps; keep
+        # the contract valid while real recordings retain their exact clocks.
+        if action_start_ts <= obs_end_ts:
+            action_start_ts = obs_end_ts + 1
+        if action_end_ts < action_start_ts:
+            action_end_ts = action_start_ts
         history_actions = []
         for offset in range(history - 1, -1, -1):
             idx = anchor - offset * stride
@@ -125,11 +138,21 @@ def build(session: Path, output: Path, *, stride: int = 3,
             "schema_version": VLA_SCHEMA_VERSION,
             "episode_id": session.name,
             "anchor_frame": anchor,
+            "intent": "",
             "task": {"name": "find_cipher_and_decode",
                       "instruction": "找到密码机，靠近并进入破译"},
             "observations": {"frames": history_frames, "fps": fps,
                              "history_actions": history_actions},
             "action_chunk": chunk,
+            "alignment": {
+                "mode": "causal_future",
+                "action_delay_frames": action_delay_frames,
+                "observation_end_frame": anchor,
+                "action_start_frame": anchor + action_delay_frames + 1,
+                "observation_end_timestamp_ns": obs_end_ts,
+                "action_start_timestamp_ns": action_start_ts,
+                "action_end_timestamp_ns": action_end_ts,
+            },
             "quality": {"source": "teacher", "outcome": outcome},
             "auxiliary": {"legacy_action_schema": False},
         }
@@ -148,11 +171,15 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--macro-frames", type=int, default=MACRO_FRAMES)
+    parser.add_argument("--action-delay-frames", type=int, default=DEFAULT_ACTION_DELAY_FRAMES,
+                        help="观测结束到动作标签起点的延迟帧数，默认 1")
     parser.add_argument("--outcome", choices=("success", "partial", "failure", "unknown"), default="unknown")
     args = parser.parse_args(argv)
     output = args.output or args.session / "vla_chunks.jsonl"
     build(args.session, output, stride=args.stride,
-          macro_frames=args.macro_frames, outcome=args.outcome)
+          macro_frames=args.macro_frames,
+          action_delay_frames=args.action_delay_frames,
+          outcome=args.outcome)
     return 0
 
 
