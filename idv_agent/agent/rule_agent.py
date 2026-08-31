@@ -47,6 +47,8 @@ class RuleAgent:
         distance = sp.get("distance", "none")
         blocked = sp.get("blocked", "no")
         interacting = sp.get("interacting", "no")
+        interact_prompt = sp.get("interact_prompt", "no")
+        decoding_state = sp.get("decoding_state", "no")
         threat = sp.get("threat", "no")
 
         # 威胁（监管者近身/耳鸣）→ 跑路一段时间
@@ -57,12 +59,12 @@ class RuleAgent:
             return int(ActionCategory.MOVE), (0, 1.0, 0, 0)
 
         # 已在破译
-        if interacting == "yes":
+        if interacting == "yes" or decoding_state == "yes":
             return int(ActionCategory.INTERACT_HOLD), (0, 0, 0, 0)
 
         # 看到密码机
         if visible == "yes":
-            if distance == "near" and position == "center":
+            if (interact_prompt == "yes" and position == "center"):
                 return int(ActionCategory.INTERACT_TAP), (0, 0, 0, 0)
             if position in ("far_left", "left"):
                 mult = ALIGN_FAR_MULT if position == "far_left" else 1.0

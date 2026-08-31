@@ -114,6 +114,8 @@ def main(argv=None) -> int:
     p.add_argument("--title", default="Identity V")
     p.add_argument("--cipher-template", type=Path, default=None,
                    help="密码机模板图片（建议同分辨率、同地图；不传则不触发自动找机）")
+    p.add_argument("--yolo-model", type=Path, default=None,
+                   help="YOLO 密码机检测权重（best.pt）")
     p.add_argument("--region", type=parse_region, default=None)
     p.add_argument("--duration", type=float, default=30.0)
     p.add_argument("--fps", type=int, default=30)
@@ -159,6 +161,7 @@ def main(argv=None) -> int:
         memory=MatchMemory(),
         slow_planner=None,   # M1 暂不接 VLM；M2 接入 slow_planner 需手动构造
         cipher_template=str(args.cipher_template) if args.cipher_template else None,
+        yolo_model_path=str(args.yolo_model) if args.yolo_model else None,
         cipher_detection_interval_s=args.cipher_detect_interval,
         device=device,
     )

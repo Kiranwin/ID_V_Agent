@@ -81,6 +81,7 @@ class RealtimeAgent:
         memory: Optional[MatchMemory] = None,
         slow_planner=None,               # Optional[SlowPlanner]
         cipher_template: Optional[str] = None,
+        yolo_model_path: Optional[str] = None,
         cipher_detection_interval_s: float = 4.0,
         device: torch.device = torch.device("cpu"),
     ):
@@ -101,10 +102,13 @@ class RealtimeAgent:
 
         self.shared = SharedState()
         from idv_agent.agent.perception import CipherMachineDetector
+        # One detector can combine YOLO with the legacy template/HSV fallback.
         self.perception = EventDetector(
             on_event=self._on_event,
-            cipher_detector=CipherMachineDetector(template_path=cipher_template)
-            if cipher_template else None,
+            cipher_detector=CipherMachineDetector(
+                template_path=cipher_template,
+                yolo_model_path=yolo_model_path,
+            ) if (cipher_template or yolo_model_path) else None,
         )
         self.stop_event = threading.Event()
         self.latency = LatencyTracker()

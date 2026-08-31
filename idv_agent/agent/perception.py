@@ -39,6 +39,8 @@ class CipherDetection:
     confidence: float = 0.0
     bbox: Optional[tuple[int, int, int, int]] = None
     source: str = "none"
+    interact_prompt: str = "no"
+    decoding_state: str = "no"
 
     def as_spatial(self) -> dict:
         return {
@@ -47,6 +49,8 @@ class CipherDetection:
             "distance": self.distance,
             "confidence": round(float(self.confidence), 3),
             "source": self.source,
+            "interact_prompt": self.interact_prompt,
+            "decoding_state": self.decoding_state,
         }
 
 
@@ -58,6 +62,7 @@ class CipherMachineDetector:
     """
 
     def __init__(self, template_path: Optional[str | Path] = None,
+                 yolo_model_path: Optional[str | Path] = None,
                  template_threshold: float = 0.72,
                  heuristic_threshold: float = 0.82,
                  highlight_threshold: float = 0.78,
@@ -67,6 +72,16 @@ class CipherMachineDetector:
         self.heuristic_threshold = heuristic_threshold
         self.highlight_threshold = highlight_threshold
         self.template_scales = tuple(float(s) for s in template_scales if s > 0)
+        self.yolo_model = None
+        if yolo_model_path:
+            model_path = Path(yolo_model_path)
+            if not model_path.is_file():
+                raise ValueError(f"YOLO 权重不存在: {model_path}")
+            try:
+                from ultralytics import YOLO
+                self.yolo_model = YOLO(str(model_path))
+            except Exception as exc:
+                raise ValueError(f"YOLO 模型加载失败: {model_path}: {exc}") from exc
         self.template = None
         if template_path:
             try:
@@ -140,6 +155,10 @@ class CipherMachineDetector:
             return CipherDetection()
         import cv2
         h, w = frame.shape[:2]
+        if self.yolo_model is not None:
+            result = self._detect_yolo(frame)
+            if result is not None:
+                return result
         if self.template is not None:
             # A 3-D machine changes apparent size with distance.  Try a small
             # set of scales; this remains cheap for a single crop and avoids
@@ -200,16 +219,66 @@ class CipherMachineDetector:
         return CipherDetection(visible, self._location(x+bw/2, w),
             self._distance(bw*bh, w*h), conf, (x,y,bw,bh), "heuristic")
 
+    def _detect_yolo(self, frame: np.ndarray) -> Optional[CipherDetection]:
+        """Run the trained four-class detector and merge its UI cues."""
+        h, w = frame.shape[:2]
+        try:
+            outputs = self.yolo_model.predict(frame, verbose=False, conf=0.25, device="0")
+        except Exception as exc:
+            print(f"[perception] YOLO inference error: {exc}")
+            return None
+        boxes = getattr(outputs[0], "boxes", None) if outputs else None
+        if boxes is None or len(boxes) == 0:
+            return None
+        candidates = []
+        prompt = decode = None
+        names = getattr(self.yolo_model, "names", {}) or {}
+        for xyxy, cls_t, conf_t in zip(boxes.xyxy.cpu().tolist(), boxes.cls.cpu().tolist(), boxes.conf.cpu().tolist()):
+            cls = int(cls_t); conf = float(conf_t)
+            name = str(names.get(cls, cls)) if isinstance(names, dict) else str(cls)
+            x1, y1, x2, y2 = [max(0, int(v)) for v in xyxy]
+            bw, bh = max(1, x2-x1), max(1, y2-y1)
+            if cls == 2 or name in {"interact_prompt", "interact_decode"}:
+                prompt = (x1, y1, bw, bh, conf)
+            elif cls == 3 or name == "decoding_state":
+                decode = (x1, y1, bw, bh, conf)
+            elif cls in (0, 1) or name in {"cipher_visible", "cipher_highlight"}:
+                candidates.append((conf, x1, y1, bw, bh))
+        if not candidates and prompt is None and decode is None:
+            return None
+        if candidates:
+            conf, x, y, bw, bh = max(candidates)
+        else:
+            item = prompt or decode
+            conf, x, y, bw, bh = item[4], item[0], item[1], item[2], item[3]
+        if prompt is not None:
+            conf = max(conf, prompt[4])
+        if decode is not None:
+            conf = max(conf, decode[4])
+        return CipherDetection(
+            visible="yes" if candidates else "no",
+            position=self._location(x + bw/2, w),
+            distance=self._distance(bw*bh, w*h),
+            confidence=conf,
+            bbox=(x, y, bw, bh),
+            source="yolo",
+            interact_prompt="yes" if prompt is not None else "no",
+            decoding_state="yes" if decode is not None else "no",
+        )
+
 
 class EventDetector:
     def __init__(self, on_event: Optional[EventCallback] = None,
-                 cipher_detector: Optional[CipherMachineDetector] = None):
+                 cipher_detector: Optional[CipherMachineDetector] = None,
+                 yolo_model_path: Optional[str | Path] = None):
         self._callbacks: list[EventCallback] = []
         if on_event is not None:
             self._callbacks.append(on_event)
         # 占位状态
         self._prev_hud = {}
-        self.cipher_detector = cipher_detector or CipherMachineDetector()
+        self.cipher_detector = cipher_detector or CipherMachineDetector(
+            yolo_model_path=yolo_model_path
+        )
 
     def on_event(self, cb: EventCallback) -> None:
         self._callbacks.append(cb)

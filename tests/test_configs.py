@@ -106,7 +106,7 @@ def test_cipher_detector_safe_empty_and_spatial_shape():
     detector = CipherMachineDetector()
     result = detector.detect(np.zeros((120, 160, 3), dtype=np.uint8))
     spatial = result.as_spatial()
-    assert set(("visible", "position", "distance", "confidence")) <= set(spatial)
+    assert set(("visible", "position", "distance", "confidence", "interact_prompt", "decoding_state")) <= set(spatial)
     assert spatial["visible"] == "no"
     assert 0.0 <= spatial["confidence"] <= 1.0
 
