@@ -92,3 +92,17 @@ def test_cipher_detector_template_match(tmp_path):
     assert result.source == "template"
     assert result.visible == "yes"
     assert result.position == "center"
+
+
+def test_cipher_detector_through_wall_highlight():
+    import numpy as np
+    from idv_agent.agent.perception import CipherMachineDetector
+
+    # Synthetic through-wall beacon: tall, saturated yellow marker below HUD.
+    frame = np.zeros((180, 240, 3), dtype=np.uint8)
+    frame[55:125, 112:120] = (0, 255, 255)  # BGR yellow
+    result = CipherMachineDetector().detect(frame)
+    assert result.source == "highlight"
+    assert result.visible == "yes"
+    assert result.position == "center"
+    assert result.confidence >= 0.78

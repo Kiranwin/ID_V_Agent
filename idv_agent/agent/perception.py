@@ -58,9 +58,11 @@ class CipherMachineDetector:
 
     def __init__(self, template_path: Optional[str | Path] = None,
                  template_threshold: float = 0.72,
-                 heuristic_threshold: float = 0.82):
+                 heuristic_threshold: float = 0.82,
+                 highlight_threshold: float = 0.78):
         self.template_threshold = template_threshold
         self.heuristic_threshold = heuristic_threshold
+        self.highlight_threshold = highlight_threshold
         self.template = None
         if template_path:
             try:
@@ -84,6 +86,50 @@ class CipherMachineDetector:
         if ratio >= 0.035: return "near"
         if ratio >= 0.008: return "mid"
         return "far"
+
+    def _detect_highlight(self, frame: np.ndarray) -> Optional[CipherDetection]:
+        """Detect the yellow through-wall cipher marker.
+
+        Identity V renders a cipher as a thin yellow beacon plus a small base
+        whenever geometry is occluded.  This is deliberately kept separate
+        from the generic bright-colour heuristic: the tall, narrow silhouette
+        is a much stronger cue and can safely drive the M1 search policy.
+        """
+        import cv2
+        h, w = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # Yellow beacon (OpenCV hue 15..45), high saturation/value.  Ignore
+        # HUD text at the top and the player's action bar at the bottom.
+        mask = cv2.inRange(hsv, np.array([15, 120, 150]), np.array([45, 255, 255]))
+        mask[: int(h * 0.16), :] = 0
+        mask[int(h * 0.92):, :] = 0
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 9)),
+        )
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        candidates = []
+        for i in range(1, n):
+            x, y, bw, bh, area = [int(v) for v in stats[i]]
+            aspect = bh / max(float(bw), 1.0)
+            # The marker is tall and narrow; reject scenery/UI blobs.
+            if area < 100 or bh < 24 or bw < 4 or bw > max(80, int(w * .12)):
+                continue
+            if aspect < 2.5 or area > w * h * 0.03:
+                continue
+            shape_score = min(1.0, (aspect - 2.5) / 5.0)
+            size_score = min(1.0, area / 900.0)
+            confidence = min(0.99, 0.78 + 0.12 * shape_score + 0.08 * size_score)
+            candidates.append((confidence, x, y, bw, bh, area))
+        if not candidates:
+            return None
+        confidence, x, y, bw, bh, area = max(candidates)
+        visible = "yes" if confidence >= self.highlight_threshold else "no"
+        return CipherDetection(
+            visible, self._location(x + bw / 2, w),
+            self._distance(area, w * h), float(confidence),
+            (x, y, bw, bh), "highlight",
+        )
 
     def detect(self, frame: np.ndarray) -> CipherDetection:
         if frame is None or not isinstance(frame, np.ndarray) or frame.ndim != 3:
@@ -114,6 +160,12 @@ class CipherMachineDetector:
                     x, y = int(loc[0]), int(loc[1])
                     return CipherDetection("yes", self._location(x + tw/2, w),
                         self._distance(tw*th, w*h), float(score), (x,y,tw,th), "template")
+
+        # Through-wall yellow beacon.  This cue is available even when the
+        # 3D machine mesh itself is completely hidden.
+        highlight = self._detect_highlight(frame)
+        if highlight is not None:
+            return highlight
 
         # 保守启发式：密码机常见的高亮黄/青色局部块，排除顶部 HUD。
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
