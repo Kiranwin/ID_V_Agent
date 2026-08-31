@@ -22,6 +22,8 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Optional
+from pathlib import Path
+import json
 
 import numpy as np
 import torch
@@ -85,6 +87,8 @@ class RealtimeAgent:
         yolo_debug: bool = False,
         cipher_detection_interval_s: float = 4.0,
         cam_pixel_scale: float = 120.0,
+        trajectory_log: Optional[str | Path] = None,
+        trajectory_frames_dir: Optional[str | Path] = None,
         device: torch.device = torch.device("cpu"),
     ):
         self.policy = policy
@@ -121,6 +125,37 @@ class RealtimeAgent:
         self.slow_count = 0
         self._slow_thread: Optional[threading.Thread] = None
         self._last_cipher_detection_at: float = 0.0
+        self.trajectory_log = Path(trajectory_log) if trajectory_log else None
+        self.trajectory_frames_dir = Path(trajectory_frames_dir) if trajectory_frames_dir else None
+        self._trajectory_fh = None
+        if self.trajectory_log is None and self.trajectory_frames_dir is not None:
+            raise ValueError("trajectory_frames_dir 需要同时指定 trajectory_log")
+        if self.trajectory_log is not None:
+            self.trajectory_log.parent.mkdir(parents=True, exist_ok=True)
+            self._trajectory_fh = self.trajectory_log.open("w", encoding="utf-8")
+            if self.trajectory_frames_dir is not None:
+                self.trajectory_frames_dir.mkdir(parents=True, exist_ok=True)
+
+    def _record_trajectory(self, frame: np.ndarray, spatial: dict, out,
+                           cmds: list[Command]) -> None:
+        """Write one controller observation/action row for BC warm-start data."""
+        if self._trajectory_fh is None:
+            return
+        row = {
+            "frame_idx": self.frame_count,
+            "timestamp_ns": time.perf_counter_ns(),
+            "spatial": spatial,
+            "category_id": int(out.category_id),
+            "continuous": [round(float(v), 6) for v in out.continuous],
+            "commands": [repr(c) for c in cmds],
+        }
+        if self.trajectory_frames_dir is not None:
+            import cv2
+            frame_path = self.trajectory_frames_dir / f"{self.frame_count:08d}.jpg"
+            cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            row["frame_path"] = frame_path.as_posix()
+        self._trajectory_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._trajectory_fh.flush()
 
     def _on_event(self, kind: str, detail: dict) -> None:
         """感知事件 → 写记忆 → 触发(慢层重规划由调用方决定)。"""
@@ -207,10 +242,20 @@ class RealtimeAgent:
 
                     # 密码机感知由慢层低频执行；快层复用最近结果，避免每帧
                     # 模板匹配。首次帧立即检测，默认间隔 4 秒（可调 3~5s）。
+                    with self.shared.lock:
+                        previous_spatial = dict(self.shared.spatial)
+                    # Search is intentionally slow, but approach/interaction
+                    # needs a short visual-servo loop and prompt confirmation.
+                    approach_interval = min(self.cipher_detection_interval_s, 0.25)
+                    active_interval = (approach_interval
+                                       if previous_spatial.get("visible") == "yes"
+                                       or previous_spatial.get("interact_prompt") == "yes"
+                                       or previous_spatial.get("decoding_state") == "yes"
+                                       else self.cipher_detection_interval_s)
                     detect_now = (
                         self._last_cipher_detection_at <= 0.0
                         or time.perf_counter() - self._last_cipher_detection_at
-                        >= self.cipher_detection_interval_s
+                        >= active_interval
                     )
                     if detect_now:
                         spatial = self.perception.on_frame(frame)
@@ -247,6 +292,7 @@ class RealtimeAgent:
                     # 解码 + 执行
                     cmds = self.decoder.decode(out.category_id, out.continuous)
                     self.executor.execute(cmds)
+                    self._record_trajectory(frame, state["spatial"], out, cmds)
                     self.latency.add("total", (time.perf_counter() - t_start) * 1000)
                     self.frame_count += 1
             finally:
@@ -258,3 +304,6 @@ class RealtimeAgent:
                     self._slow_thread.join(timeout=2.0)
                 if hotkeys is not None:
                     hotkeys.stop()
+                if self._trajectory_fh is not None:
+                    self._trajectory_fh.close()
+                    self._trajectory_fh = None

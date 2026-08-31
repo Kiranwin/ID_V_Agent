@@ -41,16 +41,31 @@ class CipherDetection:
     source: str = "none"
     interact_prompt: str = "no"
     decoding_state: str = "no"
+    # Normalized geometry.  These are deliberately separate from `distance`:
+    # bbox area is not a reliable range estimate when the antenna/HUD changes
+    # which part of a 3-D cipher is visible.
+    frame_width: int = 0
+    frame_height: int = 0
 
     def as_spatial(self) -> dict:
+        x, y, bw, bh = self.bbox or (0, 0, 0, 0)
+        width = max(int(self.frame_width), 1)
+        height = max(int(self.frame_height), 1)
+        center_x = (x + bw / 2) / width if self.bbox else None
+        bottom_y = (y + bh) / height if self.bbox else None
+        area_ratio = (bw * bh) / (width * height) if self.bbox else 0.0
         return {
             "visible": self.visible,
             "position": self.position,
             "distance": self.distance,
             "confidence": round(float(self.confidence), 3),
             "source": self.source,
+            "bbox": list(self.bbox) if self.bbox else None,
             "interact_prompt": self.interact_prompt,
             "decoding_state": self.decoding_state,
+            "center_x": round(center_x, 4) if center_x is not None else None,
+            "bottom_y": round(bottom_y, 4) if bottom_y is not None else None,
+            "bbox_area_ratio": round(area_ratio, 6),
         }
 
 
@@ -149,7 +164,7 @@ class CipherMachineDetector:
         return CipherDetection(
             visible, self._location(x + bw / 2, w),
             self._distance(area, w * h), float(confidence),
-            (x, y, bw, bh), "highlight",
+            (x, y, bw, bh), "highlight", frame_width=w, frame_height=h,
         )
 
     def detect(self, frame: np.ndarray) -> CipherDetection:
@@ -190,7 +205,8 @@ class CipherMachineDetector:
                 score, loc, tw, th = best
                 x, y = int(loc[0]), int(loc[1])
                 return CipherDetection("yes", self._location(x + tw/2, w),
-                    self._distance(tw*th, w*h), float(score), (x,y,tw,th), "template")
+                    self._distance(tw*th, w*h), float(score), (x,y,tw,th), "template",
+                    frame_width=w, frame_height=h)
 
         # Through-wall yellow beacon.  This cue is available even when the
         # 3D machine mesh itself is completely hidden.
@@ -219,7 +235,8 @@ class CipherMachineDetector:
         conf = min(0.9, 0.45 + (bw*bh)/(w*h)*4.0)
         visible = "yes" if conf >= self.heuristic_threshold else "no"
         return CipherDetection(visible, self._location(x+bw/2, w),
-            self._distance(bw*bh, w*h), conf, (x,y,bw,bh), "heuristic")
+            self._distance(bw*bh, w*h), conf, (x,y,bw,bh), "heuristic",
+            frame_width=w, frame_height=h)
 
     def _detect_yolo(self, frame: np.ndarray) -> Optional[CipherDetection]:
         """Run the trained four-class detector and merge its UI cues."""
@@ -269,6 +286,8 @@ class CipherMachineDetector:
             source="yolo",
             interact_prompt="yes" if prompt is not None else "no",
             decoding_state="yes" if decode is not None else "no",
+            frame_width=w,
+            frame_height=h,
         )
         if self.debug: print(f"[yolo-debug] boxes={debug_boxes} result={detection.as_spatial()} bbox={detection.bbox}")
         return detection

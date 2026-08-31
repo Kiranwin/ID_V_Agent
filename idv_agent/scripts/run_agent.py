@@ -19,7 +19,7 @@ from pathlib import Path
 from idv_agent.agent.action_executor import ActionExecutor
 from idv_agent.agent.memory import MatchMemory
 from idv_agent.agent.realtime_agent import RealtimeAgent
-from idv_agent.agent.rule_agent import RuleAgent
+from idv_agent.agent.rule_agent import CipherVisualServo, RuleAgent
 from idv_agent.capture.screen_capture import CaptureConfig
 from idv_agent.agent.action_decoder import ActionDecoder
 from idv_agent.agent.perception import CipherMachineDetector
@@ -37,8 +37,9 @@ def parse_region(s: str):
 def build_policy(args, device):
     if args.mode == "rule":
         from idv_agent.model.policy import RulePolicy
-        rp = RulePolicy(RuleAgent())
-        # 感知占位：给规则 agent 一个空 spatial（M1 未接视觉时先走 MOVE_LOOK 扫视）
+        # M1 默认使用视觉伺服：屏幕中心走廊对齐后前进，左右移仅留给
+        # blocked 脱困分支；无 bbox 几何时仍回退到旧的粗粒度规则。
+        rp = RulePolicy(RuleAgent(visual_servo=CipherVisualServo()))
         return rp, None
     if args.mode == "fast":
         import torch
@@ -175,6 +176,10 @@ def main(argv=None) -> int:
                    help="密码机慢层检测间隔（秒，建议 3~5）")
     p.add_argument("--cam-pixel-scale", type=float, default=120.0,
                    help="相机归一化尺度；数值越大单帧转动越慢（默认 120）")
+    p.add_argument("--trajectory-log", type=Path, default=None,
+                   help="可选：将每帧感知状态、宏控制动作和执行命令写入 JSONL")
+    p.add_argument("--trajectory-frames", type=Path, default=None,
+                   help="可选：配合 --trajectory-log 保存对应帧 JPEG（用于示范轨迹训练）")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--vision-hidden", type=int, default=192, help="需与训练一致（bc_fast 默认 192）")
     p.add_argument("--skeleton-dim", type=int, default=64, help="需与训练一致（bc_fast 默认 64）")
@@ -198,6 +203,8 @@ def main(argv=None) -> int:
         p.error("--send-input 与 --dry-run 不能同时使用")
     if args.test_stride <= 0:
         p.error("--test-stride 必须为正数")
+    if args.trajectory_frames is not None and args.trajectory_log is None:
+        p.error("--trajectory-frames 需要同时指定 --trajectory-log")
     if (args.test_image or args.test_dir) and args.send_input:
         p.error("离线测试模式禁止 --send-input")
     if args.test_dir is not None and not args.test_dir.is_dir():
@@ -235,6 +242,8 @@ def main(argv=None) -> int:
         yolo_debug=args.debug_yolo,
         cipher_detection_interval_s=args.cipher_detect_interval,
         cam_pixel_scale=args.cam_pixel_scale,
+        trajectory_log=args.trajectory_log,
+        trajectory_frames_dir=args.trajectory_frames,
         device=device,
     )
     print(f"[run_agent] mode={args.mode}, dry_run={not args.send_input}, duration={args.duration}s")

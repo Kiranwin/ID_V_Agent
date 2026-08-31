@@ -109,6 +109,43 @@ def test_cipher_detector_safe_empty_and_spatial_shape():
     assert set(("visible", "position", "distance", "confidence", "interact_prompt", "decoding_state")) <= set(spatial)
     assert spatial["visible"] == "no"
     assert 0.0 <= spatial["confidence"] <= 1.0
+    assert spatial["center_x"] is None
+    assert spatial["bottom_y"] is None
+
+
+def test_visual_servo_aligns_then_moves_forward_without_area_dependency():
+    from idv_agent.agent.rule_agent import CipherVisualServo
+    from idv_agent.configs.schema import ActionCategory
+
+    servo = CipherVisualServo(prompt_confirm_frames=2)
+    # Far left: turn only, no forward key.
+    cat, cont = servo.decide({"visible": "yes", "center_x": 0.2,
+                              "bbox_area_ratio": 0.001})
+    assert cat == int(ActionCategory.LOOK)
+    assert cont[1] == 0 and cont[2] < 0
+    # In the centre corridor: advance.  A sudden area drop must not stop us.
+    cat, cont = servo.decide({"visible": "yes", "center_x": 0.51,
+                              "bbox_area_ratio": 0.0001})
+    assert cat == int(ActionCategory.MOVE)
+    assert cont[1] == 1.0
+
+
+def test_visual_servo_requires_consecutive_prompt_and_taps_once():
+    from idv_agent.agent.rule_agent import CipherVisualServo
+    from idv_agent.configs.schema import ActionCategory
+
+    servo = CipherVisualServo(prompt_confirm_frames=2)
+    spatial = {"visible": "yes", "center_x": 0.5, "interact_prompt": "yes"}
+    cat, _ = servo.decide(spatial)
+    assert cat != int(ActionCategory.INTERACT_TAP)
+    cat, _ = servo.decide(spatial)
+    assert cat == int(ActionCategory.INTERACT_TAP)
+    cat, _ = servo.decide(spatial)
+    assert cat != int(ActionCategory.INTERACT_TAP)
+    # Decoding state takes over and stays in hold semantics.
+    cat, _ = servo.decide({"visible": "yes", "center_x": 0.5,
+                           "decoding_state": "yes"})
+    assert cat == int(ActionCategory.INTERACT_HOLD)
 
 
 def test_cipher_detector_template_match(tmp_path):
