@@ -171,6 +171,8 @@ def main(argv=None) -> int:
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--cipher-detect-interval", type=float, default=4.0,
                    help="密码机慢层检测间隔（秒，建议 3~5）")
+    p.add_argument("--cam-pixel-scale", type=float, default=120.0,
+                   help="相机归一化尺度；数值越大单帧转动越慢（默认 120）")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--vision-hidden", type=int, default=192, help="需与训练一致（bc_fast 默认 192）")
     p.add_argument("--skeleton-dim", type=int, default=64, help="需与训练一致（bc_fast 默认 64）")
@@ -229,6 +231,7 @@ def main(argv=None) -> int:
         cipher_template=str(args.cipher_template) if args.cipher_template else None,
         yolo_model_path=str(args.yolo_model) if args.yolo_model else None,
         cipher_detection_interval_s=args.cipher_detect_interval,
+        cam_pixel_scale=args.cam_pixel_scale,
         device=device,
     )
     print(f"[run_agent] mode={args.mode}, dry_run={not args.send_input}, duration={args.duration}s")

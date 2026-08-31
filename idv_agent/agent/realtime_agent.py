@@ -83,6 +83,7 @@ class RealtimeAgent:
         cipher_template: Optional[str] = None,
         yolo_model_path: Optional[str] = None,
         cipher_detection_interval_s: float = 4.0,
+        cam_pixel_scale: float = 120.0,
         device: torch.device = torch.device("cpu"),
     ):
         self.policy = policy
@@ -98,7 +99,9 @@ class RealtimeAgent:
         # 需要 .fast 字段的 Policy（LearnedPolicy）需要 decoder 和 skeleton 注入——
         # 由调用方在构造 LearnedPolicy 时已持有模型。decoder 在此统一构造。
         from idv_agent.configs.keymap import DEFAULT_SURVIVOR_KEYMAP
-        self.decoder = ActionDecoder(DEFAULT_SURVIVOR_KEYMAP)
+        if cam_pixel_scale <= 0:
+            raise ValueError("cam_pixel_scale 必须为正数")
+        self.decoder = ActionDecoder(DEFAULT_SURVIVOR_KEYMAP, cam_pixel_scale=cam_pixel_scale)
 
         self.shared = SharedState()
         from idv_agent.agent.perception import CipherMachineDetector

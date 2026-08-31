@@ -154,3 +154,19 @@ def test_run_agent_offline_image_mode(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "[test] offline" in output
     assert "action=MOVE_LOOK" in output or "action=MOVE" in output
+
+
+def test_realtime_agent_rejects_invalid_camera_scale():
+    import torch
+    from idv_agent.agent.action_executor import ActionExecutor
+    from idv_agent.agent.realtime_agent import RealtimeAgent
+    from idv_agent.model.policy import RulePolicy
+    from idv_agent.agent.rule_agent import RuleAgent
+    from idv_agent.capture.screen_capture import CaptureConfig
+    try:
+        RealtimeAgent(RulePolicy(RuleAgent()), ActionExecutor(dry_run=True),
+                      CaptureConfig(), cam_pixel_scale=0)
+    except ValueError as exc:
+        assert "cam_pixel_scale" in str(exc)
+    else:
+        raise AssertionError("invalid camera scale should fail")

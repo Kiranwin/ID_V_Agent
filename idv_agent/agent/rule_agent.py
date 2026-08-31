@@ -21,8 +21,8 @@ from typing import Tuple
 from idv_agent.configs.schema import ActionCategory
 
 
-SCAN_CAM_DX = 0.06        # 找密码机扫视幅度（≈12px/帧 @ 30Hz）
-ALIGN_CAM_DX = 0.10       # 对齐目标转视角幅度
+SCAN_CAM_DX = 0.025       # 慢速扫视（≈5px/帧 @ 30Hz）
+ALIGN_CAM_DX = 0.045      # 慢速对齐目标
 ALIGN_FAR_MULT = 1.6      # far_* 额外倍率
 TURN_AROUND_DX = 0.15     # 撞墙转身
 SCAN_PHASE_DURATION_S = 2.5
