@@ -62,11 +62,20 @@ def main(argv=None) -> int:
     start_wall = time.perf_counter()
     n_frames = 0
     frame_timestamps = []
+    frame_interval = 1.0 / max(args.fps, 1)
+    next_frame_deadline = time.perf_counter()
     try:
         with ScreenCapture(cfg) as cap:
             deadline = None
             print("[record] 录制已开始；Ctrl+C 结束（或 --max-seconds 自动结束）")
             while True:
+                # 绝对 deadline 调度：处理/写盘耗时不再与 sleep 叠加，
+                # 尽量维持目标 FPS；若处理已经落后则跳过等待并重新对齐。
+                now = time.perf_counter()
+                if now < next_frame_deadline:
+                    time.sleep(next_frame_deadline - now)
+                elif now - next_frame_deadline > frame_interval:
+                    next_frame_deadline = now
                 if args.max_seconds > 0 and time.perf_counter() - start_wall >= args.max_seconds:
                     break
                 if args.max_frames > 0 and n_frames >= args.max_frames:
@@ -87,7 +96,7 @@ def main(argv=None) -> int:
                 _save_frame(cv2, frame, p)
                 frame_timestamps.append((n_frames, capture_ts))
                 n_frames += 1
-                time.sleep(1 / args.fps)
+                next_frame_deadline += frame_interval
     except KeyboardInterrupt:
         print("\n[record] 中断")
     finally:
