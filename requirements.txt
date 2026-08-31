@@ -21,6 +21,7 @@ opencv-python
 Pillow
 pandas
 numpy
+ultralytics
 
 # 测试
 pytest
