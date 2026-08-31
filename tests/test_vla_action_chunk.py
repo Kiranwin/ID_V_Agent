@@ -17,7 +17,7 @@ def _record():
         "schema_version": VLA_SCHEMA_VERSION,
         "episode_id": "ep1",
         "anchor_frame": 3,
-        "intent": "approach_cipher",
+        "intent": "decipher",
         "task": {"name": "find_cipher_and_decode", "instruction": "找到密码机"},
         "observations": {
             "frames": [
@@ -28,8 +28,8 @@ def _record():
             "history_actions": [],
         },
         "action_chunk": [
-            {"nav": "forward", "interaction": "none", "camera_dx": 0,
-             "camera_dy": 0, "duration_frames": 6}
+            {"move_dir": 1, "camera_dx": 0,
+             "camera_dy": 0, "buttons": [0, 0, 0, 0, 0, 0], "duration_frames": 6}
             for _ in range(4)
         ],
         "quality": {"source": "teacher", "outcome": "success"},
@@ -70,6 +70,6 @@ def test_build_vla_chunks(tmp_path: Path):
     assert count == 10
     rec = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
     validate_record(rec)
-    assert rec["action_chunk"][0]["nav"] == "forward"
-    assert rec["action_chunk"][0]["camera_dx"] == 0.1
+    assert rec["action_chunk"][0]["move_dir"] == 1
+    assert rec["action_chunk"][0]["camera_dx"] == 0
     assert rec["alignment"]["action_start_frame"] == 8

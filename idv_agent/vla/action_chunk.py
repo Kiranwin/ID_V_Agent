@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-VLA_SCHEMA_VERSION = "vla.action_chunk.v1"
+VLA_SCHEMA_VERSION = "vla.action_chunk.v2"
 
 # Fixed lengths keep collation and low-latency rolling inference predictable.
 HISTORY_FRAMES = 3
@@ -21,12 +21,18 @@ MACRO_FRAMES = 6
 # leakage; deployments can increase this after measuring latency.
 DEFAULT_ACTION_DELAY_FRAMES = 1
 
-NAV_ACTIONS = ("forward", "left", "right", "stop_observe")
-INTERACTION_ACTIONS = ("none", "tap_q", "hold_decode", "release")
-INTENTS = (
-    "search_cipher", "align_cipher", "approach_cipher", "start_decode",
-    "decode", "recover_target", "avoid_obstacle", "stop_safety",
+# A single categorical movement head covers WASD diagonals without averaging
+# them into an ambiguous macro.  Index 0 is released/no movement.
+MOVE_DIRECTIONS = (
+    "stop", "north", "northeast", "east", "southeast",
+    "south", "southwest", "west", "northwest",
 )
+# Five bins per camera axis are enough for a fast first controller.  Raw mouse
+# deltas may remain in auxiliary metadata for later re-bucketing.
+CAMERA_BUCKETS = (-2, -1, 0, 1, 2)
+BUTTON_NAMES = ("interact", "vault", "item", "heal", "sprint", "crouch")
+# Top-level tactical intent; sub-intents are optional metadata, not model heads.
+INTENTS = ("decipher", "kite", "rescue", "rotate", "travel", "search", "gate", "idle")
 OUTCOMES = ("success", "partial", "failure", "unknown")
 SOURCES = ("human", "teacher", "model")
 
@@ -48,16 +54,18 @@ def _finite_number(value: Any, path: str) -> float:
 def _validate_action(action: Any, path: str, *, duration_required: bool = True) -> None:
     if not isinstance(action, Mapping):
         raise _err(path, "必须是对象")
-    nav = action.get("nav")
-    if nav not in NAV_ACTIONS:
-        raise _err(f"{path}.nav", f"必须是 {NAV_ACTIONS}")
-    interaction = action.get("interaction", "none")
-    if interaction not in INTERACTION_ACTIONS:
-        raise _err(f"{path}.interaction", f"必须是 {INTERACTION_ACTIONS}")
+    move_dir = action.get("move_dir")
+    if not isinstance(move_dir, int) or isinstance(move_dir, bool) or not 0 <= move_dir < len(MOVE_DIRECTIONS):
+        raise _err(f"{path}.move_dir", f"必须是 0..{len(MOVE_DIRECTIONS) - 1} 的整数")
     for name in ("camera_dx", "camera_dy"):
-        value = _finite_number(action.get(name, 0.0), f"{path}.{name}")
-        if not -1.0 <= value <= 1.0:
-            raise _err(f"{path}.{name}", "范围必须为 [-1, 1]")
+        value = action.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value not in CAMERA_BUCKETS:
+            raise _err(f"{path}.{name}", f"必须是离散桶 {CAMERA_BUCKETS}")
+    buttons = action.get("buttons")
+    if not isinstance(buttons, list) or len(buttons) != len(BUTTON_NAMES):
+        raise _err(f"{path}.buttons", f"必须是长度为 {len(BUTTON_NAMES)} 的 0/1 数组")
+    if any(isinstance(v, bool) or v not in (0, 1) for v in buttons):
+        raise _err(f"{path}.buttons", "元素必须为 0 或 1")
     if duration_required:
         duration = action.get("duration_frames")
         if not isinstance(duration, int) or isinstance(duration, bool) or duration < 1 or duration > 30:

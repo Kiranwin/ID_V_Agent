@@ -18,6 +18,9 @@ from idv_agent.vla.action_chunk import (
     HISTORY_FRAMES,
     MACRO_FRAMES,
     VLA_SCHEMA_VERSION,
+    BUTTON_NAMES,
+    CAMERA_BUCKETS,
+    MOVE_DIRECTIONS,
     validate_record,
 )
 
@@ -29,36 +32,49 @@ def _num(value, default=0.0):
         return default
 
 
-def _nav(rows):
+def _move_dir(rows):
     mx = sum(_num(r.get("move_x")) for r in rows) / len(rows)
     my = sum(_num(r.get("move_y")) for r in rows) / len(rows)
-    if abs(mx) < 0.25 and my > 0.35:
-        return "forward"
-    if mx < -0.25:
-        return "left"
-    if mx > 0.25:
-        return "right"
-    return "stop_observe"
+    if abs(mx) < 0.25 and my > 0.35: return 1  # north
+    if mx > 0.25 and my > 0.25: return 2       # northeast
+    if mx > 0.35 and abs(my) < 0.25: return 3  # east
+    if mx > 0.25 and my < -0.25: return 4      # southeast
+    if abs(mx) < 0.25 and my < -0.35: return 5 # south
+    if mx < -0.25 and my < -0.25: return 6     # southwest
+    if mx < -0.35 and abs(my) < 0.25: return 7 # west
+    if mx < -0.25 and my > 0.25: return 8      # northwest
+    return 0
 
 
-def _interaction(rows):
+def _camera_bucket(value):
+    value = max(-1.0, min(1.0, _num(value)))
+    if value < -0.6: return -2
+    if value < -0.15: return -1
+    if value <= 0.15: return 0
+    if value <= 0.6: return 1
+    return 2
+
+
+def _buttons(rows):
     names = {str(r.get("category_name", "")).upper() for r in rows}
-    if "INTERACT_TAP" in names:
-        return "tap_q"
-    if "INTERACT_HOLD" in names:
-        return "hold_decode"
-    if "INTERACT_RELEASE" in names:
-        return "release"
-    return "none"
+    held = "+".join(str(r.get("held_keys", "")) for r in rows).lower()
+    values = [0] * len(BUTTON_NAMES)
+    values[0] = int(any(n.startswith("INTERACT_") for n in names) or "key:q" in held)
+    values[1] = int("VAULT" in names or "key:space" in held)
+    values[2] = int(any(n.startswith("ITEM_") for n in names) or "key:f" in held)
+    values[3] = int("key:e" in held)
+    values[4] = int("key:shift" in held)
+    values[5] = int("key:ctrl" in held)
+    return values
 
 
 def _action(rows, frame_indices):
     n = max(len(rows), 1)
     return {
-        "nav": _nav(rows),
-        "interaction": _interaction(rows),
-        "camera_dx": round(sum(_num(r.get("cam_dx")) for r in rows) / n, 6),
-        "camera_dy": round(sum(_num(r.get("cam_dy")) for r in rows) / n, 6),
+        "move_dir": _move_dir(rows),
+        "camera_dx": _camera_bucket(sum(_num(r.get("cam_dx")) for r in rows) / n),
+        "camera_dy": _camera_bucket(sum(_num(r.get("cam_dy")) for r in rows) / n),
+        "buttons": _buttons(rows),
         "duration_frames": len(frame_indices),
     }
 
