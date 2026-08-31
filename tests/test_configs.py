@@ -61,7 +61,7 @@ def test_match_memory_records_cipher_detection():
 
 
 def test_prepare_yolo_dataset_splits_by_session(tmp_path):
-    from idv_agent.scripts.prepare_yolo_dataset import prepare
+    from idv_agent.scripts.prepare_yolo_dataset import CLASSES, prepare
 
     root = tmp_path / "sessions"
     for sid in ("s1", "s2"):
@@ -74,6 +74,7 @@ def test_prepare_yolo_dataset_splits_by_session(tmp_path):
                      stride=2, val_ratio=0.5, seed=1, max_per_session=None)
     assert copied == 4
     assert (out / "dataset.yaml").is_file()
+    assert CLASSES == ("cipher_visible", "cipher_highlight", "interact_prompt", "decoding_state")
     assert len(list((out / "images" / "train").glob("*.jpg"))) == 2
     assert len(list((out / "images" / "val").glob("*.jpg"))) == 2
     assert all(p.stat().st_size == 0 for p in (out / "labels" / "train").glob("*.txt"))

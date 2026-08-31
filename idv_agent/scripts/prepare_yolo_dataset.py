@@ -19,7 +19,13 @@ import shutil
 from pathlib import Path
 
 
-CLASSES = ("cipher_visible", "cipher_highlight")
+# 目标本体与交互状态分开标注。后两类是 HUD/UI 证据，不代表场景物体。
+CLASSES = (
+    "cipher_visible",
+    "cipher_highlight",
+    "interact_prompt",
+    "decoding_state",
+)
 
 
 def _session_dirs(root: Path, names: str | None) -> list[Path]:
