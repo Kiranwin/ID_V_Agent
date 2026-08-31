@@ -63,12 +63,14 @@ class CipherMachineDetector:
 
     def __init__(self, template_path: Optional[str | Path] = None,
                  yolo_model_path: Optional[str | Path] = None,
+                 debug: bool = False,
                  template_threshold: float = 0.72,
                  heuristic_threshold: float = 0.82,
                  highlight_threshold: float = 0.78,
                  template_scales: tuple[float, ...] =
                  (0.60, 0.75, 0.90, 1.00, 1.15, 1.35, 1.60)):
         self.template_threshold = template_threshold
+        self.debug = bool(debug)
         self.heuristic_threshold = heuristic_threshold
         self.highlight_threshold = highlight_threshold
         self.template_scales = tuple(float(s) for s in template_scales if s > 0)
@@ -232,12 +234,14 @@ class CipherMachineDetector:
             return None
         candidates = []
         prompt = decode = None
+        debug_boxes = []
         names = getattr(self.yolo_model, "names", {}) or {}
         for xyxy, cls_t, conf_t in zip(boxes.xyxy.cpu().tolist(), boxes.cls.cpu().tolist(), boxes.conf.cpu().tolist()):
             cls = int(cls_t); conf = float(conf_t)
             name = str(names.get(cls, cls)) if isinstance(names, dict) else str(cls)
             x1, y1, x2, y2 = [max(0, int(v)) for v in xyxy]
             bw, bh = max(1, x2-x1), max(1, y2-y1)
+            debug_boxes.append({"class_id": cls, "name": name, "confidence": round(conf, 3), "bbox": (x1, y1, bw, bh)})
             if cls == 2 or name in {"interact_prompt", "interact_decode"}:
                 prompt = (x1, y1, bw, bh, conf)
             elif cls == 3 or name == "decoding_state":
@@ -245,6 +249,7 @@ class CipherMachineDetector:
             elif cls in (0, 1) or name in {"cipher_visible", "cipher_highlight"}:
                 candidates.append((conf, x1, y1, bw, bh))
         if not candidates and prompt is None and decode is None:
+            if self.debug: print(f"[yolo-debug] boxes={debug_boxes} result=none")
             return None
         if candidates:
             conf, x, y, bw, bh = max(candidates)
@@ -255,7 +260,7 @@ class CipherMachineDetector:
             conf = max(conf, prompt[4])
         if decode is not None:
             conf = max(conf, decode[4])
-        return CipherDetection(
+        detection = CipherDetection(
             visible="yes" if candidates else "no",
             position=self._location(x + bw/2, w),
             distance=self._distance(bw*bh, w*h),
@@ -265,19 +270,22 @@ class CipherMachineDetector:
             interact_prompt="yes" if prompt is not None else "no",
             decoding_state="yes" if decode is not None else "no",
         )
+        if self.debug: print(f"[yolo-debug] boxes={debug_boxes} result={detection.as_spatial()} bbox={detection.bbox}")
+        return detection
 
 
 class EventDetector:
     def __init__(self, on_event: Optional[EventCallback] = None,
                  cipher_detector: Optional[CipherMachineDetector] = None,
-                 yolo_model_path: Optional[str | Path] = None):
+                 yolo_model_path: Optional[str | Path] = None,
+                 yolo_debug: bool = False):
         self._callbacks: list[EventCallback] = []
         if on_event is not None:
             self._callbacks.append(on_event)
         # 占位状态
         self._prev_hud = {}
         self.cipher_detector = cipher_detector or CipherMachineDetector(
-            yolo_model_path=yolo_model_path
+            yolo_model_path=yolo_model_path, debug=yolo_debug
         )
 
     def on_event(self, cb: EventCallback) -> None:

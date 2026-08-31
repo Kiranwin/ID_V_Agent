@@ -125,6 +125,7 @@ def run_image_test(args, policy) -> int:
     detector = CipherMachineDetector(
         template_path=str(args.cipher_template) if args.cipher_template else None,
         yolo_model_path=str(args.yolo_model) if args.yolo_model else None,
+        debug=args.debug_yolo,
     )
     decoder = ActionDecoder(DEFAULT_SURVIVOR_KEYMAP)
     memory = MatchMemory()
@@ -166,6 +167,7 @@ def main(argv=None) -> int:
                    help="密码机模板图片（建议同分辨率、同地图；不传则不触发自动找机）")
     p.add_argument("--yolo-model", type=Path, default=None,
                    help="YOLO 密码机检测权重（best.pt）")
+    p.add_argument("--debug-yolo", action="store_true", help="打印 YOLO 原始检测框和结果")
     p.add_argument("--region", type=parse_region, default=None)
     p.add_argument("--duration", type=float, default=30.0)
     p.add_argument("--fps", type=int, default=30)
@@ -230,6 +232,7 @@ def main(argv=None) -> int:
         slow_planner=None,   # M1 暂不接 VLM；M2 接入 slow_planner 需手动构造
         cipher_template=str(args.cipher_template) if args.cipher_template else None,
         yolo_model_path=str(args.yolo_model) if args.yolo_model else None,
+        yolo_debug=args.debug_yolo,
         cipher_detection_interval_s=args.cipher_detect_interval,
         cam_pixel_scale=args.cam_pixel_scale,
         device=device,

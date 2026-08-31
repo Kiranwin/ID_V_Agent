@@ -82,6 +82,7 @@ class RealtimeAgent:
         slow_planner=None,               # Optional[SlowPlanner]
         cipher_template: Optional[str] = None,
         yolo_model_path: Optional[str] = None,
+        yolo_debug: bool = False,
         cipher_detection_interval_s: float = 4.0,
         cam_pixel_scale: float = 120.0,
         device: torch.device = torch.device("cpu"),
@@ -111,6 +112,7 @@ class RealtimeAgent:
             cipher_detector=CipherMachineDetector(
                 template_path=cipher_template,
                 yolo_model_path=yolo_model_path,
+                debug=yolo_debug,
             ) if (cipher_template or yolo_model_path) else None,
         )
         self.stop_event = threading.Event()
