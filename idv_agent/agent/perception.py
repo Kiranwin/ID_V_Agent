@@ -59,10 +59,13 @@ class CipherMachineDetector:
     def __init__(self, template_path: Optional[str | Path] = None,
                  template_threshold: float = 0.72,
                  heuristic_threshold: float = 0.82,
-                 highlight_threshold: float = 0.78):
+                 highlight_threshold: float = 0.78,
+                 template_scales: tuple[float, ...] =
+                 (0.60, 0.75, 0.90, 1.00, 1.15, 1.35, 1.60)):
         self.template_threshold = template_threshold
         self.heuristic_threshold = heuristic_threshold
         self.highlight_threshold = highlight_threshold
+        self.template_scales = tuple(float(s) for s in template_scales if s > 0)
         self.template = None
         if template_path:
             try:
@@ -137,29 +140,35 @@ class CipherMachineDetector:
         import cv2
         h, w = frame.shape[:2]
         if self.template is not None:
-            th, tw = self.template.shape[:2]
-            if th <= h and tw <= w:
+            # A 3-D machine changes apparent size with distance.  Try a small
+            # set of scales; this remains cheap for a single crop and avoids
+            # requiring a separate template for every camera distance.
+            best = None
+            for scale in self.template_scales:
+                tw = max(2, int(round(self.template.shape[1] * scale)))
+                th = max(2, int(round(self.template.shape[0] * scale)))
+                if th > h or tw > w:
+                    continue
+                templ = cv2.resize(self.template, (tw, th), interpolation=cv2.INTER_AREA)
                 # CCOEFF_NORMED is undefined for uniform templates (e.g. a
-                # tightly cropped icon/patch), which can make minMaxLoc pick
-                # the top-left corner regardless of the actual match.  Use
-                # normalized squared difference in that case and convert it
-                # to the same higher-is-better score convention.
-                method = cv2.TM_CCOEFF_NORMED
-                # JPEG/template patches may be constant per channel while
-                # channel means differ (overall std is then non-zero).
-                channel_std = np.std(self.template.reshape(-1, self.template.shape[-1]), axis=0)
-                if float(np.max(channel_std)) < 1e-3:
-                    method = cv2.TM_SQDIFF_NORMED
-                result = cv2.matchTemplate(frame, self.template, method)
+                # tightly cropped icon/patch), so use squared difference in
+                # that case and convert to a higher-is-better score.
+                channel_std = np.std(templ.reshape(-1, templ.shape[-1]), axis=0)
+                method = (cv2.TM_SQDIFF_NORMED
+                          if float(np.max(channel_std)) < 1e-3
+                          else cv2.TM_CCOEFF_NORMED)
+                result = cv2.matchTemplate(frame, templ, method)
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-                if method == cv2.TM_SQDIFF_NORMED:
-                    score, loc = 1.0 - float(min_val), min_loc
-                else:
-                    score, loc = float(max_val), max_loc
-                if score >= self.template_threshold:
-                    x, y = int(loc[0]), int(loc[1])
-                    return CipherDetection("yes", self._location(x + tw/2, w),
-                        self._distance(tw*th, w*h), float(score), (x,y,tw,th), "template")
+                score, loc = ((1.0 - float(min_val), min_loc)
+                              if method == cv2.TM_SQDIFF_NORMED
+                              else (float(max_val), max_loc))
+                if best is None or score > best[0]:
+                    best = (score, loc, tw, th)
+            if best is not None and best[0] >= self.template_threshold:
+                score, loc, tw, th = best
+                x, y = int(loc[0]), int(loc[1])
+                return CipherDetection("yes", self._location(x + tw/2, w),
+                    self._distance(tw*th, w*h), float(score), (x,y,tw,th), "template")
 
         # Through-wall yellow beacon.  This cue is available even when the
         # 3D machine mesh itself is completely hidden.
