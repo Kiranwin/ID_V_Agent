@@ -32,7 +32,9 @@ class MatchMemory:
         self.hunter_last_ts: float = 0.0
         self.cipher_progress: dict[str, float] = {}       # 密码机名 -> 进度 0..1
         self.dungeon_position: Optional[str] = None       # 地窖位置
-        self.teammate_hooked: list[str] = field(default_factory=list)
+        # MatchMemory 不是 dataclass；这里必须实例化真实列表，不能使用
+        # dataclasses.field（否则 summary() 会拿到 Field 对象并在运行时崩溃）。
+        self.teammate_hooked: list[str] = []
         self.door_open: bool = False
 
     # ---- 事件 ----

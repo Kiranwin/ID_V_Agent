@@ -1,0 +1,25 @@
+name: idv312
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch==2.6.0+cu124
+      - torchvision==0.21.0+cu124
+      - "transformers>=5.8"
+      - "peft>=0.19"
+      - "accelerate>=1.13"
+      - sentencepiece
+      - modelscope
+      - qwen-vl-utils
+      - dxcam
+      - pynput
+      - pygetwindow
+      - pydirectinput
+      - opencv-python
+      - Pillow
+      - pandas
+      - numpy
+      - pytest

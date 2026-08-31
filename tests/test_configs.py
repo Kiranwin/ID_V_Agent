@@ -30,3 +30,32 @@ def test_rule_policy_passes_spatial_state():
         "memory": {},
     })
     assert out.category_id == 4
+
+
+def test_match_memory_summary_has_real_collections():
+    from idv_agent.agent.memory import MatchMemory, MemoryEvent
+
+    mem = MatchMemory()
+    mem.add_event(MemoryEvent(kind="teammate_hooked", position="chair_A"))
+    summary = mem.summary()
+    assert summary["teammates_hooked"] == ["chair_A"]
+    assert summary["n_events"] == 1
+
+
+def test_run_agent_send_input_requires_admin(monkeypatch):
+    """安全回归：非管理员进程不得进入真发送路径。"""
+    import ctypes
+    from idv_agent.scripts import run_agent
+
+    class _Shell:
+        @staticmethod
+        def IsUserAnAdmin():
+            return 0
+
+    monkeypatch.setattr(ctypes, "windll", type("W", (), {"shell32": _Shell})(), raising=False)
+    try:
+        run_agent.main(["--mode", "rule", "--send-input", "--duration", "0"])
+    except RuntimeError as exc:
+        assert "管理员权限" in str(exc)
+    else:
+        raise AssertionError("非管理员 --send-input 应被拒绝")

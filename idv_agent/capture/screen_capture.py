@@ -42,7 +42,18 @@ class ScreenCapture:
         except ImportError as e:  # pragma: no cover
             raise RuntimeError("opencv-python 未安装") from e
         self._cv2 = cv2
-        self._camera = dxcam.create(output_idx=0, output_color="BGR")
+        try:
+            self._camera = dxcam.create(output_idx=0, output_color="BGR")
+        except Exception as exc:
+            # DXGI DuplicateOutput 常以 COMError/Access Denied 形式出现；
+            # 给出针对 Windows 会话、管理员权限和 RDP/锁屏的可执行提示。
+            self._camera = None
+            msg = str(exc)
+            raise RuntimeError(
+                "DXGI 屏幕复制初始化失败（DuplicateOutput 拒绝访问）。"
+                "请确认当前 Python 进程与游戏处于同一交互式桌面、以管理员身份运行，"
+                "且未处于锁屏/RDP 断开会话；然后重试。原始错误: " + msg
+            ) from exc
         # dxcam 使用 (left, top, right, bottom)；对外配置保持更直观的
         # (left, top, width, height)。未显式指定时按窗口标题解析一次区域。
         if self.config.region is not None:

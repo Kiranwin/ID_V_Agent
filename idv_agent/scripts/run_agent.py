@@ -107,7 +107,7 @@ def build_policy(args, device):
     raise ValueError(f"未知 mode: {args.mode}")
 
 
-def main() -> int:
+def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["rule", "fast"], default="rule",
                    help="rule=M1规则闭环，fast=M2学习快层")
@@ -125,13 +125,20 @@ def main() -> int:
     p.add_argument("--send-input", action="store_true", help="真发送键鼠（仅沙盒！）")
     p.add_argument("--dry-run", action="store_true", help="显式声明仅记录命令（默认行为）")
     p.add_argument("--device", default="cpu")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     if args.send_input and args.dry_run:
         p.error("--send-input 与 --dry-run 不能同时使用")
 
     import torch
     device = torch.device(args.device)
+    if args.send_input:
+        # 提前阻止“看似启动成功、实际运行在非管理员会话”的危险误用。
+        import ctypes
+        if not (hasattr(ctypes, "windll") and ctypes.windll.shell32.IsUserAnAdmin()):
+            raise RuntimeError(
+                "--send-input 必须从管理员权限终端运行；当前 Python 进程未提升。"
+            )
     policy, _ = build_policy(args, device)
 
     capture_cfg = CaptureConfig(
@@ -153,6 +160,10 @@ def main() -> int:
     max_frames = int(args.fps * args.duration)
     agent.run(max_frames=max_frames)
     print(f"[run_agent] 结束，帧数={agent.frame_count}")
+    for stage, stats in agent.latency.summary().items():
+        print(f"[latency] {stage}: mean={stats['mean']:.2f}ms "
+              f"p50={stats['p50']:.2f}ms p95={stats['p95']:.2f}ms "
+              f"p99={stats['p99']:.2f}ms max={stats['max']:.2f}ms")
     return 0
 
 

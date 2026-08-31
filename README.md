@@ -77,10 +77,16 @@ pip install -r requirements.txt
 # 2. 无 GPU / 无游戏也能验证管线
 python -m idv_agent.scripts.smoke_test
 
-# 3. 真实录制（管理员权限，详见 docs/05）
+# 3. M0 环境只读自检（不启动游戏、不发送输入）
+python -m idv_agent.scripts.doctor
+
+# 4. 真实录制（管理员权限，详见 docs/05）
 python -m idv_agent.scripts.record --list-windows
 
-# 4. 数据统计（确认类别分布，P4 验证）
+# M0 捕获延迟基准（管理员终端、游戏窗口已打开；只读不注入）
+python -m idv_agent.scripts.benchmark_capture --title "第五人格" --seconds 60
+
+# 5. 数据统计（确认类别分布，P4 验证）
 python -m idv_agent.scripts.stats --session-dir data/sessions/<session_id>
 ```
 
