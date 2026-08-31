@@ -60,6 +60,25 @@ def test_match_memory_records_cipher_detection():
     assert summary["cipher_last_detection"]["position"] == "right"
 
 
+def test_prepare_yolo_dataset_splits_by_session(tmp_path):
+    from idv_agent.scripts.prepare_yolo_dataset import prepare
+
+    root = tmp_path / "sessions"
+    for sid in ("s1", "s2"):
+        frames = root / sid / "frames"
+        frames.mkdir(parents=True)
+        for i in range(3):
+            (frames / f"{i:08d}.jpg").write_bytes(b"jpeg")
+    out = tmp_path / "yolo"
+    copied = prepare(sessions_root=root, session_names=None, output=out,
+                     stride=2, val_ratio=0.5, seed=1, max_per_session=None)
+    assert copied == 4
+    assert (out / "dataset.yaml").is_file()
+    assert len(list((out / "images" / "train").glob("*.jpg"))) == 2
+    assert len(list((out / "images" / "val").glob("*.jpg"))) == 2
+    assert all(p.stat().st_size == 0 for p in (out / "labels" / "train").glob("*.txt"))
+
+
 def test_run_agent_send_input_requires_admin(monkeypatch):
     """安全回归：非管理员进程不得进入真发送路径。"""
     import ctypes
