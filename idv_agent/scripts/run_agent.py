@@ -21,6 +21,10 @@ from idv_agent.agent.memory import MatchMemory
 from idv_agent.agent.realtime_agent import RealtimeAgent
 from idv_agent.agent.rule_agent import RuleAgent
 from idv_agent.capture.screen_capture import CaptureConfig
+from idv_agent.agent.action_decoder import ActionDecoder
+from idv_agent.agent.perception import CipherMachineDetector
+from idv_agent.configs.keymap import DEFAULT_SURVIVOR_KEYMAP
+from idv_agent.configs.schema import ActionCategory
 
 
 def parse_region(s: str):
@@ -107,6 +111,52 @@ def build_policy(args, device):
     raise ValueError(f"未知 mode: {args.mode}")
 
 
+def run_image_test(args, policy) -> int:
+    """Offline perception/policy replay; never opens DXGI or sends input."""
+    import cv2
+    if args.test_image:
+        paths = [Path(p) for p in args.test_image]
+    else:
+        root = Path(args.test_dir)
+        paths = sorted(p for p in root.iterdir()
+                       if p.suffix.lower() in {".jpg", ".jpeg", ".png"})[::args.test_stride]
+    if not paths:
+        raise ValueError("测试输入为空：请提供有效图片或非空目录")
+    detector = CipherMachineDetector(
+        template_path=str(args.cipher_template) if args.cipher_template else None,
+        yolo_model_path=str(args.yolo_model) if args.yolo_model else None,
+    )
+    decoder = ActionDecoder(DEFAULT_SURVIVOR_KEYMAP)
+    memory = MatchMemory()
+    print(f"[test] offline images={len(paths)} mode={args.mode} send_input=False")
+    for i, path in enumerate(paths, 1):
+        frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if frame is None:
+            print(f"[test] skip unreadable path={path}")
+            continue
+        detection = detector.detect(frame)
+        spatial = detection.as_spatial()
+        state = {
+            "intent_vector": [0.0] * 16,
+            "skeleton_idx": 0,
+            "spatial": spatial,
+            "memory": memory.summary(),
+        }
+        out = policy.decide(frame, state)
+        cmds = decoder.decode(out.category_id, out.continuous)
+        try:
+            action_name = ActionCategory(int(out.category_id)).name
+        except ValueError:
+            action_name = str(out.category_id)
+        print(
+            f"[test:{i}] file={path.name} "
+            f"detect={spatial} action={action_name} "
+            f"continuous={tuple(round(float(v), 3) for v in out.continuous)} "
+            f"commands={cmds}"
+        )
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["rule", "fast"], default="rule",
@@ -131,10 +181,23 @@ def main(argv=None) -> int:
     p.add_argument("--send-input", action="store_true", help="真发送键鼠（仅沙盒！）")
     p.add_argument("--dry-run", action="store_true", help="显式声明仅记录命令（默认行为）")
     p.add_argument("--device", default="cpu")
+    test_group = p.add_mutually_exclusive_group()
+    test_group.add_argument("--test-image", action="append", default=None,
+                            help="离线测试单张图片；可重复传入多张")
+    test_group.add_argument("--test-dir", type=Path, default=None,
+                            help="离线测试图片目录（按文件名排序）")
+    p.add_argument("--test-stride", type=int, default=1,
+                   help="--test-dir 每隔多少张图片测试一张")
     args = p.parse_args(argv)
 
     if args.send_input and args.dry_run:
         p.error("--send-input 与 --dry-run 不能同时使用")
+    if args.test_stride <= 0:
+        p.error("--test-stride 必须为正数")
+    if (args.test_image or args.test_dir) and args.send_input:
+        p.error("离线测试模式禁止 --send-input")
+    if args.test_dir is not None and not args.test_dir.is_dir():
+        p.error(f"测试目录不存在: {args.test_dir}")
 
     import torch
     device = torch.device(args.device)
@@ -146,6 +209,9 @@ def main(argv=None) -> int:
                 "--send-input 必须从管理员权限终端运行；当前 Python 进程未提升。"
             )
     policy, _ = build_policy(args, device)
+
+    if args.test_image or args.test_dir:
+        return run_image_test(args, policy)
 
     capture_cfg = CaptureConfig(
         fps=args.fps,

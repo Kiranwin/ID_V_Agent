@@ -139,3 +139,18 @@ def test_cipher_detector_through_wall_highlight():
     assert result.visible == "yes"
     assert result.position == "center"
     assert result.confidence >= 0.78
+
+
+def test_run_agent_offline_image_mode(tmp_path, capsys):
+    import cv2
+    import numpy as np
+    from idv_agent.scripts import run_agent
+
+    image = tmp_path / "frame.jpg"
+    frame = np.zeros((180, 240, 3), dtype=np.uint8)
+    frame[55:125, 112:120] = (0, 255, 255)
+    cv2.imwrite(str(image), frame)
+    assert run_agent.main(["--mode", "rule", "--test-image", str(image)]) == 0
+    output = capsys.readouterr().out
+    assert "[test] offline" in output
+    assert "action=MOVE_LOOK" in output or "action=MOVE" in output
