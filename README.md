@@ -83,6 +83,9 @@ python -m idv_agent.scripts.doctor
 # 4. 真实录制（管理员权限，详见 docs/05）
 python -m idv_agent.scripts.record --list-windows
 
+# M1 每局采集后的会话完整性检查
+python -m idv_agent.scripts.validate_session --session-dir data/sessions/<session_id>
+
 # M0 捕获延迟基准（管理员终端、游戏窗口已打开；只读不注入）
 python -m idv_agent.scripts.benchmark_capture --title "第五人格" --seconds 60
 
