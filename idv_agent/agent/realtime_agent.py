@@ -208,6 +208,13 @@ class RealtimeAgent:
                         self._last_cipher_detection_at = time.perf_counter()
                         with self.shared.lock:
                             self.shared.spatial = dict(spatial)
+                        print(
+                            f"[cipher] detect visible={spatial.get('visible')} "
+                            f"position={spatial.get('position')} "
+                            f"distance={spatial.get('distance')} "
+                            f"confidence={spatial.get('confidence', 0.0):.3f} "
+                            f"source={spatial.get('source', 'none')}"
+                        )
                         from idv_agent.agent.memory import MemoryEvent
                         import json
                         self.memory.add_event(MemoryEvent(
