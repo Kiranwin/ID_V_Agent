@@ -64,3 +64,15 @@ def test_run_agent_send_input_requires_admin(monkeypatch):
         assert "管理员权限" in str(exc)
     else:
         raise AssertionError("非管理员 --send-input 应被拒绝")
+
+
+def test_cipher_detector_safe_empty_and_spatial_shape():
+    import numpy as np
+    from idv_agent.agent.perception import CipherMachineDetector
+
+    detector = CipherMachineDetector()
+    result = detector.detect(np.zeros((120, 160, 3), dtype=np.uint8))
+    spatial = result.as_spatial()
+    assert set(("visible", "position", "distance", "confidence")) <= set(spatial)
+    assert spatial["visible"] == "no"
+    assert 0.0 <= spatial["confidence"] <= 1.0

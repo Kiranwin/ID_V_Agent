@@ -13,6 +13,8 @@ P8 场景：监管者砍断破译是游戏侧状态变化（无按键事件）�
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -28,13 +30,109 @@ class PerceptionEvent:
 EventCallback = Callable[[str, dict], None]
 
 
+@dataclass
+class CipherDetection:
+    """密码机候选的结构化结果，供 RuleAgent 消费。"""
+    visible: str = "no"
+    position: str = "none"
+    distance: str = "none"
+    confidence: float = 0.0
+    bbox: Optional[tuple[int, int, int, int]] = None
+    source: str = "none"
+
+    def as_spatial(self) -> dict:
+        return {
+            "visible": self.visible,
+            "position": self.position,
+            "distance": self.distance,
+            "confidence": round(float(self.confidence), 3),
+        }
+
+
+class CipherMachineDetector:
+    """轻量密码机候选检测器。
+
+    优先使用同地图模板（避免把场景物体误当密码机）；无模板时使用保守的
+    HSV 高亮候选启发式，仅输出低置信度结果，便于离线回放和后续校准。
+    """
+
+    def __init__(self, template_path: Optional[str | Path] = None,
+                 template_threshold: float = 0.72,
+                 heuristic_threshold: float = 0.82):
+        self.template_threshold = template_threshold
+        self.heuristic_threshold = heuristic_threshold
+        self.template = None
+        if template_path:
+            try:
+                import cv2
+                self.template = cv2.imread(str(template_path), cv2.IMREAD_COLOR)
+                if self.template is None:
+                    raise ValueError("模板图片无法读取")
+            except Exception as exc:
+                raise ValueError(f"密码机模板加载失败: {template_path}: {exc}") from exc
+
+    @staticmethod
+    def _location(cx: float, width: int) -> str:
+        ratio = cx / max(width, 1)
+        if ratio < 0.35: return "far_left" if ratio < 0.18 else "left"
+        if ratio > 0.65: return "far_right" if ratio > 0.82 else "right"
+        return "center"
+
+    @staticmethod
+    def _distance(area: float, frame_area: float) -> str:
+        ratio = area / max(frame_area, 1.0)
+        if ratio >= 0.035: return "near"
+        if ratio >= 0.008: return "mid"
+        return "far"
+
+    def detect(self, frame: np.ndarray) -> CipherDetection:
+        if frame is None or not isinstance(frame, np.ndarray) or frame.ndim != 3:
+            return CipherDetection()
+        import cv2
+        h, w = frame.shape[:2]
+        if self.template is not None:
+            th, tw = self.template.shape[:2]
+            if th <= h and tw <= w:
+                result = cv2.matchTemplate(frame, self.template, cv2.TM_CCOEFF_NORMED)
+                _, score, _, loc = cv2.minMaxLoc(result)
+                if score >= self.template_threshold:
+                    x, y = int(loc[0]), int(loc[1])
+                    return CipherDetection("yes", self._location(x + tw/2, w),
+                        self._distance(tw*th, w*h), float(score), (x,y,tw,th), "template")
+
+        # 保守启发式：密码机常见的高亮黄/青色局部块，排除顶部 HUD。
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array([15, 90, 100]), np.array([100, 255, 255]))
+        mask[: int(h * 0.16), :] = 0
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        candidates = []
+        for i in range(1, n):
+            x, y, bw, bh, area = [int(v) for v in stats[i]]
+            if area < 80 or bw < 6 or bh < 6 or area > w*h*0.08:
+                continue
+            fill = area / max(bw*bh, 1)
+            if fill < 0.12:
+                continue
+            candidates.append((area * min(fill, 1.0), x, y, bw, bh))
+        if not candidates:
+            return CipherDetection()
+        _, x, y, bw, bh = max(candidates)
+        # 启发式只作为候选，置信度低于模板结果，避免盲目驱动注入。
+        conf = min(0.9, 0.45 + (bw*bh)/(w*h)*4.0)
+        visible = "yes" if conf >= self.heuristic_threshold else "no"
+        return CipherDetection(visible, self._location(x+bw/2, w),
+            self._distance(bw*bh, w*h), conf, (x,y,bw,bh), "heuristic")
+
+
 class EventDetector:
-    def __init__(self, on_event: Optional[EventCallback] = None):
+    def __init__(self, on_event: Optional[EventCallback] = None,
+                 cipher_detector: Optional[CipherMachineDetector] = None):
         self._callbacks: list[EventCallback] = []
         if on_event is not None:
             self._callbacks.append(on_event)
         # 占位状态
         self._prev_hud = {}
+        self.cipher_detector = cipher_detector or CipherMachineDetector()
 
     def on_event(self, cb: EventCallback) -> None:
         self._callbacks.append(cb)
@@ -51,7 +149,8 @@ class EventDetector:
 
         返回事件列表（可能是多个）。此占位不实际检测，仅保留接口供 M1 落地。
         """
-        return []
+        detection = self.cipher_detector.detect(frame)
+        return detection.as_spatial()
 
     def on_decode_progress(self, progress: Optional[float]) -> None:
         """P8：破译进度消失（被打断）时触发 decode_interrupt 事件。"""

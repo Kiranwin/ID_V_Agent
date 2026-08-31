@@ -186,7 +186,9 @@ class RealtimeAgent:
                             self.shared.last_frame = frame
 
                     # 感知（事件检测——P8 占位）
-                    self.perception.on_frame(frame)
+                    spatial = self.perception.on_frame(frame)
+                    with self.shared.lock:
+                        self.shared.spatial = dict(spatial)
 
                     # 决策
                     t0 = time.perf_counter()
