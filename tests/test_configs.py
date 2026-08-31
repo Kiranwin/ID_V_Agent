@@ -76,3 +76,19 @@ def test_cipher_detector_safe_empty_and_spatial_shape():
     assert set(("visible", "position", "distance", "confidence")) <= set(spatial)
     assert spatial["visible"] == "no"
     assert 0.0 <= spatial["confidence"] <= 1.0
+
+
+def test_cipher_detector_template_match(tmp_path):
+    import cv2
+    import numpy as np
+    from idv_agent.agent.perception import CipherMachineDetector
+
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    patch = np.full((18, 14, 3), (20, 180, 220), dtype=np.uint8)
+    frame[55:73, 72:86] = patch
+    template_path = tmp_path / "cipher.jpg"
+    cv2.imwrite(str(template_path), patch)
+    result = CipherMachineDetector(template_path=template_path).detect(frame)
+    assert result.source == "template"
+    assert result.visible == "yes"
+    assert result.position == "center"

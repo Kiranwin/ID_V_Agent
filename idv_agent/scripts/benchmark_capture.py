@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import statistics
 import time
+from pathlib import Path
 
 from idv_agent.capture.input_logger import find_window_region
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
@@ -30,6 +31,8 @@ def main(argv=None) -> int:
     p.add_argument("--region", type=parse_region, default=None)
     p.add_argument("--fps", type=int, default=60)
     p.add_argument("--seconds", type=float, default=10.0)
+    p.add_argument("--save-frame", type=Path, default=None,
+                   help="保存第一张成功捕获的帧为模板候选（需人工裁剪密码机区域）")
     args = p.parse_args(argv)
     if args.fps <= 0 or args.seconds <= 0:
         p.error("--fps 和 --seconds 必须为正数")
@@ -62,6 +65,10 @@ def main(argv=None) -> int:
                 empty += 1
             else:
                 frames += 1
+                if args.save_frame is not None and frames == 1:
+                    args.save_frame.parent.mkdir(parents=True, exist_ok=True)
+                    cv2 = __import__("cv2")
+                    cv2.imwrite(str(args.save_frame), frame)
 
     total = frames + empty
     elapsed = max(args.seconds, 1e-9)

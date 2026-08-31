@@ -93,8 +93,23 @@ class CipherMachineDetector:
         if self.template is not None:
             th, tw = self.template.shape[:2]
             if th <= h and tw <= w:
-                result = cv2.matchTemplate(frame, self.template, cv2.TM_CCOEFF_NORMED)
-                _, score, _, loc = cv2.minMaxLoc(result)
+                # CCOEFF_NORMED is undefined for uniform templates (e.g. a
+                # tightly cropped icon/patch), which can make minMaxLoc pick
+                # the top-left corner regardless of the actual match.  Use
+                # normalized squared difference in that case and convert it
+                # to the same higher-is-better score convention.
+                method = cv2.TM_CCOEFF_NORMED
+                # JPEG/template patches may be constant per channel while
+                # channel means differ (overall std is then non-zero).
+                channel_std = np.std(self.template.reshape(-1, self.template.shape[-1]), axis=0)
+                if float(np.max(channel_std)) < 1e-3:
+                    method = cv2.TM_SQDIFF_NORMED
+                result = cv2.matchTemplate(frame, self.template, method)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                if method == cv2.TM_SQDIFF_NORMED:
+                    score, loc = 1.0 - float(min_val), min_loc
+                else:
+                    score, loc = float(max_val), max_loc
                 if score >= self.template_threshold:
                     x, y = int(loc[0]), int(loc[1])
                     return CipherDetection("yes", self._location(x + tw/2, w),

@@ -112,6 +112,8 @@ def main(argv=None) -> int:
     p.add_argument("--mode", choices=["rule", "fast"], default="rule",
                    help="rule=M1规则闭环，fast=M2学习快层")
     p.add_argument("--title", default="Identity V")
+    p.add_argument("--cipher-template", type=Path, default=None,
+                   help="密码机模板图片（建议同分辨率、同地图；不传则不触发自动找机）")
     p.add_argument("--region", type=parse_region, default=None)
     p.add_argument("--duration", type=float, default=30.0)
     p.add_argument("--fps", type=int, default=30)
@@ -154,6 +156,7 @@ def main(argv=None) -> int:
         target_fps=args.fps,
         memory=MatchMemory(),
         slow_planner=None,   # M1 暂不接 VLM；M2 接入 slow_planner 需手动构造
+        cipher_template=str(args.cipher_template) if args.cipher_template else None,
         device=device,
     )
     print(f"[run_agent] mode={args.mode}, dry_run={not args.send_input}, duration={args.duration}s")

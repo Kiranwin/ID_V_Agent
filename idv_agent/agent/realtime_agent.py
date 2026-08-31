@@ -80,6 +80,7 @@ class RealtimeAgent:
         target_fps: int = 30,
         memory: Optional[MatchMemory] = None,
         slow_planner=None,               # Optional[SlowPlanner]
+        cipher_template: Optional[str] = None,
         device: torch.device = torch.device("cpu"),
     ):
         self.policy = policy
@@ -95,7 +96,12 @@ class RealtimeAgent:
         self.decoder = ActionDecoder(DEFAULT_SURVIVOR_KEYMAP)
 
         self.shared = SharedState()
-        self.perception = EventDetector(on_event=self._on_event)
+        from idv_agent.agent.perception import CipherMachineDetector
+        self.perception = EventDetector(
+            on_event=self._on_event,
+            cipher_detector=CipherMachineDetector(template_path=cipher_template)
+            if cipher_template else None,
+        )
         self.stop_event = threading.Event()
         self.latency = LatencyTracker()
         self.frame_count = 0
