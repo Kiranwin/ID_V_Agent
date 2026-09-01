@@ -7,6 +7,9 @@ import csv
 import json
 from pathlib import Path
 
+from idv_agent.configs.game_mode import GAME_MODE_CHOICES
+from idv_agent.vla.action_chunk import VLA_SCHEMA_VERSION
+
 
 def validate(session: Path) -> list[str]:
     errors = []
@@ -19,6 +22,10 @@ def validate(session: Path) -> list[str]:
         return [f"meta.json 无法解析: {exc}"]
     if meta.get("recording_type") != "vla_raw":
         errors.append("recording_type 不是 vla_raw（旧 session 不可作为 VLA 原始集）")
+    if meta.get("vla_schema_version") != VLA_SCHEMA_VERSION:
+        errors.append(f"vla_schema_version 必须是 {VLA_SCHEMA_VERSION}")
+    if meta.get("mode") not in GAME_MODE_CHOICES:
+        errors.append(f"mode 必须是 {GAME_MODE_CHOICES}")
     for name in ("events.csv", "mouse_positions.csv", "frame_timestamps.csv"):
         if not (session / name).is_file():
             errors.append(f"缺少 {name}")

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from idv_agent.capture.input_logger import InputRecorder
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
+from idv_agent.configs.game_mode import DEFAULT_GAME_MODE, GAME_MODE_CHOICES
 from idv_agent.vla.action_chunk import (
     DEFAULT_ACTION_DELAY_FRAMES,
     VLA_SCHEMA_VERSION,
@@ -90,6 +91,7 @@ def record(args) -> Path:
         "vla_schema_version": VLA_SCHEMA_VERSION,
         "session_id": session_id,
         "source": "human",
+        "mode": args.mode,
         "task_name": args.task_name,
         "task_instruction": args.task_instruction,
         "target_fps": args.fps,
@@ -123,6 +125,8 @@ def main(argv=None) -> int:
     parser.add_argument("--jpeg-quality", type=int, default=90)
     parser.add_argument("--task-name", default="find_cipher_and_decode")
     parser.add_argument("--task-instruction", default="找到密码机，靠近并进入破译")
+    parser.add_argument("--mode", choices=GAME_MODE_CHOICES, default=DEFAULT_GAME_MODE,
+                        help="游戏模式；写入 meta.json 并作为 VLA 条件 token")
     parser.add_argument("--note", default="只在官方自定义剧本/训练营录制")
     args = parser.parse_args(argv)
     if args.fps <= 0 or args.max_width <= 0 or not 1 <= args.jpeg_quality <= 100:

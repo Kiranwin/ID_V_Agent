@@ -10,7 +10,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-VLA_SCHEMA_VERSION = "vla.action_chunk.v2"
+from idv_agent.configs.game_mode import GAME_MODE_CHOICES, mode_token
+
+VLA_SCHEMA_VERSION = "vla.action_chunk.v3"
 
 # Fixed lengths keep collation and low-latency rolling inference predictable.
 HISTORY_FRAMES = 3
@@ -90,10 +92,15 @@ def validate_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -
         raise _err("episode_id", "必须是非空字符串")
     if not isinstance(record["anchor_frame"], int) or record["anchor_frame"] < 0:
         raise _err("anchor_frame", "必须是非负整数")
+    mode = record.get("mode")
+    if mode not in GAME_MODE_CHOICES:
+        raise _err("mode", f"必须是 {GAME_MODE_CHOICES}")
 
     task = record.get("task")
     if not isinstance(task, Mapping) or not isinstance(task.get("instruction"), str) or not task["instruction"].strip():
         raise _err("task.instruction", "必须是非空字符串")
+    if task.get("mode_token") != mode_token(mode):
+        raise _err("task.mode_token", f"必须是 {mode_token(mode)!r}")
 
     obs = record.get("observations")
     if not isinstance(obs, Mapping):

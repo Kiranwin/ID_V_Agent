@@ -12,6 +12,8 @@ import csv
 import json
 from pathlib import Path
 
+from idv_agent.configs.game_mode import DEFAULT_GAME_MODE, mode_token
+
 from idv_agent.vla.action_chunk import (
     ACTION_CHUNK_HORIZON,
     DEFAULT_ACTION_DELAY_FRAMES,
@@ -110,11 +112,17 @@ def build(session: Path, output: Path, *, stride: int = 3,
             actions[row["frame_idx"]] = row
 
     fps = 30.0
+    mode = DEFAULT_GAME_MODE
+    task_name = "find_cipher_and_decode"
+    task_instruction = "找到密码机，靠近并进入破译"
     meta = session / "meta.json"
     if meta.is_file():
         try:
             raw = json.loads(meta.read_text(encoding="utf-8"))
             fps = float(raw.get("effective_fps") or raw.get("target_fps") or fps)
+            mode = raw.get("mode", DEFAULT_GAME_MODE)
+            task_name = str(raw.get("task_name") or task_name)
+            task_instruction = str(raw.get("task_instruction") or task_instruction)
         except (ValueError, TypeError, json.JSONDecodeError):
             pass
 
@@ -155,8 +163,10 @@ def build(session: Path, output: Path, *, stride: int = 3,
             "episode_id": session.name,
             "anchor_frame": anchor,
             "intent": "",
-            "task": {"name": "find_cipher_and_decode",
-                      "instruction": "找到密码机，靠近并进入破译"},
+            "mode": mode,
+            "task": {"name": task_name,
+                      "instruction": task_instruction,
+                      "mode_token": mode_token(mode)},
             "observations": {"frames": history_frames, "fps": fps,
                              "history_actions": history_actions},
             "action_chunk": chunk,

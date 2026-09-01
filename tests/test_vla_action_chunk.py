@@ -17,8 +17,10 @@ def _record():
         "schema_version": VLA_SCHEMA_VERSION,
         "episode_id": "ep1",
         "anchor_frame": 3,
+        "mode": "standard",
         "intent": "decipher",
-        "task": {"name": "find_cipher_and_decode", "instruction": "找到密码机"},
+        "task": {"name": "find_cipher_and_decode", "instruction": "找到密码机",
+                 "mode_token": "<mode:standard>"},
         "observations": {
             "frames": [
                 {"path": f"frames/{i:08d}.jpg", "frame_index": i, "timestamp_ns": i * 1000}
@@ -73,3 +75,10 @@ def test_build_vla_chunks(tmp_path: Path):
     assert rec["action_chunk"][0]["move_dir"] == 1
     assert rec["action_chunk"][0]["camera_dx"] == 0
     assert rec["alignment"]["action_start_frame"] == 8
+
+
+def test_mode_token_is_required_and_canonical():
+    record = _record()
+    record["mode"] = "blackjack"
+    with pytest.raises(ValueError, match="mode_token"):
+        validate_record(record)

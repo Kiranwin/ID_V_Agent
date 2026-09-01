@@ -12,7 +12,10 @@ def test_validate_vla_raw_session(tmp_path: Path):
     (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
     (session / "mouse_positions.csv").write_text("timestamp_ns,x,y\n", encoding="utf-8")
     (session / "frame_timestamps.csv").write_text("frame_id,timestamp_ns\n0,100\n", encoding="utf-8")
-    (session / "meta.json").write_text(json.dumps({"recording_type": "vla_raw"}), encoding="utf-8")
+    (session / "meta.json").write_text(json.dumps({
+        "recording_type": "vla_raw", "vla_schema_version": "vla.action_chunk.v3",
+        "mode": "standard",
+    }), encoding="utf-8")
     assert validate(session) == []
 
 
