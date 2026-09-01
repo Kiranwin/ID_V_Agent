@@ -217,7 +217,8 @@ subgoal 的固定词汇、intent 映射和半自动派生规则见
 
 ### 5.3 与现有 v3 的关系
 
-现有记录中的 `intent` 空字符串仍可被旧样本校验通过，但新的 VLA 训练集必须包含
+v4 不保留顶层 `intent` 字段，避免它与 `slow_label.intent` 产生双重真源；训练器只读取
+anchor/历史帧中的 `slow_label.intent`。现有 v3 记录中的 `intent` 空字符串仅用于兼容，新的 VLA 训练集必须包含
 `slow_label` 和 `loss_mask`。新增字段后将使用 `vla.action_chunk.v4`；旧 v3 只作为
 兼容/迁移输入，不能直接送入快慢 VLA 训练。`build_vla_chunks.py` 后续改造时必须从
 帧级/片段级标注读取这些字段；不能在训练 collator 中临时猜测慢标签。

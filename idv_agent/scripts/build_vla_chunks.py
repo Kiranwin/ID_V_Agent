@@ -295,7 +295,6 @@ def build(session: Path, output: Path, *, stride: int = 3,
             "schema_version": schema_version,
             "episode_id": session.name,
             "anchor_frame": anchor,
-            "intent": "",
             "mode": mode,
             "task": {"name": task_name,
                       "instruction": task_instruction,
@@ -315,6 +314,10 @@ def build(session: Path, output: Path, *, stride: int = 3,
             "quality": {"source": "teacher", "outcome": outcome},
             "auxiliary": {"legacy_action_schema": False},
         }
+        if schema_version == VLA_SCHEMA_VERSION:
+            # v3 keeps the legacy optional field; v4 uses slow_label.intent
+            # as the single canonical intent source.
+            record["intent"] = ""
         if schema_version == VLA_SCHEMA_VERSION_V4:
             slow_label = _slow_label_for_frame(anchor, intent_segments, frame_states, actions.get(anchor, {}))
             record["slow_label"] = slow_label

@@ -154,6 +154,10 @@ def validate_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -
         raise _err("alignment.mode", "必须是 causal_future")
     if "action_start_frame" not in alignment or not isinstance(alignment["action_start_frame"], int):
         raise _err("alignment.action_start_frame", "必须是整数")
+    expected_start = alignment.get("observation_end_frame", record["anchor_frame"]) + delay + 1
+    if alignment["action_start_frame"] != expected_start:
+        raise _err("alignment.action_start_frame",
+                   "必须等于 observation_end_frame + action_delay_frames + 1；delay 表示两者之间跳过的帧数")
     for name in ("observation_end_timestamp_ns", "action_start_timestamp_ns", "action_end_timestamp_ns"):
         _finite_number(alignment.get(name), f"alignment.{name}")
     if not (alignment["observation_end_timestamp_ns"] <
@@ -206,6 +210,8 @@ def validate_v4_record(record: Mapping[str, Any], *, strict_lengths: bool = True
         raise ValueError("VLA record: 必须是对象")
     if record.get("schema_version") != VLA_SCHEMA_VERSION_V4:
         raise _err("schema_version", f"必须是 {VLA_SCHEMA_VERSION_V4!r}")
+    if "intent" in record:
+        raise _err("intent", "v4 顶层 intent 已废弃，请使用 slow_label.intent")
 
     # Reuse all common validation while relaxing v3's fixed history length.
     base = dict(record)

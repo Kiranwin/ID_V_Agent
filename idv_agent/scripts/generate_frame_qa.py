@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -42,10 +43,55 @@ def _load_states(path: Path) -> dict[tuple[str, int], str]:
     return states
 
 
+def _load_intent_segments(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.is_file():
+        return []
+    if path.suffix.lower() == ".csv":
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    else:
+        rows = []
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_no} JSON 无效") from exc
+            if not isinstance(value, dict):
+                raise ValueError(f"{path}:{line_no} 必须是对象")
+            rows.append(value)
+    result = []
+    for index, row in enumerate(rows):
+        try:
+            start = int(row["start_frame"])
+            end = int(row["end_frame"])
+            intent = str(row["intent"]).strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{path}:{index + 1} 缺少有效 start_frame/end_frame/intent") from exc
+        if start < 0 or end < start or not intent:
+            raise ValueError(f"{path}:{index + 1} 片段范围或 intent 无效")
+        result.append({"start_frame": start, "end_frame": end, "intent": intent})
+    result.sort(key=lambda row: (row["start_frame"], row["end_frame"]))
+    for previous, current in zip(result, result[1:]):
+        if current["start_frame"] <= previous["end_frame"]:
+            raise ValueError(f"{path} 片段重叠: {previous} / {current}")
+    return result
+
+
 def _load_intent(dataset: Path, meta_path: Path | None, override: str | None,
-                 annotation: dict[str, Any]) -> tuple[str, str]:
+                 annotation: dict[str, Any], segments: list[dict[str, Any]]) -> tuple[str, str]:
     if override:
         return override, "cli"
+    frame = annotation.get("source_frame")
+    try:
+        frame = int(frame)
+    except (TypeError, ValueError):
+        frame = None
+    if frame is not None:
+        for segment in segments:
+            if segment["start_frame"] <= frame <= segment["end_frame"]:
+                return segment["intent"], "intent_segments"
     candidates = []
     if meta_path and meta_path.is_file():
         candidates.append(meta_path)
@@ -107,15 +153,17 @@ def _qa_for_annotation(annotation: dict[str, Any], state: str, intent: str,
 
 
 def generate(dataset: Path, *, annotations: Path, states: Path,
-             output: Path, meta: Path | None = None, intent: str | None = None) -> int:
+             output: Path, meta: Path | None = None, intent: str | None = None,
+             intent_segments: Path | None = None) -> int:
     state_map = _load_states(states)
     annotations_rows = _load_jsonl(annotations)
+    segments = _load_intent_segments(intent_segments)
     result = []
     for annotation in annotations_rows:
         key = (str(annotation.get("source_session")), int(annotation.get("source_frame")))
         if key not in state_map:
             raise ValueError(f"缺少帧状态: {key}")
-        frame_intent, source = _load_intent(dataset, meta, intent, annotation)
+        frame_intent, source = _load_intent(dataset, meta, intent, annotation, segments)
         result.extend(_qa_for_annotation(annotation, state_map[key], frame_intent, source))
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in result) +
@@ -130,6 +178,8 @@ def main(argv=None) -> int:
     parser.add_argument("--annotations", type=Path, default=None)
     parser.add_argument("--states", type=Path, default=None)
     parser.add_argument("--meta", type=Path, default=None)
+    parser.add_argument("--intent-segments", type=Path, default=None,
+                        help="按 source_frame 映射人工意图片段（CSV/JSONL）")
     parser.add_argument("--intent", default=None, help="覆盖 meta 中的 session 主意图")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args(argv)
@@ -138,7 +188,8 @@ def main(argv=None) -> int:
                  annotations=args.annotations or args.dataset / "vg_annotations.jsonl",
                  states=args.states or args.dataset / "frame_states.jsonl",
                  output=args.output or args.dataset / "frame_qa.jsonl",
-                 meta=args.meta, intent=args.intent)
+                 meta=args.meta, intent=args.intent,
+                 intent_segments=args.intent_segments)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     return 0

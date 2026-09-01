@@ -4,7 +4,7 @@ YOLO txt remains the only human-maintained bounding-box source. This command
 creates two reproducible products:
 
 * ``vg_annotations.jsonl``: one structured annotation record per image;
-* ``vg_grounding.jsonl``: question/answer examples rendered from those records.
+* ``vg_grounding.jsonl``: grounding/presence question/answer examples rendered from those records.
 
 The structured boxes keep normalized and pixel ``xyxy`` coordinates so a later
 Qwen/VLA adapter can choose its own textual box token format without relabeling.
@@ -105,21 +105,10 @@ def _box_text(box: list[float]) -> str:
 def _examples(annotation: dict) -> list[dict]:
     image = annotation["image"]
     objects = annotation["objects"]
-    examples = [{
-        "schema_version": SCHEMA_VERSION,
-        "id": f"{annotation['id']}__state",
-        "task": "state_qa",
-        "image": image,
-        "question": "当前帧中角色处于什么状态？",
-        "answer": f"当前帧状态为 {annotation['state']}。",
-        "target": None,
-        "objects": objects,
-        "state": annotation["state"],
-        "intent_hint": annotation["intent_hint"],
-        "source_session": annotation["source_session"],
-        "source_frame": annotation["source_frame"],
-        "split": annotation["split"],
-    }]
+    # Frame state is supervised separately in frame_qa.jsonl. Keeping it out
+    # of vg_grounding avoids duplicate state_qa samples and keeps this file's
+    # contract limited to spatial grounding/presence.
+    examples = []
     for obj in objects:
         if obj["label"] == "cipher_machine":
             question = "密码机在哪里？"
@@ -141,6 +130,7 @@ def _examples(annotation: dict) -> list[dict]:
             "objects": objects,
             "state": annotation["state"],
             "intent_hint": annotation["intent_hint"],
+            "intent_source": annotation.get("intent_source", "unknown"),
             "source_session": annotation["source_session"],
             "source_frame": annotation["source_frame"],
             "split": annotation["split"],
@@ -157,6 +147,7 @@ def _examples(annotation: dict) -> list[dict]:
             "objects": [],
             "state": annotation["state"],
             "intent_hint": annotation["intent_hint"],
+            "intent_source": annotation.get("intent_source", "unknown"),
             "source_session": annotation["source_session"],
             "source_frame": annotation["source_frame"],
             "split": annotation["split"],
@@ -185,13 +176,49 @@ def _load_states(path: Path) -> dict[tuple[str, int], str]:
     return states
 
 
+def _load_intent_segments(path: Path | None) -> list[dict]:
+    if path is None or not path.is_file():
+        return []
+    if path.suffix.lower() == ".csv":
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    else:
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    result = []
+    for index, row in enumerate(rows):
+        try:
+            start = int(row["start_frame"])
+            end = int(row["end_frame"])
+            intent = str(row["intent"]).strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{path}:{index + 1} 缺少有效 start_frame/end_frame/intent") from exc
+        if start < 0 or end < start or not intent:
+            raise ValueError(f"{path}:{index + 1} 片段范围或 intent 无效")
+        result.append({"start_frame": start, "end_frame": end,
+                       "intent": intent, "segment_id": str(row.get("segment_id") or f"seg_{index:03d}")})
+    result.sort(key=lambda row: (row["start_frame"], row["end_frame"]))
+    for previous, current in zip(result, result[1:]):
+        if current["start_frame"] <= previous["end_frame"]:
+            raise ValueError(f"{path} 片段重叠: {previous} / {current}")
+    return result
+
+
+def _intent_for_frame(frame: int, segments: list[dict], state: str) -> tuple[str, str]:
+    for segment in segments:
+        if segment["start_frame"] <= frame <= segment["end_frame"]:
+            return segment["intent"], "intent_segments"
+    return STATE_TO_INTENT_HINT[state], "state_weak_hint"
+
+
 def convert(dataset: Path, annotations_out: Path, grounding_out: Path,
-            repo_root: Path, state_file: Path | None = None) -> tuple[int, int]:
+            repo_root: Path, state_file: Path | None = None,
+            intent_segments: Path | None = None) -> tuple[int, int]:
     manifest = dataset / "manifest.csv"
     if not manifest.is_file():
         raise ValueError(f"缺少 {manifest}")
     state_file = state_file or dataset / "frame_states.jsonl"
     states = _load_states(state_file)
+    segments = _load_intent_segments(intent_segments)
     annotations, examples = [], []
     expected_state_keys: set[tuple[str, int]] = set()
     with manifest.open(encoding="utf-8-sig", newline="") as handle:
@@ -212,6 +239,7 @@ def convert(dataset: Path, annotations_out: Path, grounding_out: Path,
             state = states.get((session, frame_index))
             if state is None:
                 raise ValueError(f"缺少帧状态: session={session} frame={frame_index}")
+            intent_hint, intent_source = _intent_for_frame(frame_index, segments, state)
             record = {
                 "schema_version": SCHEMA_VERSION,
                 "id": image_path.stem,
@@ -223,7 +251,8 @@ def convert(dataset: Path, annotations_out: Path, grounding_out: Path,
                 "source_frame": frame_index,
                 "split": row["split"],
                 "state": state,
-                "intent_hint": STATE_TO_INTENT_HINT[state],
+                "intent_hint": intent_hint,
+                "intent_source": intent_source,
                 "screen_region": _region([o for o in objects if o["label"] == "cipher_machine"]),
                 "objects": objects,
                 "annotation_source": "yolo_txt",
@@ -256,11 +285,14 @@ def main(argv=None) -> int:
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--state-file", type=Path, default=None,
                         help="帧级状态 JSONL；默认 dataset/frame_states.jsonl")
+    parser.add_argument("--intent-segments", type=Path, default=None,
+                        help="人工意图片段 CSV/JSONL；用于统一 vg_annotations.intent_hint")
     args = parser.parse_args(argv)
     annotations_out = args.annotations_out or args.dataset / "vg_annotations.jsonl"
     grounding_out = args.grounding_out or args.dataset / "vg_grounding.jsonl"
     try:
-        convert(args.dataset, annotations_out, grounding_out, args.repo_root.resolve(), args.state_file)
+        convert(args.dataset, annotations_out, grounding_out, args.repo_root.resolve(), args.state_file,
+                args.intent_segments)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     return 0
