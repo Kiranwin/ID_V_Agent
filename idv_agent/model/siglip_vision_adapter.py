@@ -1,9 +1,9 @@
-"""把 SigLIP2-base-patch16-224 的 vision tower 包装成 DummyVisionEncoder 接口。
+"""把 SigLIP2-base-patch16-224 的 vision tower 包装成视觉编码器接口。
 
 接口：
     forward(pixel_values: [B, 3, H, W]) -> [B, L, hidden_size]
 L = (image_size/patch_size)^2（base/16/224 = 196），hidden_size = 768。
-调用方（FastController）对序列做 mean pooling 拿 [B, hidden]。
+调用方可在外部加入时间编码和 temporal encoder。
 
 transformers 5.x 中 SigLIP1/SigLIP2 共用 SiglipModel；只取 vision_model 子模块。
 """

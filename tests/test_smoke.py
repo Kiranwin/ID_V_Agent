@@ -9,9 +9,7 @@ from idv_agent.scripts.smoke_test import (
     test_intent_orthogonality,
     test_action_decoder,
     test_decode_state_machine_calibration,
-    test_fast_model_forward,
-    test_slow_model_forward,
-    test_dataset_collator,
+    test_vla_contract,
 )
 
 
@@ -19,9 +17,7 @@ def test_all():
     test_intent_orthogonality()
     test_action_decoder()
     test_decode_state_machine_calibration()
-    test_fast_model_forward()
-    test_slow_model_forward()
-    test_dataset_collator()
+    test_vla_contract()
 
 
 def test_decode_exit_not_rerun():

@@ -11,8 +11,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from idv_agent.configs.game_mode import GAME_MODE_CHOICES, mode_token
+from idv_agent.configs.subgoal import SUBGOAL_NAMES, subgoals_for_intent
 
 VLA_SCHEMA_VERSION = "vla.action_chunk.v3"
+VLA_SCHEMA_VERSION_V4 = "vla.action_chunk.v4"
 
 # Fixed lengths keep collation and low-latency rolling inference predictable.
 HISTORY_FRAMES = 3
@@ -37,6 +39,7 @@ BUTTON_NAMES = ("interact", "vault", "item", "heal", "sprint", "crouch")
 INTENTS = ("decipher", "kite", "rescue", "rotate", "travel", "search", "gate", "idle")
 OUTCOMES = ("success", "partial", "failure", "unknown")
 SOURCES = ("human", "teacher", "model")
+SUBGOAL_SOURCES = ("rule", "human_override", "unknown")
 
 
 def _err(path: str, message: str) -> ValueError:
@@ -167,3 +170,70 @@ def validate_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -
         raise _err("quality.source", f"必须是 {SOURCES}")
     if quality.get("outcome", "unknown") not in OUTCOMES:
         raise _err("quality.outcome", f"必须是 {OUTCOMES}")
+
+
+def _validate_slow_label(label: Any, path: str) -> None:
+    if not isinstance(label, Mapping):
+        raise _err(path, "必须是对象")
+    valid = label.get("valid")
+    if not isinstance(valid, bool):
+        raise _err(f"{path}.valid", "必须是布尔值")
+    if not valid:
+        return
+    intent = label.get("intent")
+    if intent not in INTENTS:
+        raise _err(f"{path}.intent", f"必须是 {INTENTS}")
+    subgoal = label.get("subgoal")
+    if subgoal not in SUBGOAL_NAMES:
+        raise _err(f"{path}.subgoal", "不是 subgoal.v1 词汇")
+    if subgoal not in subgoals_for_intent(intent):
+        raise _err(f"{path}.subgoal", f"{subgoal!r} 不属于 intent={intent!r} 的候选集合")
+    source = label.get("subgoal_source", "unknown")
+    if source not in SUBGOAL_SOURCES:
+        raise _err(f"{path}.subgoal_source", f"必须是 {SUBGOAL_SOURCES}")
+    if source == "rule" and label.get("subgoal_rule_version") != "subgoal.v1":
+        raise _err(f"{path}.subgoal_rule_version", "rule 来源必须为 subgoal.v1")
+
+
+def validate_v4_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -> None:
+    """Validate the fast/slow VLA v4 record.
+
+    v4 keeps the v3 action/alignment contract and adds frame-level slow labels
+    plus loss masks.  The v3 validator is reused for common fields so the two
+    schemas cannot silently diverge.
+    """
+    if not isinstance(record, Mapping):
+        raise ValueError("VLA record: 必须是对象")
+    if record.get("schema_version") != VLA_SCHEMA_VERSION_V4:
+        raise _err("schema_version", f"必须是 {VLA_SCHEMA_VERSION_V4!r}")
+
+    # Reuse all common validation while relaxing v3's fixed history length.
+    base = dict(record)
+    base["schema_version"] = VLA_SCHEMA_VERSION
+    anchor_label = record.get("slow_label", {})
+    base["intent"] = anchor_label.get("intent", "") if isinstance(anchor_label, Mapping) else ""
+    validate_record(base, strict_lengths=False)
+
+    obs = record["observations"]
+    frames = obs["frames"]
+    if strict_lengths and not 3 <= len(frames) <= 8:
+        raise _err("observations.frames", "v4 必须包含 3..8 帧")
+    history = obs.get("history_actions", [])
+    if strict_lengths and len(history) > 8:
+        raise _err("observations.history_actions", "v4 最多 8 个历史动作")
+    for i, frame in enumerate(frames):
+        if "slow_label" not in frame:
+            raise _err(f"observations.frames[{i}].slow_label", "缺少字段")
+        _validate_slow_label(frame["slow_label"], f"observations.frames[{i}].slow_label")
+
+    if "slow_label" not in record:
+        raise _err("slow_label", "缺少字段")
+    _validate_slow_label(record["slow_label"], "slow_label")
+
+    masks = record.get("loss_mask")
+    if not isinstance(masks, Mapping):
+        raise _err("loss_mask", "必须是对象")
+    for name in ("slow", "fast"):
+        value = masks.get(name)
+        if isinstance(value, bool) or value not in (0, 1):
+            raise _err(f"loss_mask.{name}", "必须是 0 或 1")

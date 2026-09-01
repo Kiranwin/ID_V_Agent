@@ -9,8 +9,8 @@
 - 类别用标准求生者 ActionCategory（20 类），非黑杰克 schema。
 - 增加 threat 处理：感知到监管者/耳鸣时优先跑路（不硬顶破译），体现转点决策。
 
-这是 M1 阶段「规则闭环」的核心：让整个环先转起来（不依赖训练好的模型），
-为 M2 的 BC 训练提供游戏内可验证基线。
+这是当前 VLA 尚未部署前的安全兜底：让捕获、感知和输入链路可独立验证，
+并生成可回放的教师轨迹；它不是当前 VLA 的训练主线。
 """
 
 from __future__ import annotations
@@ -58,7 +58,9 @@ class CipherVisualServo:
     def decide(self, spatial: dict) -> Tuple[int, Tuple[float, float, float, float]]:
         """Return an ActionCategory/continuous tuple for one perception update."""
         visible = spatial.get("visible") == "yes"
-        decoding = spatial.get("decoding_state") == "yes"
+        # Frame state is supplied by the state-label/runtime layer, not by
+        # the object detector. Keep detector output object-only.
+        decoding = spatial.get("frame_state") == "decoding"
         prompt = spatial.get("interact_prompt") == "yes"
         if decoding:
             self._q_sent = True
@@ -119,7 +121,7 @@ class RuleAgent:
         blocked = sp.get("blocked", "no")
         interacting = sp.get("interacting", "no")
         interact_prompt = sp.get("interact_prompt", "no")
-        decoding_state = sp.get("decoding_state", "no")
+        frame_state = sp.get("frame_state", "unknown")
         threat = sp.get("threat", "no")
 
         # 威胁（监管者近身/耳鸣）→ 跑路一段时间
@@ -139,7 +141,7 @@ class RuleAgent:
             return self.visual_servo.decide(sp)
 
         # 已在破译
-        if interacting == "yes" or decoding_state == "yes":
+        if interacting == "yes" or frame_state == "decoding":
             return int(ActionCategory.INTERACT_HOLD), (0, 0, 0, 0)
 
         # 看到密码机

@@ -1,7 +1,7 @@
-"""把 Qwen3-VL-4B-Instruct 包装成 BackboneOutput 接口，与 dummy_backbone 鸭子兼容。
+"""把 Qwen3-VL-4B-Instruct 包装成统一 BackboneOutput 接口。
 
 关键事实（transformers 5.x）：
-- 模型类 Qwen3VLForConditionalGeneration；hidden_size 2560（接 GameActorCritic heads）
+- 模型类 Qwen3VLForConditionalGeneration；hidden_size 2560（供 VLA 主干使用）
 - vocab_size 151936；pixel_values 为 [num_patches, 1536]
 - 必传：input_ids, attention_mask, pixel_values, image_grid_thw
 
@@ -16,7 +16,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from idv_agent.model.dummy_backbone import BackboneOutput
+from idv_agent.model.backbone_types import BackboneOutput
 
 
 def default_qwen_lora_config():

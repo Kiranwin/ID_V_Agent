@@ -3,10 +3,10 @@
 主线程（目标 30Hz）：
     DXGI grab -> Policy.decide -> ActionDecoder -> ActionExecutor
 
-慢线程（异步，秒级）：慢层规划（VLM 或 SlowPlanner）更新 intent + skeleton 到 SharedState。
+慢线程（异步，秒级）：慢头/VLM 更新 intent + subgoal + context 到 SharedState。
 
 设计：
-- RealtimeAgent 用 Policy 抽象（可 M1 规则 / M2 学习快层 / M3 VLA，P9 可插拔）。
+- RealtimeAgent 用 Policy 抽象；当前仅启用规则安全兜底，VLA 动作块运行器待接入。
 - 不依赖训练好的 ckpt 也能跑：RulePolicy 兜底让闭环先转起来（P1）。
 - 接入 MatchMemory + EventDetector：关键事件触发慢层重规划/转点。
 - F12 紧急退出 + 退出时 release_all 防止按键卡住。
@@ -250,7 +250,7 @@ class RealtimeAgent:
                     active_interval = (approach_interval
                                        if previous_spatial.get("visible") == "yes"
                                        or previous_spatial.get("interact_prompt") == "yes"
-                                       or previous_spatial.get("decoding_state") == "yes"
+                                       or previous_spatial.get("frame_state") == "decoding"
                                        else self.cipher_detection_interval_s)
                     detect_now = (
                         self._last_cipher_detection_at <= 0.0

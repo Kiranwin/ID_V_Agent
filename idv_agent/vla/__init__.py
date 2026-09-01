@@ -13,12 +13,14 @@ from .action_chunk import (
     BUTTON_NAMES,
     INTENTS,
     VLA_SCHEMA_VERSION,
+    VLA_SCHEMA_VERSION_V4,
     validate_record,
+    validate_v4_record,
 )
 
 __all__ = [
     "ACTION_CHUNK_HORIZON", "HISTORY_FRAMES", "MACRO_FRAMES",
     "DEFAULT_ACTION_DELAY_FRAMES", "MOVE_DIRECTIONS", "CAMERA_BUCKETS",
-    "BUTTON_NAMES", "INTENTS", "VLA_SCHEMA_VERSION",
-    "validate_record",
+    "BUTTON_NAMES", "INTENTS", "VLA_SCHEMA_VERSION", "VLA_SCHEMA_VERSION_V4",
+    "validate_record", "validate_v4_record",
 ]

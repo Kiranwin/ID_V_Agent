@@ -8,7 +8,7 @@ P8 场景：监管者砍断破译是游戏侧状态变化（无按键事件）�
 `on_frame(frame)` 接口，将来接入「受击红屏 / 破译进度条消失」视觉信号，把
 「破译被打断」事件抛给慢层/状态机，避免破译状态残留到 90s 超时。
 
-当前为**接口 + 占位实现**，真实视觉识别待 M1 感知层落地。
+密码机 YOLO/模板检测已接入；HUD 事件检测仍是接口占位，后续单独补齐。
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ class CipherDetection:
     bbox: Optional[tuple[int, int, int, int]] = None
     source: str = "none"
     interact_prompt: str = "no"
-    decoding_state: str = "no"
     # Normalized geometry.  These are deliberately separate from `distance`:
     # bbox area is not a reliable range estimate when the antenna/HUD changes
     # which part of a 3-D cipher is visible.
@@ -62,7 +61,6 @@ class CipherDetection:
             "source": self.source,
             "bbox": list(self.bbox) if self.bbox else None,
             "interact_prompt": self.interact_prompt,
-            "decoding_state": self.decoding_state,
             "center_x": round(center_x, 4) if center_x is not None else None,
             "bottom_y": round(bottom_y, 4) if bottom_y is not None else None,
             "bbox_area_ratio": round(area_ratio, 6),
@@ -239,7 +237,11 @@ class CipherMachineDetector:
             frame_width=w, frame_height=h)
 
     def _detect_yolo(self, frame: np.ndarray) -> Optional[CipherDetection]:
-        """Run the trained four-class detector and merge its UI cues."""
+        """Run the trained three-class object/prompt detector.
+
+        Frame state (including ``decoding``) is intentionally not a YOLO class;
+        it must come from the frame-state classifier/annotation path.
+        """
         h, w = frame.shape[:2]
         try:
             outputs = self.yolo_model.predict(frame, verbose=False, conf=0.25, device="0")
@@ -250,7 +252,7 @@ class CipherMachineDetector:
         if boxes is None or len(boxes) == 0:
             return None
         candidates = []
-        prompt = decode = None
+        prompt = None
         debug_boxes = []
         names = getattr(self.yolo_model, "names", {}) or {}
         for xyxy, cls_t, conf_t in zip(boxes.xyxy.cpu().tolist(), boxes.cls.cpu().tolist(), boxes.conf.cpu().tolist()):
@@ -261,22 +263,18 @@ class CipherMachineDetector:
             debug_boxes.append({"class_id": cls, "name": name, "confidence": round(conf, 3), "bbox": (x1, y1, bw, bh)})
             if cls == 2 or name in {"interact_prompt", "interact_decode"}:
                 prompt = (x1, y1, bw, bh, conf)
-            elif cls == 3 or name == "decoding_state":
-                decode = (x1, y1, bw, bh, conf)
             elif cls in (0, 1) or name in {"cipher_visible", "cipher_highlight"}:
                 candidates.append((conf, x1, y1, bw, bh))
-        if not candidates and prompt is None and decode is None:
+        if not candidates and prompt is None:
             if self.debug: print(f"[yolo-debug] boxes={debug_boxes} result=none")
             return None
         if candidates:
             conf, x, y, bw, bh = max(candidates)
         else:
-            item = prompt or decode
+            item = prompt
             conf, x, y, bw, bh = item[4], item[0], item[1], item[2], item[3]
         if prompt is not None:
             conf = max(conf, prompt[4])
-        if decode is not None:
-            conf = max(conf, decode[4])
         detection = CipherDetection(
             visible="yes" if candidates else "no",
             position=self._location(x + bw/2, w),
@@ -285,7 +283,6 @@ class CipherMachineDetector:
             bbox=(x, y, bw, bh),
             source="yolo",
             interact_prompt="yes" if prompt is not None else "no",
-            decoding_state="yes" if decode is not None else "no",
             frame_width=w,
             frame_height=h,
         )

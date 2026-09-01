@@ -26,8 +26,16 @@ from idv_agent.configs.schema import (
     ExtractParams,
     NUM_CONTINUOUS,
 )
-from idv_agent.labels.intent import display_key
 from idv_agent.labels.state_machine import DecodeStateTracker, StateReplay
+
+
+def display_key(code: str) -> str:
+    """将输入日志代码转为稳定的人类可读名称。"""
+    if code.startswith("key:"):
+        return code[4:].upper()
+    if code.startswith("btn:"):
+        return code[4:].upper()
+    return code.upper()
 
 # 破译隐式状态：这些帧的原语义被重写为 INTERACT_HOLD
 _DECODE_REWRITE_CATEGORIES = frozenset({

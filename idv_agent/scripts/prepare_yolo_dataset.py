@@ -14,17 +14,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import random
 import shutil
 from pathlib import Path
 
 
-# 目标本体与交互状态分开标注。后两类是 HUD/UI 证据，不代表场景物体。
+# YOLO 只标物体/视觉证据；帧级行为状态由 frame_states.jsonl 单独标注。
 CLASSES = (
     "cipher_visible",
     "cipher_highlight",
     "interact_prompt",
-    "decoding_state",
 )
 
 
@@ -51,13 +51,15 @@ def prepare(*, sessions_root: Path, session_names: str | None,
     if not 0.0 < val_ratio < 1.0:
         raise ValueError("val_ratio 必须在 (0,1) 内")
     sessions = _session_dirs(sessions_root, session_names)
-    if len(sessions) < 2:
-        raise ValueError("至少需要 2 局 session，才能按局划分 train/val")
+    if len(sessions) < 1:
+        raise ValueError("至少需要 1 局 session")
 
     rng = random.Random(seed)
     shuffled = list(sessions)
     rng.shuffle(shuffled)
-    n_val = max(1, round(len(shuffled) * val_ratio))
+    # 一局只能生成 train 标注池；不能把同一局相邻帧拆到 train/val，
+    # 否则验证结果会因时序泄漏而虚高。收集到更多 session 后再启用 val。
+    n_val = 0 if len(shuffled) == 1 else max(1, round(len(shuffled) * val_ratio))
     val_sessions = {p.name for p in shuffled[:n_val]}
 
     # Create the standard Ultralytics layout.
@@ -101,11 +103,27 @@ def prepare(*, sessions_root: Path, session_names: str | None,
         writer.writeheader()
         writer.writerows(manifest_rows)
 
+    # State labels are not YOLO objects. Create an editable template once and
+    # never overwrite it on subsequent preparation runs.
+    state_path = output / "frame_states.jsonl"
+    if not state_path.exists():
+        state_path.write_text(
+            "".join(json.dumps({
+                "session": row["session"],
+                "frame": int(Path(row["source"]).stem),
+                "state": "",
+            }, ensure_ascii=False) + "\n" for row in manifest_rows),
+            encoding="utf-8",
+        )
+
     print(f"[yolo] sessions={len(sessions)} train_sessions={len(sessions)-len(val_sessions)} "
           f"val_sessions={len(val_sessions)} images={copied} stride={stride}")
+    if len(sessions) == 1:
+        print("[yolo] 警告：当前只有 1 局，全部标注放入 train；补充其他 session 后再按局划分 val/test")
     print(f"[yolo] output={output.resolve()}")
     print("[yolo] classes=" + ", ".join(f"{i}:{n}" for i, n in enumerate(CLASSES)))
     print("[yolo] 空 txt 是负样本；请人工标注后再训练")
+    print("[yolo] 帧状态模板=" + str(state_path))
     return copied
 
 

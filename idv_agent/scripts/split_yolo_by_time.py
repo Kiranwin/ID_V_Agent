@@ -4,7 +4,7 @@ import argparse, re, shutil
 from collections import defaultdict
 from pathlib import Path
 
-CLASSES = ("cipher_visible", "cipher_highlight", "interact_prompt", "decoding_state")
+CLASSES = ("cipher_visible", "cipher_highlight", "interact_prompt")
 
 def split_dataset(src: Path, dst: Path, val_ratio: float = 0.2):
     if not 0 < val_ratio < 0.5: raise ValueError("val_ratio 必须在 (0, 0.5) 内")

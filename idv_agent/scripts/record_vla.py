@@ -1,6 +1,6 @@
 """Record raw human demonstrations for the native VLA pipeline.
 
-Unlike ``record.py`` this command writes only raw frames, a shared-clock frame
+This command writes only raw frames, a shared-clock frame
 timestamp file, and input events. It deliberately does not create legacy
 ``per_frame_actions.csv``/``samples.jsonl`` labels; conversion and annotation
 are explicit later steps.

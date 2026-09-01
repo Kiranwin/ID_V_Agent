@@ -1,12 +1,10 @@
-"""无 GPU / 无游戏冒烟测试：验证核心管线组件可运行。
+"""无 GPU / 无游戏冒烟测试：验证 VLA 核心与规则安全兜底。
 
 覆盖：
 - intent 正交性
 - ActionDecoder 差分逻辑（press/release/mouse）
 - 破译状态机校准标记（P2）
-- 动作提取（合成事件）
-- 模型 forward（dummy fast + dummy slow）
-- Dataset + Collator
+- VLA action-chunk schema
 
 用法：
     python -m idv_agent.scripts.smoke_test
@@ -15,8 +13,6 @@
 from __future__ import annotations
 
 import sys
-import tempfile
-from pathlib import Path
 
 
 def _expect(cond: bool, msg: str) -> None:
@@ -77,79 +73,46 @@ def test_decode_state_machine_calibration() -> None:
     _expect(st2.active, "Space 校准后仍保持破译态")
 
 
-def test_fast_model_forward() -> None:
-    import torch
-    from idv_agent.configs.intent import INTENT_VECTOR_DIM
-    from idv_agent.model.dummy_vision import DummyVisionEncoder
-    from idv_agent.model.fast_controller import FastController
-    from idv_agent.configs.schema import NUM_CATEGORIES, NUM_CONTINUOUS
-    vision = DummyVisionEncoder(hidden_size=96)
-    model = FastController(vision_encoder=vision, vision_hidden_size=96,
-                           intent_dim=INTENT_VECTOR_DIM, skeleton_dim=32,
-                           num_categories=NUM_CATEGORIES, num_continuous=NUM_CONTINUOUS)
-    model.eval()
-    with torch.no_grad():
-        out = model(
-            pixel_values=torch.randn(2, 3, 64, 64),
-            intent_vector=torch.randn(2, INTENT_VECTOR_DIM),
-            skeleton_embedding=torch.randn(2, 32),
-            category_labels=torch.tensor([0, 1]),
-            continuous_labels=torch.randn(2, NUM_CONTINUOUS),
-        )
-    _expect(out.loss is not None and out.category_logits.shape == (2, NUM_CATEGORIES),
-            "FastController forward OK")
+def test_vla_contract() -> None:
+    from idv_agent.configs.game_mode import mode_token
+    from idv_agent.vla.action_chunk import validate_record
 
-
-def test_slow_model_forward() -> None:
-    import torch
-    from idv_agent.model.dummy_backbone import DummyBackbone
-    from idv_agent.model.game_actor_critic import GameActorCritic
-    from idv_agent.configs.schema import NUM_CONTINUOUS
-    backbone = DummyBackbone(vocab_size=50, hidden_size=32, image_feature=3)
-    model = GameActorCritic(backbone=backbone, hidden_size=32, numeric_dim=NUM_CONTINUOUS)
-    model.eval()
-    with torch.no_grad():
-        out = model(
-            pixel_values=torch.randn(1, 3, 32, 32),
-            input_ids=torch.randint(0, 50, (1, 8)),
-            labels=torch.randint(0, 50, (1, 8)),
-            numeric_labels=torch.randn(1, NUM_CONTINUOUS),
-        )
-    _expect(out.loss is not None and out.numeric_mean.shape == (1, NUM_CONTINUOUS),
-            "GameActorCritic forward OK")
-
-
-def test_dataset_collator() -> None:
-    import json
-    import torch
-    from idv_agent.labels.dataset import SessionDataset
-    from idv_agent.labels.collator import FastControllerCollator
-    from idv_agent.labels.tokenizer import SkeletonVocab
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        (td / "frames").mkdir()
-        # 生成占位图
-        import numpy as np
-        from PIL import Image
-        for i in range(2):
-            Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8)).save(td / "frames" / f"{i:08d}.jpg")
-        recs = [{
-            "image": f"frames/{i:08d}.jpg",
-            "conversations": [{"from": "human", "value": "q"}, {"from": "gpt", "value": "意图: decode\n动作骨架: F_HOLD\n完整操作: F_HOLD"}],
-            "slow_system_output": {"intent_id": 2, "intent_name": "decode", "intent_vector": [0.0]*16, "action_skeleton": "F_HOLD"},
-            "fast_system_input": {"intent_vector": [0.0]*16, "action_skeleton": "F_HOLD"},
-            "fast_system_output": {"category_id": 5, "category_name": "INTERACT_HOLD", "text_action": "F_HOLD", "numeric_action": [0,0,0,0]},
-        } for i in range(2)]
-        with (td / "samples.jsonl").open("w", encoding="utf-8") as f:
-            for r in recs:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        ds = SessionDataset([td / "samples.jsonl"], image_size=224, mode="tensor")
-        vocab = SkeletonVocab.build_from_jsonls([td / "samples.jsonl"])
-        coll = FastControllerCollator(skeleton_vocab=vocab)
-        batch = coll([ds[0], ds[1]])
-        _expect(batch["pixel_values"].shape == (2, 3, 224, 224), "Dataset/collator 像素 batch OK")
-        _expect(torch.is_tensor(batch["category_labels"]) and batch["category_labels"].shape == (2,),
-                "Dataset/collator 标签 OK")
+    record = {
+        "schema_version": "vla.action_chunk.v3",
+        "episode_id": "smoke",
+        "anchor_frame": 2,
+        "mode": "standard",
+        "task": {
+            "name": "find_cipher_and_decode",
+            "instruction": "找到密码机，靠近并进入破译",
+            "mode_token": mode_token("standard"),
+        },
+        "observations": {
+            "frames": [
+                {"path": "frames/00000000.jpg", "frame_index": 0, "timestamp_ns": 0},
+                {"path": "frames/00000001.jpg", "frame_index": 1, "timestamp_ns": 33_000_000},
+                {"path": "frames/00000002.jpg", "frame_index": 2, "timestamp_ns": 66_000_000},
+            ],
+            "fps": 30,
+            "history_actions": [],
+        },
+        "action_chunk": [
+            {"move_dir": 1, "camera_dx": 0, "camera_dy": 0,
+             "buttons": [0, 0, 0, 0, 0, 0], "duration_frames": 6}
+        ] * 4,
+        "alignment": {
+            "mode": "causal_future",
+            "action_delay_frames": 1,
+            "observation_end_frame": 2,
+            "action_start_frame": 4,
+            "observation_end_timestamp_ns": 66_000_000,
+            "action_start_timestamp_ns": 99_000_000,
+            "action_end_timestamp_ns": 759_000_000,
+        },
+        "quality": {"source": "human", "outcome": "unknown"},
+    }
+    validate_record(record)
+    _expect(True, "VLA action-chunk contract OK")
 
 
 def main() -> int:
@@ -157,9 +120,7 @@ def main() -> int:
     print("\n[1] intent 正交性"); test_intent_orthogonality()
     print("\n[2] ActionDecoder"); test_action_decoder()
     print("\n[3] 破译状态机（P2 校准）"); test_decode_state_machine_calibration()
-    print("\n[4] FastController forward"); test_fast_model_forward()
-    print("\n[5] GameActorCritic forward"); test_slow_model_forward()
-    print("\n[6] Dataset + collator"); test_dataset_collator()
+    print("\n[4] VLA action-chunk contract"); test_vla_contract()
     print("\n=== 全部通过 ===")
     return 0
 

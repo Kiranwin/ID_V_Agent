@@ -20,11 +20,15 @@ from idv_agent.vla.action_chunk import (
     HISTORY_FRAMES,
     MACRO_FRAMES,
     VLA_SCHEMA_VERSION,
+    VLA_SCHEMA_VERSION_V4,
     BUTTON_NAMES,
     CAMERA_BUCKETS,
+    INTENTS,
     MOVE_DIRECTIONS,
     validate_record,
+    validate_v4_record,
 )
+from idv_agent.configs.subgoal import subgoals_for_intent
 
 
 def _num(value, default=0.0):
@@ -88,12 +92,130 @@ def _history_action(row):
     return action
 
 
+def _load_jsonl(path: Path) -> list[dict]:
+    rows = []
+    if not path.is_file():
+        return rows
+    with path.open(encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_no} JSON 无效") from exc
+            if not isinstance(value, dict):
+                raise ValueError(f"{path}:{line_no} 必须是对象")
+            rows.append(value)
+    return rows
+
+
+def _load_intent_segments(session: Path) -> list[dict]:
+    """Load human top-level intent segments for v4.
+
+    JSONL is the canonical format; CSV is accepted for convenient manual
+    editing.  Frame ranges are inclusive.
+    """
+    jsonl = session / "intent_segments.jsonl"
+    if jsonl.is_file():
+        rows = _load_jsonl(jsonl)
+    else:
+        csv_path = session / "intent_segments.csv"
+        if not csv_path.is_file():
+            return []
+        with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    segments = []
+    for index, row in enumerate(rows):
+        try:
+            start = int(row.get("start_frame"))
+            end = int(row.get("end_frame"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"intent segment {index} 缺少有效 start_frame/end_frame") from exc
+        intent = str(row.get("intent", "")).strip()
+        if intent not in INTENTS:
+            raise ValueError(f"intent segment {index} 的 intent={intent!r} 不在 {INTENTS}")
+        if start < 0 or end < start:
+            raise ValueError(f"intent segment {index} 帧范围无效")
+        segments.append({"start_frame": start, "end_frame": end,
+                         "intent": intent, "segment_id": str(row.get("segment_id") or f"seg_{index:03d}")})
+    segments.sort(key=lambda row: (row["start_frame"], row["end_frame"]))
+    return segments
+
+
+def _load_frame_states(session: Path) -> dict[int, dict]:
+    rows = _load_jsonl(session / "frame_states.jsonl")
+    result = {}
+    for row in rows:
+        value = row.get("frame", row.get("frame_id"))
+        try:
+            frame = int(value)
+        except (TypeError, ValueError):
+            continue
+        result[frame] = row
+    return result
+
+
+def _derive_subgoal(intent: str, state: dict, action: dict) -> str:
+    """Derive a v1 subgoal without requiring a second manual label."""
+    state_name = str(state.get("state", "")).strip().lower()
+    if state_name in {"qte", "calibration"} or str(state.get("decode_calibration", "")) in {"1", "yes", "true"}:
+        candidate = "handle_qte"
+    elif intent == "decipher":
+        if state_name == "decoding":
+            candidate = "maintain_decoding"
+        elif str(state.get("interact_prompt", "")).lower() in {"yes", "1", "true"}:
+            candidate = "start_decoding"
+        elif str(action.get("category_name", "")).upper().startswith("INTERACT_"):
+            candidate = "start_decoding"
+        else:
+            candidate = "find_cipher"
+    elif intent == "search":
+        candidate = "find_cipher"
+    elif intent in {"travel", "rotate", "rescue", "gate"}:
+        candidate = {"rescue": "rescue_teammate", "gate": "open_gate"}.get(intent, "move_to_target")
+    elif intent == "kite":
+        candidate = "maintain_distance"
+    else:
+        candidate = "observe"
+    if candidate not in subgoals_for_intent(intent):
+        # State-derived QTE is only valid for decipher; fall back safely when
+        # a manually supplied segment has another top-level intent.
+        candidate = subgoals_for_intent(intent)[0]
+    return candidate
+
+
+def _slow_label_for_frame(frame_idx: int, segments: list[dict], states: dict[int, dict], action: dict) -> dict:
+    for segment in segments:
+        if segment["start_frame"] <= frame_idx <= segment["end_frame"]:
+            intent = segment["intent"]
+            return {
+                "valid": True,
+                "segment_id": segment["segment_id"],
+                "intent": intent,
+                "subgoal": _derive_subgoal(intent, states.get(frame_idx, {}), action),
+                "subgoal_source": "rule",
+                "subgoal_rule_version": "subgoal.v1",
+            }
+    return {"valid": False, "segment_id": "", "intent": "", "subgoal": "none",
+            "subgoal_source": "unknown"}
+
+
 def build(session: Path, output: Path, *, stride: int = 3,
           history: int = HISTORY_FRAMES, horizon: int = ACTION_CHUNK_HORIZON,
           macro_frames: int = MACRO_FRAMES, action_delay_frames: int = DEFAULT_ACTION_DELAY_FRAMES,
-          outcome: str = "unknown") -> int:
-    if history != HISTORY_FRAMES or horizon != ACTION_CHUNK_HORIZON:
-        raise ValueError("VLA v1 要求固定 history=3、horizon=4")
+          outcome: str = "unknown", schema_version: str = VLA_SCHEMA_VERSION,
+          slow_period_s: float = 1.0) -> int:
+    if horizon != ACTION_CHUNK_HORIZON:
+        raise ValueError("VLA 要求固定 horizon=4")
+    if schema_version == VLA_SCHEMA_VERSION and history != HISTORY_FRAMES:
+        raise ValueError("VLA v3 要求固定 history=3")
+    if schema_version == VLA_SCHEMA_VERSION_V4 and not 3 <= history <= 8:
+        raise ValueError("VLA v4 要求 history 在 3..8")
+    if schema_version not in {VLA_SCHEMA_VERSION, VLA_SCHEMA_VERSION_V4}:
+        raise ValueError(f"不支持 schema_version={schema_version!r}")
+    if slow_period_s <= 0:
+        raise ValueError("slow_period_s 必须为正数")
     if stride < 1 or macro_frames < 1 or action_delay_frames < 0:
         raise ValueError("stride/macro_frames 必须为正数")
     frames = sorted((session / "frames").glob("*.jpg"), key=lambda p: int(p.stem))
@@ -110,6 +232,11 @@ def build(session: Path, output: Path, *, stride: int = 3,
             except (TypeError, ValueError):
                 continue
             actions[row["frame_idx"]] = row
+
+    intent_segments = _load_intent_segments(session) if schema_version == VLA_SCHEMA_VERSION_V4 else []
+    if schema_version == VLA_SCHEMA_VERSION_V4 and not intent_segments:
+        raise ValueError(f"v4 缺少 {session / 'intent_segments.jsonl'}（人工只标顶层 intent 的片段文件）")
+    frame_states = _load_frame_states(session) if schema_version == VLA_SCHEMA_VERSION_V4 else {}
 
     fps = 30.0
     mode = DEFAULT_GAME_MODE
@@ -128,6 +255,8 @@ def build(session: Path, output: Path, *, stride: int = 3,
 
     total_future = horizon * macro_frames
     rows = []
+    last_slow_ts = None
+    last_slow_segment = None
     for anchor in range((history - 1) * stride,
                         len(frames) - action_delay_frames - total_future, stride):
         history_frames = []
@@ -135,8 +264,12 @@ def build(session: Path, output: Path, *, stride: int = 3,
             idx = anchor - offset * stride
             frame = frames[idx]
             ts = _num(actions.get(idx, {}).get("timestamp_ns"), 0)
-            history_frames.append({"path": frame.relative_to(session).as_posix(),
-                                   "frame_index": idx, "timestamp_ns": int(ts)})
+            item = {"path": frame.relative_to(session).as_posix(),
+                    "frame_index": idx, "timestamp_ns": int(ts)}
+            if schema_version == VLA_SCHEMA_VERSION_V4:
+                item["slow_label"] = _slow_label_for_frame(idx, intent_segments,
+                                                            frame_states, actions.get(idx, {}))
+            history_frames.append(item)
         chunk = []
         for step in range(horizon):
             first = anchor + action_delay_frames + step * macro_frames + 1
@@ -159,7 +292,7 @@ def build(session: Path, output: Path, *, stride: int = 3,
             if idx in actions:
                 history_actions.append(_history_action(actions[idx]))
         record = {
-            "schema_version": VLA_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "episode_id": session.name,
             "anchor_frame": anchor,
             "intent": "",
@@ -182,7 +315,23 @@ def build(session: Path, output: Path, *, stride: int = 3,
             "quality": {"source": "teacher", "outcome": outcome},
             "auxiliary": {"legacy_action_schema": False},
         }
-        validate_record(record)
+        if schema_version == VLA_SCHEMA_VERSION_V4:
+            slow_label = _slow_label_for_frame(anchor, intent_segments, frame_states, actions.get(anchor, {}))
+            record["slow_label"] = slow_label
+            anchor_ts = obs_end_ts
+            segment_id = slow_label.get("segment_id") if slow_label.get("valid") else None
+            slow_due = bool(slow_label.get("valid")) and (
+                last_slow_ts is None
+                or anchor_ts - last_slow_ts >= int(slow_period_s * 1e9)
+                or segment_id != last_slow_segment
+            )
+            if slow_due:
+                last_slow_ts = anchor_ts
+                last_slow_segment = segment_id
+            record["loss_mask"] = {"slow": int(slow_due), "fast": 1}
+            validate_v4_record(record)
+        else:
+            validate_record(record)
         rows.append(record)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) +
@@ -196,16 +345,27 @@ def main(argv=None):
     parser.add_argument("session", type=Path)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--stride", type=int, default=3)
+    parser.add_argument("--history", type=int, default=None,
+                        help="历史帧数；v3 默认 3，v4 默认 8（范围 3..8）")
     parser.add_argument("--macro-frames", type=int, default=MACRO_FRAMES)
     parser.add_argument("--action-delay-frames", type=int, default=DEFAULT_ACTION_DELAY_FRAMES,
                         help="观测结束到动作标签起点的延迟帧数，默认 1")
     parser.add_argument("--outcome", choices=("success", "partial", "failure", "unknown"), default="unknown")
+    parser.add_argument("--schema-version", choices=(VLA_SCHEMA_VERSION, VLA_SCHEMA_VERSION_V4),
+                        default=VLA_SCHEMA_VERSION)
+    parser.add_argument("--slow-period-s", type=float, default=1.0)
     args = parser.parse_args(argv)
+    history = args.history if args.history is not None else (
+        8 if args.schema_version == VLA_SCHEMA_VERSION_V4 else HISTORY_FRAMES
+    )
     output = args.output or args.session / "vla_chunks.jsonl"
     build(args.session, output, stride=args.stride,
+          history=history,
           macro_frames=args.macro_frames,
           action_delay_frames=args.action_delay_frames,
-          outcome=args.outcome)
+          outcome=args.outcome,
+          schema_version=args.schema_version,
+          slow_period_s=args.slow_period_s)
     return 0
 
 

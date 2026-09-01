@@ -4,7 +4,7 @@
 
 ## 项目一句话
 
-以《第五人格》为环境构建 VLA agent：**画面+状态 → 动作序列**。当前阶段求生者·律师，PC 互通版，官方自定义剧本沙盒。架构为快慢双系统分层，快层按 M1 规则 → M2 小策略网络(BC) → M3 3B VLA 演进。
+以《第五人格》为环境构建 VLA agent：**连续画面+指令+模式 → 动作块序列**。当前阶段求生者·律师，PC 互通版，官方自定义剧本沙盒。VLA 原生 action chunk 是训练主线，规则策略仅作安全兜底。
 
 ## 硬性约束（勿违反）
 
@@ -21,11 +21,11 @@
 | 动作类别 / 连续通道约定 | `idv_agent/configs/schema.py` |
 | 键位映射（换了角色/改了键） | `idv_agent/configs/keymap_survivor.py` |
 | 意图类别与 16 维原型 | `idv_agent/configs/intent.py` |
-| 训练超参与设备 | `idv_agent/training/config.py` |
+| VLA 训练逻辑与超参 | `idv_agent/training/` |
 | 采集参数（FPS、区域、灵敏度尺度） | `idv_agent/capture/screen_capture.py` |
-| 破译状态机 / 动作提取参数 | `idv_agent/labels/state_machine.py`, `extract.py` |
-| 快层网络 | `idv_agent/model/fast_controller.py` |
-| 慢层三头网络 | `idv_agent/model/game_actor_critic.py` |
+| 原始事件→逐帧动作预处理 | `idv_agent/labels/extract.py`, `idv_agent/scripts/extract.py` |
+| 破译状态机 | `idv_agent/labels/state_machine.py` |
+| VLA 主干适配器 | `idv_agent/model/qwen_backbone_adapter.py`, `siglip_vision_adapter.py` |
 | 策略抽象(可插拔规则/学习) | `idv_agent/model/policy.py` |
 | 部署调度 | `idv_agent/agent/realtime_agent.py` |
 | 规则 agent（律师版兜底 P1） | `idv_agent/agent/rule_agent.py` |
@@ -33,11 +33,12 @@
 
 ## 关键概念速览
 
-- **动作空间**：20 离散类别 + 4 连续（move_x/y, cam_dx/dy），见 `configs/schema.py`。
-- **快慢连接**：慢层输出 → `intent_vector[16]` + `skeleton_idx` → 注入快层条件输入。
+- **动作空间**：VLA v3 九方向移动 + 五档相机桶 + 六个按键状态，见 `vla/action_chunk.py`。
+- **时序输入**：固定 3 帧历史，滚动预测 4 步宏动作块。
+- **VG 标注**：YOLO 只保留 `cipher_visible/cipher_highlight/interact_prompt` 三类；帧状态由 `frame_states.jsonl` 标注 `decoding/idle/walking/chased`，转换后写入 VG JSON 的顶层 `state`。
 - **破译状态机**：第五人格按一次 Q 即自动破译（无后续按键事件），需识别该隐式状态并把解码段语义重写为 `INTERACT_HOLD`（`labels/state_machine.py`）。
-- **数据文件**：每 session 一个 `frames/`+`events.csv`+`mouse_positions.csv`+`meta.json`，构建脚本产出 `samples.jsonl`。
-- **BC 训练**：`bc_fast`（快层）+ `bc_slow`（慢层），均 FP16 + GradScaler。
+- **数据文件**：每 raw session 一个 `frames/`+`events.csv`+`mouse_positions.csv`+`frame_timestamps.csv`+`meta.json`，构建脚本产出 `vla_chunks.jsonl`。
+- **训练精度**：RTX 2080 Ti 使用 FP16 + GradScaler；VLA 训练不再依赖旧 `samples.jsonl`/BC 管线。
 
 ## 变更工作流
 
