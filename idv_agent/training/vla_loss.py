@@ -20,6 +20,10 @@ class VLALossWeights:
     slow_intent: float = 1.0
     slow_subgoal: float = 0.5
     consistency: float = 0.1
+    # Recorded trajectories contain many more stop than moving steps.  Keep
+    # stop supervised, but prevent it from dominating the categorical head.
+    move_stop_weight: float = 0.25
+    button_positive_weight: float = 4.0
 
 
 def _masked_mean(values: torch.Tensor, sample_mask: torch.Tensor) -> torch.Tensor:
@@ -32,10 +36,21 @@ def _masked_mean(values: torch.Tensor, sample_mask: torch.Tensor) -> torch.Tenso
 def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
                      batch: dict, weights: VLALossWeights = VLALossWeights()) -> dict[str, torch.Tensor]:
     fast_mask = batch["fast_loss_mask"].to(fast.move_logits.device)
-    move = F.cross_entropy(fast.move_logits.transpose(1, 2), batch["move_target"], reduction="none")
+    move_class_weight = torch.ones(fast.move_logits.shape[-1], device=fast.move_logits.device,
+                                   dtype=fast.move_logits.dtype)
+    move_class_weight[0] = weights.move_stop_weight
+    move = F.cross_entropy(fast.move_logits.transpose(1, 2), batch["move_target"],
+                           weight=move_class_weight, reduction="none")
     cam_dx = F.cross_entropy(fast.camera_dx_logits.transpose(1, 2), batch["camera_dx_target"], reduction="none")
     cam_dy = F.cross_entropy(fast.camera_dy_logits.transpose(1, 2), batch["camera_dy_target"], reduction="none")
-    buttons = F.binary_cross_entropy_with_logits(fast.button_logits, batch["button_target"], reduction="none")
+    button_target = batch["button_target"].to(fast.button_logits.dtype)
+    positive_weight = torch.where(button_target > 0,
+                                  torch.as_tensor(weights.button_positive_weight, device=fast.button_logits.device,
+                                                  dtype=fast.button_logits.dtype),
+                                  torch.ones((), device=fast.button_logits.device,
+                                             dtype=fast.button_logits.dtype))
+    buttons = F.binary_cross_entropy_with_logits(fast.button_logits, button_target,
+                                                 weight=positive_weight, reduction="none")
     duration = F.smooth_l1_loss(fast.duration, batch["duration_target"], reduction="none")
     losses = {
         "fast_move": _masked_mean(move, fast_mask),
@@ -72,4 +87,3 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
         + weights.consistency * losses["consistency"]
     )
     return {"total": total, **losses}
-

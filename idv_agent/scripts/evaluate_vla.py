@@ -15,16 +15,18 @@ import torch
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
-from idv_agent.scripts.train_vla import _bounded_subset, _load_act_backbone, encode_batch, _model_inputs
+from idv_agent.scripts.train_vla import (_bounded_subset, _dataset_paths, _load_act_backbone,
+                                          encode_batch, _model_inputs)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
 from idv_agent.training.vla_loss import compute_vla_loss
+from idv_agent.vla.action_chunk import INTENTS
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(args.device)
     amp_enabled = device.type == "cuda"
-    dataset = VLASequenceDataset(args.data, verify_images=True)
+    dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
     if args.max_samples > 0:
         dataset = _bounded_subset(dataset, args.max_samples)
     loader = DataLoader(dataset, batch_size=max(1, min(args.batch_size, 2)), shuffle=False,
@@ -56,10 +58,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     frame_cache: dict[str, torch.Tensor] = {}
 
     sums = {"loss": 0.0, "loss_count": 0, "move_correct": 0, "move_total": 0,
+            "move_nonstop_correct": 0, "move_nonstop_total": 0,
             "camera_dx_correct": 0, "camera_dy_correct": 0, "camera_total": 0,
             "button_correct": 0, "button_total": 0, "button_exact": 0,
+            "button_pressed_tp": 0, "button_pressed_pred": 0, "button_pressed_target": 0,
             "duration_abs": 0.0, "duration_total": 0,
-            "intent_correct": 0, "intent_total": 0}
+            "intent_correct": 0, "intent_total": 0, "intent_buckets": {name: [0, 0] for name in INTENTS}}
     with torch.no_grad():
         for batch in loader:
             model_batch = _model_inputs(batch, device)
@@ -85,12 +89,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             sums["loss_count"] += int(sample_mask.sum())
             sums["move_correct"] += int(((move_pred == move_target) & mask).sum())
             sums["move_total"] += int(mask.sum())
+            non_stop = mask & (move_target != 0)
+            sums["move_nonstop_correct"] += int(((move_pred == move_target) & non_stop).sum())
+            sums["move_nonstop_total"] += int(non_stop.sum())
             sums["camera_dx_correct"] += int(((dx_pred == dx_target) & mask).sum())
             sums["camera_dy_correct"] += int(((dy_pred == dy_target) & mask).sum())
             sums["camera_total"] += int(mask.sum())
             button_mask = sample_mask[:, None, None].expand_as(button_target)
             sums["button_correct"] += int(((buttons_pred == button_target) & button_mask).sum())
             sums["button_total"] += int(button_mask.sum())
+            sums["button_pressed_tp"] += int(((buttons_pred == 1) & (button_target == 1) & button_mask).sum())
+            sums["button_pressed_pred"] += int(((buttons_pred == 1) & button_mask).sum())
+            sums["button_pressed_target"] += int(((button_target == 1) & button_mask).sum())
             sums["button_exact"] += int((((buttons_pred == button_target).all(-1)) & mask).sum())
             duration_mask = sample_mask[:, None].expand_as(model_batch["duration_target"])
             sums["duration_abs"] += float((output.fast.duration - model_batch["duration_target"]).abs()[duration_mask].sum().cpu())
@@ -99,6 +109,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             intent_mask = valid_intent & sample_mask
             sums["intent_correct"] += int(((output.slow.intent_logits.argmax(-1) == model_batch["intent_target"]) & intent_mask).sum())
             sums["intent_total"] += int(intent_mask.sum())
+            for target, predicted, valid in zip(model_batch["intent_target"].tolist(),
+                                                output.slow.intent_logits.argmax(-1).tolist(),
+                                                intent_mask.tolist()):
+                if valid:
+                    bucket = sums["intent_buckets"][INTENTS[target]]
+                    bucket[1] += 1
+                    bucket[0] += int(target == predicted)
 
     def ratio(n: int, d: int) -> float | None:
         return float(n / d) if d else None
@@ -111,12 +128,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "unique_frames_encoded": len(frame_cache),
         "loss": (sums["loss"] / sums["loss_count"] if sums["loss_count"] else None),
         "move_accuracy": ratio(sums["move_correct"], sums["move_total"]),
+        "move_nonstop_accuracy": ratio(sums["move_nonstop_correct"], sums["move_nonstop_total"]),
         "camera_dx_accuracy": ratio(sums["camera_dx_correct"], sums["camera_total"]),
         "camera_dy_accuracy": ratio(sums["camera_dy_correct"], sums["camera_total"]),
         "button_element_accuracy": ratio(sums["button_correct"], sums["button_total"]),
         "button_exact_accuracy": ratio(sums["button_exact"], sums["move_total"]),
+        "button_pressed_precision": ratio(sums["button_pressed_tp"], sums["button_pressed_pred"]),
+        "button_pressed_recall": ratio(sums["button_pressed_tp"], sums["button_pressed_target"]),
         "duration_mae_frames": ratio(int(sums["duration_abs"] * 1_000_000), sums["duration_total"] * 1_000_000),
         "intent_accuracy": ratio(sums["intent_correct"], sums["intent_total"]),
+        "intent_buckets": {
+            name: {"correct": values[0], "total": values[1],
+                   "accuracy": ratio(values[0], values[1])}
+            for name, values in sums["intent_buckets"].items() if values[1]
+        },
     }
 
 

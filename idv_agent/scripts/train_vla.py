@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +102,87 @@ def _bounded_subset(dataset, limit: int):
     return Subset(dataset, indices)
 
 
+ACTION_STRATA = ("interact", "move", "other_key", "stop")
+DEFAULT_STRATIFIED_RATIOS = {
+    "interact": 0.35, "move": 0.35, "other_key": 0.15, "stop": 0.15,
+}
+
+
+def _action_stratum(sample: dict[str, Any]) -> str:
+    """Classify one complete action chunk, with interaction taking priority."""
+    buttons = sample["button_target"]
+    if bool((buttons[:, 0] > 0).any()):  # BUTTON_NAMES[0] == interact/Q
+        return "interact"
+    if bool((buttons > 0).any()):
+        return "other_key"
+    if bool((sample["move_target"] != 0).any()):
+        return "move"
+    return "stop"
+
+
+def _stratified_subset(dataset, limit: int, *, seed: int = 0,
+                       ratios: dict[str, float] | None = None):
+    """Sample whole chunks with action-stratum quotas and episode round-robin.
+
+    This deliberately operates on dataset indices, so observation/action
+    alignment remains untouched.  If a requested stratum is undersupplied,
+    unused quota is redistributed from the remaining pool.
+    """
+    if limit <= 0 or len(dataset) <= limit:
+        return dataset
+    ratios = dict(ratios or DEFAULT_STRATIFIED_RATIOS)
+    if set(ratios) != set(ACTION_STRATA) or any(value < 0 for value in ratios.values()):
+        raise ValueError("stratified ratios 必须覆盖四类且非负")
+    total_ratio = sum(ratios.values())
+    if total_ratio <= 0:
+        raise ValueError("stratified ratios 总和必须为正")
+    ratios = {key: value / total_ratio for key, value in ratios.items()}
+    rng = random.Random(seed)
+    grouped: dict[str, dict[str, list[int]]] = {
+        key: defaultdict(list) for key in ACTION_STRATA
+    }
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        grouped[_action_stratum(sample)][sample["episode_id"]].append(index)
+    for strata in grouped.values():
+        for indices in strata.values():
+            rng.shuffle(indices)
+
+    raw_quota = {key: ratios[key] * limit for key in ACTION_STRATA}
+    quota = {key: int(raw_quota[key]) for key in ACTION_STRATA}
+    for key in sorted(ACTION_STRATA, key=lambda item: raw_quota[item] - quota[item], reverse=True)[:limit - sum(quota.values())]:
+        quota[key] += 1
+    selected: list[int] = []
+    leftovers = limit
+    for key in ACTION_STRATA:
+        episodes = list(grouped[key])
+        rng.shuffle(episodes)
+        take = min(quota[key], sum(len(values) for values in grouped[key].values()))
+        while take and episodes:
+            progressed = False
+            for episode in list(episodes):
+                values = grouped[key][episode]
+                if values:
+                    selected.append(values.pop())
+                    take -= 1
+                    progressed = True
+                    if not take:
+                        break
+                else:
+                    episodes.remove(episode)
+            if not progressed:
+                break
+        leftovers -= quota[key] - take
+
+    if len(selected) < limit:
+        used = set(selected)
+        remaining = [index for index in range(len(dataset)) if index not in used]
+        rng.shuffle(remaining)
+        selected.extend(remaining[:limit - len(selected)])
+    rng.shuffle(selected)
+    return Subset(dataset, selected[:limit])
+
+
 def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: torch.device,
                  frame_cache: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
     """Encode real images one frame at a time and return ``[B, L, D]`` features."""
@@ -138,7 +221,7 @@ def _model_inputs(batch: dict[str, Any], device: torch.device) -> dict[str, torc
     return {key: batch[key].to(device) for key in keys}
 
 
-def forward_loss(adapter, core, batch, *, device, amp_enabled: bool):
+def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weights=None):
     model_batch = _model_inputs(batch, device)
     frame_features = encode_batch(adapter, batch, device=device)
     condition = core.initial_condition(frame_features.shape[0], device=device,
@@ -151,7 +234,8 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool):
         output = core(frame_features, condition,
                       valid_mask=model_batch["frame_valid_mask"],
                       time_deltas=model_batch["time_deltas"], run_slow=True)
-        losses = compute_vla_loss(output.fast, output.slow, model_batch)
+        losses = compute_vla_loss(output.fast, output.slow, model_batch,
+                                  weights=loss_weights) if loss_weights is not None else compute_vla_loss(output.fast, output.slow, model_batch)
     return losses, output
 
 
@@ -172,8 +256,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if not args.init_checkpoint and not args.allow_base_init:
         raise ValueError("ACT 训练必须提供 --init-checkpoint M2_VG；仅兼容测试可加 --allow-base-init")
     dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
+    sampling = getattr(args, "sampling", "uniform")
+    if sampling not in ("uniform", "stratified"):
+        raise ValueError("sampling 必须是 uniform 或 stratified")
     if args.max_samples:
-        dataset = _bounded_subset(dataset, args.max_samples)
+        dataset = (_stratified_subset(dataset, args.max_samples, seed=int(getattr(args, "seed", 0)))
+                   if sampling == "stratified" else _bounded_subset(dataset, args.max_samples))
     batch_size = max(1, min(args.batch_size, 2))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                         collate_fn=VLASequenceCollator(max_frames=8))
@@ -204,6 +292,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     for name in ("visual_projection", "condition_projection"):
         getattr(adapter, name).to(device=device, dtype=torch.float32)
     core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim).to(device=device, dtype=torch.float32)
+    from idv_agent.training.vla_loss import VLALossWeights
+    loss_weights = VLALossWeights(move_stop_weight=args.move_stop_weight,
+                                   button_positive_weight=args.button_positive_weight)
 
     # Materialize LazyLinear before constructing the optimizer/checkpoint.
     first_batch = next(iter(loader))
@@ -213,7 +304,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     optimizer = torch.optim.AdamW(trainable, lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-    baseline_losses, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=amp_enabled)
+    baseline_losses, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=amp_enabled,
+                                      loss_weights=loss_weights)
     baseline = float(baseline_losses["total"].detach().cpu())
     history: list[float] = []
     peak_memory = 0
@@ -226,7 +318,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             iterator = iter(loader)
             batch = next(iterator)
         optimizer.zero_grad(set_to_none=True)
-        losses, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled)
+        losses, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
+                                      loss_weights=loss_weights)
         total = losses["total"]
         if not torch.isfinite(total):
             raise FloatingPointError(f"step {step}: loss 非有限值")
@@ -271,7 +364,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         precision="fp16+GradScaler" if amp_enabled else "fp32",
         training={"method": "action_chunk_sft", "steps": args.steps, "learning_rate": args.lr,
                   "batch_size": args.batch_size, "temporal_dim": args.temporal_dim,
-                  "max_samples": args.max_samples},
+                  "max_samples": args.max_samples, "sampling": sampling,
+                  "seed": int(getattr(args, "seed", 0)), "move_stop_weight": args.move_stop_weight,
+                  "button_positive_weight": args.button_positive_weight},
         schema_versions=["vla.action_chunk.v4"],
         artifacts={"act_checkpoint": str(checkpoint.name)},
         extra={"parent_stage": parent_manifest["stage"] if parent_manifest else None,
@@ -344,6 +439,11 @@ def main(argv=None) -> int:
     parser.add_argument("--max-samples", type=int, default=32)
     parser.add_argument("--temporal-dim", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--move-stop-weight", type=float, default=0.25)
+    parser.add_argument("--button-positive-weight", type=float, default=4.0)
+    parser.add_argument("--sampling", choices=("uniform", "stratified"), default="uniform",
+                        help="训练 chunk 采样策略；stratified 按交互/移动/按键/停止分层")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", default="checkpoints/vla_minimal.pt")
     args = parser.parse_args(argv)
     result = train(args)
