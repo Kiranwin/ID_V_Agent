@@ -18,6 +18,7 @@ outputs/
 # 本地配置
 .env
 .vscode/
+.worktrees/
 
 # 系统
 Thumbs.db
