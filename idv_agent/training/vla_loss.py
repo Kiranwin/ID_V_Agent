@@ -22,8 +22,12 @@ class VLALossWeights:
     consistency: float = 0.1
     # Recorded trajectories contain many more stop than moving steps.  Keep
     # stop supervised, but prevent it from dominating the categorical head.
-    move_stop_weight: float = 0.25
+    move_stop_weight: float = 0.5
     move_direction_balance: bool = False
+    # Global counts are computed once from the sampled training subset.  They
+    # are used for small batches where per-batch counts are statistically
+    # meaningless; large batches retain the original dynamic weighting.
+    move_global_counts: Optional[torch.Tensor] = None
     button_positive_weight: float = 4.0
 
 
@@ -43,7 +47,17 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
     if weights.move_direction_balance:
         # Inverse-square-root frequency weighting is less unstable than pure
         # inverse frequency while still preventing the dominant north class.
-        counts = torch.bincount(batch["move_target"].reshape(-1), minlength=fast.move_logits.shape[-1]).to(move_class_weight.dtype)
+        # Counts are computed once from the sampled training set.  Never fall
+        # back to a single-batch histogram: that made batch=1/4 runs highly
+        # sensitive to whichever directions happened to be in the batch.
+        if weights.move_global_counts is not None:
+            counts = weights.move_global_counts.to(device=move_class_weight.device,
+                                                   dtype=move_class_weight.dtype)
+        else:
+            # Compatibility for callers that do not provide a precomputed
+            # histogram; training entry points always provide one when
+            # move_direction_balance is enabled.
+            counts = torch.bincount(batch["move_target"].reshape(-1), minlength=fast.move_logits.shape[-1]).to(move_class_weight.dtype)
         counts = counts.clamp_min(1.0)
         move_class_weight = counts.rsqrt()
         move_class_weight = move_class_weight / move_class_weight.mean()

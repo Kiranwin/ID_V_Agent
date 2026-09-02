@@ -1,0 +1,204 @@
+{
+  "checkpoint": "C:\\Codespace\\ID_V_Agent\\checkpoints\\M3_ACT\\mvp_overfit32\\act_mvp_overfit32_b8.pt",
+  "checkpoint_step": 100,
+  "manifest": {
+    "manifest_schema_version": "checkpoint.manifest.v1",
+    "stage": "M3_ACT",
+    "created_at": "2026-09-02T12:41:08.899099+00:00",
+    "parent": "C:\\Codespace\\ID_V_Agent\\checkpoints\\M2_VG",
+    "base_model": "C:/Users/kiran/.cache/modelscope/models/Qwen--Qwen3-VL-4B-Instruct/snapshots/master",
+    "adapters": [
+      "lora_wk",
+      "visual_projection",
+      "act_heads"
+    ],
+    "frozen": [
+      "qwen_vision_tower",
+      "lora_wk"
+    ],
+    "trainable": [
+      "visual_projection",
+      "condition_projection",
+      "shared_temporal_encoder",
+      "slow_head",
+      "fast_head"
+    ],
+    "data": {
+      "act": "C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260901_105143.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260901_145958.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260901_150035.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260901_150104.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260901_150145.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260901_152105.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_143109.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_143224.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_143349.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_144514_471052.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_144742_894659.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_144818_438184.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_145130_808200.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_145159_919497.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_145330_096738.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_145402_463403.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_145605_084693.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_145635_549882.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_145705_120535.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_145814_293254.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_145844_399761.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_152508_487172.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_153530_866532.jsonl,C:/Codespace/ID_V_Agent/data/mvp_vla/train/20260902_155023_887599.jsonl",
+      "act_glob": "vla.action_chunk.v4"
+    },
+    "counts": {
+      "train": 32,
+      "val": 0
+    },
+    "precision": "fp16+GradScaler",
+    "training": {
+      "method": "action_chunk_sft",
+      "steps": 100,
+      "learning_rate": 0.001,
+      "batch_size": 8,
+      "temporal_dim": 256,
+      "max_samples": 32,
+      "sampling": "stratified",
+      "seed": 0,
+      "move_stop_weight": 0.5,
+      "button_positive_weight": 4.0,
+      "move_direction_balance": true,
+      "global_move_counts": null,
+      "teacher_forcing_start": 1.0,
+      "teacher_forcing_end": 0.0,
+      "teacher_forcing_decay_steps": 0
+    },
+    "schema_versions": [
+      "vla.action_chunk.v4"
+    ],
+    "artifacts": {
+      "act_checkpoint": "act_mvp_overfit32_b8.pt"
+    },
+    "parent_stage": "M2_VG",
+    "val_data": []
+  },
+  "train": {
+    "name": "train",
+    "samples": 32,
+    "move_pred_counts": [
+      64,
+      64,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "move_target_counts": [
+      96,
+      21,
+      4,
+      0,
+      0,
+      4,
+      0,
+      1,
+      2
+    ],
+    "slow_intent_pred_counts": [
+      0,
+      0,
+      0,
+      0,
+      32,
+      0,
+      0,
+      0
+    ],
+    "slow_intent_target_counts": [
+      25,
+      0,
+      0,
+      0,
+      7,
+      0,
+      0,
+      0
+    ],
+    "fast_condition_intent_counts": [
+      0,
+      0,
+      0,
+      0,
+      32,
+      0,
+      0,
+      0
+    ],
+    "slow_intent_loss_sum": 9.245361328125,
+    "slow_subgoal_loss_sum": 4.7373046875,
+    "slow_count": 7,
+    "move_total": 128,
+    "move_nonstop_pred": 17,
+    "move_nonstop_total": 32,
+    "slow_intent_loss_mean": 1.3207659040178572,
+    "slow_subgoal_loss_mean": 0.6767578125,
+    "move_nonstop_prediction_rate_on_nonstop_targets": 0.53125,
+    "slow_intent_pred_names": {
+      "travel": 32
+    },
+    "fast_condition_intent_names": {
+      "travel": 32
+    }
+  },
+  "val": {
+    "name": "val",
+    "samples": 32,
+    "move_pred_counts": [
+      64,
+      64,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "move_target_counts": [
+      100,
+      19,
+      1,
+      0,
+      0,
+      0,
+      0,
+      8,
+      0
+    ],
+    "slow_intent_pred_counts": [
+      0,
+      0,
+      0,
+      0,
+      32,
+      0,
+      0,
+      0
+    ],
+    "slow_intent_target_counts": [
+      26,
+      0,
+      0,
+      0,
+      6,
+      0,
+      0,
+      0
+    ],
+    "fast_condition_intent_counts": [
+      0,
+      0,
+      0,
+      0,
+      32,
+      0,
+      0,
+      0
+    ],
+    "slow_intent_loss_sum": 3.7359619140625,
+    "slow_subgoal_loss_sum": 1.91357421875,
+    "slow_count": 3,
+    "move_total": 128,
+    "move_nonstop_pred": 14,
+    "move_nonstop_total": 28,
+    "slow_intent_loss_mean": 1.2453206380208333,
+    "slow_subgoal_loss_mean": 0.6378580729166666,
+    "move_nonstop_prediction_rate_on_nonstop_targets": 0.5,
+    "slow_intent_pred_names": {
+      "travel": 32
+    },
+    "fast_condition_intent_names": {
+      "travel": 32
+    }
+  },
+  "note": "fast_condition_intent uses teacher_forcing_ratio=0, matching deployment; historical step-250 distributions require per-step logging and are not recoverable from a final checkpoint."
+}

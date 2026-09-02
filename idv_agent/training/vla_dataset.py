@@ -47,9 +47,10 @@ class VLASequenceDataset(Dataset):
                         validate_v4_record(record)
                     except ValueError as exc:
                         raise ValueError(f"{path}:{line_no}: {exc}") from exc
+                    image_root = Path(record.get("source_root", path.parent))
                     if verify_images:
                         for frame in record["observations"]["frames"]:
-                            image = path.parent / frame["path"]
+                            image = image_root / frame["path"]
                             if not image.is_file():
                                 raise ValueError(f"{path}:{line_no} 图像不存在: {image}")
                     self.records.append((path.parent, record))
@@ -61,6 +62,12 @@ class VLASequenceDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict:
         root, record = self.records[index]
+        # Filtered MVP files may live outside the source session.  The
+        # preparer preserves source_root while retaining protocol-relative
+        # frame paths, so resolve pixels from that original root.
+        source_root = record.get("source_root")
+        if source_root:
+            root = Path(source_root)
         frames = record["observations"]["frames"]
         slow = record["slow_label"]
         chunk = record["action_chunk"]
@@ -135,4 +142,3 @@ class VLASequenceCollator:
             "time_deltas": time_deltas,
         })
         return batch_dict
-

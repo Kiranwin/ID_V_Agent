@@ -311,7 +311,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if args.max_samples:
         dataset = (_stratified_subset(dataset, args.max_samples, seed=int(getattr(args, "seed", 0)))
                    if sampling == "stratified" else _bounded_subset(dataset, args.max_samples))
-    batch_size = max(1, min(args.batch_size, 2))
+    # Do not silently cap the requested batch.  The caller is responsible for
+    # selecting a size that fits the available GPU memory.
+    batch_size = max(1, int(args.batch_size))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                         collate_fn=VLASequenceCollator(max_frames=8))
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
@@ -342,12 +344,22 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         getattr(adapter, name).to(device=device, dtype=torch.float32)
     core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim).to(device=device, dtype=torch.float32)
     from idv_agent.training.vla_loss import VLALossWeights
+    global_counts = None
+    if args.move_direction_balance:
+        global_counts = torch.zeros(9, dtype=torch.float32)
+        for index in range(len(dataset)):
+            global_counts += torch.bincount(dataset[index]["move_target"], minlength=9).to(torch.float32)
     loss_weights = VLALossWeights(move_stop_weight=args.move_stop_weight,
                                    button_positive_weight=args.button_positive_weight,
-                                   move_direction_balance=args.move_direction_balance)
+                                   move_direction_balance=args.move_direction_balance,
+                                   move_global_counts=global_counts)
 
     # Materialize LazyLinear before constructing the optimizer/checkpoint.
     first_batch = next(iter(loader))
+    if getattr(args, "overfit_slow_mask", False):
+        # Small-set memorization check: supervise the slow head on every
+        # sampled chunk instead of simulating its low-frequency tick.
+        first_batch["slow_loss_mask"] = torch.ones_like(first_batch["slow_loss_mask"])
     with torch.no_grad():
         encode_batch(adapter, first_batch, device=device)
     trainable = [p for p in list(adapter.parameters()) + list(core.parameters()) if p.requires_grad]
@@ -359,6 +371,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                       teacher_forcing_ratio=_teacher_forcing_ratio(args, 0))
     baseline = float(baseline_losses["total"].detach().cpu())
     history: list[float] = []
+    component_history: list[dict[str, float]] = []
     peak_memory = 0
     started = time.perf_counter()
     iterator = iter(loader)
@@ -368,6 +381,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         except StopIteration:
             iterator = iter(loader)
             batch = next(iterator)
+        if getattr(args, "overfit_slow_mask", False):
+            batch["slow_loss_mask"] = torch.ones_like(batch["slow_loss_mask"])
         optimizer.zero_grad(set_to_none=True)
         losses, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
                                       loss_weights=loss_weights,
@@ -386,13 +401,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             optimizer.step()
         history.append(float(total.detach().cpu()))
+        component_history.append({key: float(value.detach().cpu()) for key, value in losses.items()})
         if device.type == "cuda":
             peak_memory = max(peak_memory, torch.cuda.max_memory_allocated(device))
 
     mask = _mask_comparison(history, adapter, core, first_batch, device, amp_enabled)
     checkpoint = Path(args.checkpoint)
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"adapter": {"visual_projection": adapter.visual_projection.state_dict(),
+    torch.save({"checkpoint_schema_version": "m3_act.internal.v1",
+                "adapter": {"visual_projection": adapter.visual_projection.state_dict(),
                              "condition_projection": adapter.condition_projection.state_dict()},
                 "core": core.state_dict(),
                 "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
@@ -415,11 +432,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         counts={"train": len(dataset), "val": len(val_dataset) if val_dataset is not None else 0},
         precision="fp16+GradScaler" if amp_enabled else "fp32",
         training={"method": "action_chunk_sft", "steps": args.steps, "learning_rate": args.lr,
-                  "batch_size": args.batch_size, "temporal_dim": args.temporal_dim,
+                  "batch_size": batch_size, "temporal_dim": args.temporal_dim,
                   "max_samples": args.max_samples, "sampling": sampling,
                   "seed": int(getattr(args, "seed", 0)), "move_stop_weight": args.move_stop_weight,
                   "button_positive_weight": args.button_positive_weight,
                   "move_direction_balance": args.move_direction_balance,
+                  "global_move_counts": global_counts.tolist() if global_counts is not None else None,
                   "teacher_forcing_start": args.teacher_forcing_start,
                   "teacher_forcing_end": args.teacher_forcing_end,
                   "teacher_forcing_decay_steps": args.teacher_forcing_decay_steps},
@@ -430,13 +448,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
     manifest_path = checkpoint.parent / "manifest.json"
     write_manifest(manifest_path, manifest)
+    # Embed the exact manifest snapshot in the binary as well as writing the
+    # human-readable sidecar.  This prevents later experiments in the same
+    # directory from making a checkpoint's provenance ambiguous.
+    torch.save({**saved, "manifest": manifest}, checkpoint)
     result = {"samples": len(dataset), "val_samples": len(val_dataset) if val_dataset is not None else 0,
             "steps": args.steps, "baseline_loss": baseline,
             "final_loss": history[-1] if history else baseline,
-            "loss_history": history, "mask": mask,
+            "loss_history": history, "component_loss_history": component_history, "mask": mask,
             "checkpoint": str(checkpoint), "checkpoint_loss_delta": abs(float(before["total"] - after["total"])),
             "peak_memory_mb": peak_memory / (1024 * 1024), "elapsed_sec": elapsed,
             "manifest": str(manifest_path.resolve()),
+            "checkpoint_manifest_embedded": True,
             "slow_accuracy": _slow_accuracy(adapter, core, eval_loader, device, amp_enabled),
             "val": (_evaluate(adapter, core, val_loader, device, amp_enabled)
                     if val_loader is not None else None)}
@@ -472,12 +495,48 @@ def _evaluate(adapter, core, loader, device, amp_enabled):
     core.eval()
     adapter.eval()
     losses: list[float] = []
+    move_pred = [0] * 9
+    move_target = [0] * 9
+    intent_pred = [0] * 8
+    intent_target = [0] * 8
+    button_pred = [0] * 6
+    button_target = [0] * 6
+    non_stop_pred = 0
+    non_stop_total = 0
     with torch.no_grad():
         for batch in loader:
-            values, _ = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled)
+            values, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled)
             losses.append(float(values["total"].detach().cpu()))
+            mask = batch["fast_loss_mask"].to(output.fast.move_logits.device).bool()
+            for value in output.fast.move_logits.argmax(-1)[mask].detach().cpu().reshape(-1).tolist():
+                move_pred[int(value)] += 1
+            targets = batch["move_target"][mask].detach().cpu().reshape(-1).tolist()
+            for value in targets:
+                move_target[int(value)] += 1
+            target_tensor = batch["move_target"][mask]
+            pred_tensor = output.fast.move_logits.argmax(-1)[mask]
+            non_stop = target_tensor != 0
+            non_stop_total += int(non_stop.sum())
+            non_stop_pred += int(((pred_tensor != 0) & non_stop).sum())
+            button_logits = output.fast.button_logits[mask]
+            button_targets = batch["button_target"][mask]
+            button_pred_tensor = (button_logits > 0).to(torch.int64)
+            for i in range(button_pred_tensor.shape[-1]):
+                button_pred[i] += int(button_pred_tensor[..., i].sum())
+                button_target[i] += int((button_targets[..., i] > 0).sum())
+            if output.slow is not None:
+                valid = batch["intent_target"] >= 0
+                for value in output.slow.intent_logits.argmax(-1)[valid].detach().cpu().tolist():
+                    intent_pred[int(value)] += 1
+                for value in batch["intent_target"][valid].detach().cpu().tolist():
+                    intent_target[int(value)] += 1
     return {"loss": (sum(losses) / len(losses) if losses else None),
-            "slow_accuracy": _slow_accuracy(adapter, core, loader, device, amp_enabled)}
+            "slow_accuracy": _slow_accuracy(adapter, core, loader, device, amp_enabled),
+            "move_pred_counts": move_pred, "move_target_counts": move_target,
+            "intent_pred_counts": intent_pred, "intent_target_counts": intent_target,
+            "button_pred_positive_counts": button_pred, "button_target_positive_counts": button_target,
+            "interact_pred_positive": button_pred[0], "interact_target_positive": button_target[0],
+            "move_nonstop_prediction_rate": (non_stop_pred / non_stop_total if non_stop_total else None)}
 
 
 def _teacher_forcing_ratio(args: argparse.Namespace, step: int) -> float:
@@ -506,9 +565,9 @@ def main(argv=None) -> int:
     parser.add_argument("--max-samples", type=int, default=32)
     parser.add_argument("--temporal-dim", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--move-stop-weight", type=float, default=0.25)
+    parser.add_argument("--move-stop-weight", type=float, default=0.5)
     parser.add_argument("--move-direction-balance", action="store_true",
-                        help="按当前 batch 的九方向频率做 inverse-sqrt class balance")
+                        help="batch>=4 时按 batch 频率；batch<4 时按采样训练集全局频率做 inverse-sqrt balance")
     parser.add_argument("--button-positive-weight", type=float, default=4.0)
     parser.add_argument("--teacher-forcing-start", type=float, default=1.0,
                         help="训练开始时使用真实 intent/subgoal 的比例")
@@ -518,6 +577,8 @@ def main(argv=None) -> int:
                         help="teacher forcing 线性退火步数；0 表示使用总训练步数")
     parser.add_argument("--sampling", choices=("uniform", "stratified"), default="uniform",
                         help="训练 chunk 采样策略；stratified 按交互/移动/按键/停止分层")
+    parser.add_argument("--overfit-slow-mask", action="store_true",
+                        help="小数据过拟合验证时将每条样本 slow_loss_mask 置 1")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", default="checkpoints/vla_minimal.pt")
     args = parser.parse_args(argv)
