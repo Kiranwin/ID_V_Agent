@@ -79,6 +79,26 @@ def _load_intent_segments(path: Path | None) -> list[dict[str, Any]]:
     return result
 
 
+def _segments_for_session(session: str, *, intent_segments: Path | None,
+                          intent_root: Path | None,
+                          cache: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    if session in cache:
+        return cache[session]
+    if intent_segments is not None:
+        cache[session] = _load_intent_segments(intent_segments)
+    elif intent_root is not None:
+        for name in ("intent_segments.csv", "intent_segments.jsonl"):
+            path = intent_root / session / name
+            if path.is_file():
+                cache[session] = _load_intent_segments(path)
+                break
+        else:
+            raise ValueError(f"session={session} 缺少 intent_segments.csv/jsonl: {intent_root / session}")
+    else:
+        cache[session] = []
+    return cache[session]
+
+
 def _load_intent(dataset: Path, meta_path: Path | None, override: str | None,
                  annotation: dict[str, Any], segments: list[dict[str, Any]]) -> tuple[str, str]:
     if override:
@@ -108,7 +128,7 @@ def _load_intent(dataset: Path, meta_path: Path | None, override: str | None,
             if value:
                 return value, f"meta:{key}"
     value = str(annotation.get("intent_hint", "")).strip()
-    return value or "idle", "annotation.intent_hint"
+    return value or "idle", str(annotation.get("intent_source", "annotation.intent_hint"))
 
 
 def _region(objects: list[dict[str, Any]]) -> str:
@@ -154,15 +174,18 @@ def _qa_for_annotation(annotation: dict[str, Any], state: str, intent: str,
 
 def generate(dataset: Path, *, annotations: Path, states: Path,
              output: Path, meta: Path | None = None, intent: str | None = None,
-             intent_segments: Path | None = None) -> int:
+             intent_segments: Path | None = None, intent_root: Path | None = None) -> int:
     state_map = _load_states(states)
     annotations_rows = _load_jsonl(annotations)
-    segments = _load_intent_segments(intent_segments)
+    segment_cache: dict[str, list[dict[str, Any]]] = {}
     result = []
     for annotation in annotations_rows:
         key = (str(annotation.get("source_session")), int(annotation.get("source_frame")))
         if key not in state_map:
             raise ValueError(f"缺少帧状态: {key}")
+        session = str(annotation.get("source_session", ""))
+        segments = _segments_for_session(session, intent_segments=intent_segments,
+                                         intent_root=intent_root, cache=segment_cache)
         frame_intent, source = _load_intent(dataset, meta, intent, annotation, segments)
         result.extend(_qa_for_annotation(annotation, state_map[key], frame_intent, source))
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -180,6 +203,8 @@ def main(argv=None) -> int:
     parser.add_argument("--meta", type=Path, default=None)
     parser.add_argument("--intent-segments", type=Path, default=None,
                         help="按 source_frame 映射人工意图片段（CSV/JSONL）")
+    parser.add_argument("--intent-root", type=Path, default=None,
+                        help="包含各 session/intent_segments.csv 的 raw session 根目录")
     parser.add_argument("--intent", default=None, help="覆盖 meta 中的 session 主意图")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args(argv)
@@ -189,7 +214,7 @@ def main(argv=None) -> int:
                  states=args.states or args.dataset / "frame_states.jsonl",
                  output=args.output or args.dataset / "frame_qa.jsonl",
                  meta=args.meta, intent=args.intent,
-                 intent_segments=args.intent_segments)
+                 intent_segments=args.intent_segments, intent_root=args.intent_root)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     return 0

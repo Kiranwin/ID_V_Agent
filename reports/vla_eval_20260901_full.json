@@ -1,0 +1,17 @@
+{
+  "data": [
+    "data/vla_raw_sessions/20260901_152105/vla_chunks_v4.jsonl"
+  ],
+  "samples": 2214,
+  "checkpoint": "C:\\Codespace\\ID_V_Agent\\checkpoints\\M3_ACT\\act_small.pt",
+  "parent_stage": "M2_VG",
+  "unique_frames_encoded": 2221,
+  "loss": 2.221143708258948,
+  "move_accuracy": 0.5844625112917796,
+  "camera_dx_accuracy": 0.998193315266486,
+  "camera_dy_accuracy": 1.0,
+  "button_element_accuracy": 0.9192261367058115,
+  "button_exact_accuracy": 0.5254065040650406,
+  "duration_mae_frames": 0.09178628895663957,
+  "intent_accuracy": 0.24796747967479674
+}

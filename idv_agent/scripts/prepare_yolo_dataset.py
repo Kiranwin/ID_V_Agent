@@ -45,7 +45,8 @@ def _frames(session_dir: Path) -> list[Path]:
 
 def prepare(*, sessions_root: Path, session_names: str | None,
             output: Path, stride: int, val_ratio: float,
-            seed: int, max_per_session: int | None) -> int:
+            seed: int, max_per_session: int | None,
+            val_session_names: str | None = None) -> int:
     if stride <= 0:
         raise ValueError("stride 必须为正整数")
     if not 0.0 < val_ratio < 1.0:
@@ -54,13 +55,22 @@ def prepare(*, sessions_root: Path, session_names: str | None,
     if len(sessions) < 1:
         raise ValueError("至少需要 1 局 session")
 
-    rng = random.Random(seed)
-    shuffled = list(sessions)
-    rng.shuffle(shuffled)
-    # 一局只能生成 train 标注池；不能把同一局相邻帧拆到 train/val，
-    # 否则验证结果会因时序泄漏而虚高。收集到更多 session 后再启用 val。
-    n_val = 0 if len(shuffled) == 1 else max(1, round(len(shuffled) * val_ratio))
-    val_sessions = {p.name for p in shuffled[:n_val]}
+    all_session_names = {p.name for p in sessions}
+    if val_session_names:
+        val_sessions = {name.strip() for name in val_session_names.split(",") if name.strip()}
+        unknown = val_sessions - all_session_names
+        if unknown:
+            raise ValueError(f"--val-sessions 中存在未选择的 session: {', '.join(sorted(unknown))}")
+        if len(val_sessions) == len(sessions):
+            raise ValueError("验证集不能包含全部 session")
+    else:
+        rng = random.Random(seed)
+        shuffled = list(sessions)
+        rng.shuffle(shuffled)
+        # 一局只能生成 train 标注池；不能把同一局相邻帧拆到 train/val，
+        # 否则验证结果会因时序泄漏而虚高。收集到更多 session 后再启用 val。
+        n_val = 0 if len(shuffled) == 1 else max(1, round(len(shuffled) * val_ratio))
+        val_sessions = {p.name for p in shuffled[:n_val]}
 
     # Create the standard Ultralytics layout.
     for split in ("train", "val"):
@@ -134,13 +144,16 @@ def main(argv=None) -> int:
     p.add_argument("--output", type=Path, default=Path("data/yolo_cipher"))
     p.add_argument("--stride", type=int, default=5, help="每隔多少帧抽一张")
     p.add_argument("--val-ratio", type=float, default=0.2)
+    p.add_argument("--val-sessions", default=None,
+                   help="显式指定验证 session（逗号分隔）；优先于 --val-ratio/--seed")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-per-session", type=int, default=None)
     args = p.parse_args(argv)
     try:
         prepare(sessions_root=args.sessions_root, session_names=args.sessions,
                 output=args.output, stride=args.stride, val_ratio=args.val_ratio,
-                seed=args.seed, max_per_session=args.max_per_session)
+                seed=args.seed, max_per_session=args.max_per_session,
+                val_session_names=args.val_sessions)
     except ValueError as exc:
         p.error(str(exc))
     return 0

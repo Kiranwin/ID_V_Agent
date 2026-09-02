@@ -25,7 +25,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = REPO_ROOT / "idv_agent" / "data" / "wk"
+# Runtime data lives under the repository-level data directory.  Keep this
+# path aligned with the WK files consumed by train_wk_lora.py.
+DATA_DIR = REPO_ROOT / "data" / "wk_vg" / "wk"
 TRAIN_PATH = DATA_DIR / "wk_train.jsonl"
 GAPS_PATH = DATA_DIR / "knowledge_gaps.json"
 

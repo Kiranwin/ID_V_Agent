@@ -133,6 +133,41 @@ def _mouse_changed_between(timestamp_ns: int, previous_ns: int | None,
     return xs[end - 1] != xs[start] or ys[end - 1] != ys[start]
 
 
+def _load_action_states(session: Path) -> dict[int, dict[str, str]]:
+    """Load event-derived per-frame action semantics when available.
+
+    The game starts decoding with a short Q tap and then continues without a
+    held Q key.  ``labels.extract``/``state_machine`` already turns that
+    implicit interval into ``INTERACT_HOLD`` rows; using those rows here keeps
+    frame state inference event-derived while avoiding the old Q+prompt-only
+    undercount.
+    """
+    path = session / "per_frame_actions.csv"
+    if not path.is_file():
+        return {}
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = csv.DictReader(handle)
+        result: dict[int, dict[str, str]] = {}
+        for index, row in enumerate(rows, 2):
+            try:
+                frame = int(row.get("frame_idx", row.get("frame_id")))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{path}:{index} frame_idx 无效") from exc
+            result[frame] = {
+                "category_name": str(row.get("category_name", "")),
+                "text_action": str(row.get("text_action", "")),
+            }
+    return result
+
+
+def _action_implies_decoding(action: dict[str, str] | None) -> bool:
+    if not action:
+        return False
+    category = action.get("category_name", "").strip().upper()
+    text_action = action.get("text_action", "").strip().upper()
+    return category == "INTERACT_HOLD" or "INTERACT_HOLD" in text_action or "DECODE" in text_action
+
+
 def _held(intervals: list[Interval], timestamp_ns: int) -> set[str]:
     return {item.code for item in intervals if item.contains(timestamp_ns)}
 
@@ -186,6 +221,7 @@ def infer(dataset: Path, *, repo_root: Path, output: Path, overwrite: bool = Fal
                 "session": session,
                 "intervals": _build_intervals(events, end_ts),
                 "mouse": _mouse_motion(session),
+                "action_states": _load_action_states(session),
                 "frame_ts_by_index": frame_ts_by_index,
                 "last_ts": None,
                 "recent_motions": [],
@@ -216,7 +252,13 @@ def infer(dataset: Path, *, repo_root: Path, output: Path, overwrite: bool = Fal
         mouse_changed = _mouse_changed_between(frame_ts, item["last_ts"], mouse_ts, mouse_x, mouse_y)
         item["last_ts"] = frame_ts
         prompt = _prompt_present(label_path)
-        decoding = INTERACT_KEY in held and prompt
+        action_state = item["action_states"].get(frame_index)
+        # Q is a tap in the real game: after the tap, decoding persists even
+        # when Q is released and the prompt disappears.  Prefer the
+        # event-derived state-machine label when present, while retaining the
+        # raw Q+prompt rule for minimal/exported sessions without actions CSV.
+        action_decoding = _action_implies_decoding(action_state)
+        decoding = action_decoding or (INTERACT_KEY in held and prompt)
         chased = chased_heuristic and _chased_heuristic(
             held, mouse_changed, item["recent_motions"], chased_window_frames)
         if decoding:
@@ -235,9 +277,12 @@ def infer(dataset: Path, *, repo_root: Path, output: Path, overwrite: bool = Fal
             "evidence": {
                 "q_held": INTERACT_KEY in held,
                 "interact_prompt": prompt,
+                "action_category": action_state.get("category_name", "") if action_state else "",
+                "action_text": action_state.get("text_action", "") if action_state else "",
+                "action_decoding": action_decoding,
                 "move_keys_held": sorted(held & MOVE_KEYS),
                 "mouse_changed": mouse_changed,
-                "state_rule": "q_held+prompt|chased_heuristic|active_input|idle",
+                "state_rule": "action_interact_hold|q_held+prompt|chased_heuristic|active_input|idle",
             },
         })
 

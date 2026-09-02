@@ -210,15 +210,30 @@ def _intent_for_frame(frame: int, segments: list[dict], state: str) -> tuple[str
     return STATE_TO_INTENT_HINT[state], "state_weak_hint"
 
 
+def _segments_for_session(session: str, *, intent_segments: Path | None,
+                          intent_root: Path | None) -> list[dict]:
+    if intent_segments is not None:
+        return _load_intent_segments(intent_segments)
+    if intent_root is None:
+        return []
+    for name in ("intent_segments.csv", "intent_segments.jsonl"):
+        path = intent_root / session / name
+        if path.is_file():
+            return _load_intent_segments(path)
+    raise ValueError(f"session={session} 缺少 intent_segments.csv/jsonl: {intent_root / session}")
+
+
 def convert(dataset: Path, annotations_out: Path, grounding_out: Path,
             repo_root: Path, state_file: Path | None = None,
-            intent_segments: Path | None = None) -> tuple[int, int]:
+            intent_segments: Path | None = None,
+            intent_root: Path | None = None,
+            require_intent_coverage: bool = False) -> tuple[int, int]:
     manifest = dataset / "manifest.csv"
     if not manifest.is_file():
         raise ValueError(f"缺少 {manifest}")
     state_file = state_file or dataset / "frame_states.jsonl"
     states = _load_states(state_file)
-    segments = _load_intent_segments(intent_segments)
+    segment_cache: dict[str, list[dict]] = {}
     annotations, examples = [], []
     expected_state_keys: set[tuple[str, int]] = set()
     with manifest.open(encoding="utf-8-sig", newline="") as handle:
@@ -239,6 +254,14 @@ def convert(dataset: Path, annotations_out: Path, grounding_out: Path,
             state = states.get((session, frame_index))
             if state is None:
                 raise ValueError(f"缺少帧状态: session={session} frame={frame_index}")
+            if session not in segment_cache:
+                segment_cache[session] = _segments_for_session(
+                    session, intent_segments=intent_segments, intent_root=intent_root)
+            segments = segment_cache[session]
+            if require_intent_coverage and not any(
+                    segment["start_frame"] <= frame_index <= segment["end_frame"]
+                    for segment in segments):
+                raise ValueError(f"session={session} frame={frame_index} 不在人工 intent_segments 覆盖范围内")
             intent_hint, intent_source = _intent_for_frame(frame_index, segments, state)
             record = {
                 "schema_version": SCHEMA_VERSION,
@@ -287,12 +310,19 @@ def main(argv=None) -> int:
                         help="帧级状态 JSONL；默认 dataset/frame_states.jsonl")
     parser.add_argument("--intent-segments", type=Path, default=None,
                         help="人工意图片段 CSV/JSONL；用于统一 vg_annotations.intent_hint")
+    parser.add_argument("--intent-root", type=Path, default=None,
+                        help="包含各 session/intent_segments.csv 的 raw session 根目录")
+    parser.add_argument("--allow-weak-intent", action="store_true",
+                        help="允许分段未覆盖的帧回退到状态弱提示（默认严格报错）")
     args = parser.parse_args(argv)
     annotations_out = args.annotations_out or args.dataset / "vg_annotations.jsonl"
     grounding_out = args.grounding_out or args.dataset / "vg_grounding.jsonl"
     try:
+        if args.intent_segments is not None and args.intent_root is not None:
+            parser.error("--intent-segments 与 --intent-root 只能二选一")
         convert(args.dataset, annotations_out, grounding_out, args.repo_root.resolve(), args.state_file,
-                args.intent_segments)
+                args.intent_segments, args.intent_root,
+                require_intent_coverage=bool(args.intent_segments or args.intent_root) and not args.allow_weak_intent)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     return 0
