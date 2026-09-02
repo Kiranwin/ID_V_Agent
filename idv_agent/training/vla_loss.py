@@ -29,6 +29,11 @@ class VLALossWeights:
     # meaningless; large batches retain the original dynamic weighting.
     move_global_counts: Optional[torch.Tensor] = None
     button_positive_weight: float = 4.0
+    # Optional [num_buttons, 2] histogram: columns are negative/positive
+    # counts.  When supplied, BCE uses neg/pos per button instead of a fixed
+    # scalar, preventing a majority interaction label from collapsing to all
+    # ones (or a rare key from collapsing to all zeros).
+    button_global_counts: Optional[torch.Tensor] = None
 
 
 def _masked_mean(values: torch.Tensor, sample_mask: torch.Tensor) -> torch.Tensor:
@@ -66,11 +71,19 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
     cam_dx = F.cross_entropy(fast.camera_dx_logits.transpose(1, 2), batch["camera_dx_target"], reduction="none")
     cam_dy = F.cross_entropy(fast.camera_dy_logits.transpose(1, 2), batch["camera_dy_target"], reduction="none")
     button_target = batch["button_target"].to(fast.button_logits.dtype)
-    positive_weight = torch.where(button_target > 0,
-                                  torch.as_tensor(weights.button_positive_weight, device=fast.button_logits.device,
-                                                  dtype=fast.button_logits.dtype),
-                                  torch.ones((), device=fast.button_logits.device,
-                                             dtype=fast.button_logits.dtype))
+    if weights.button_global_counts is not None:
+        counts = weights.button_global_counts.to(device=fast.button_logits.device,
+                                                 dtype=fast.button_logits.dtype)
+        if counts.ndim != 2 or counts.shape[0] != fast.button_logits.shape[-1] or counts.shape[1] != 2:
+            raise ValueError("button_global_counts 必须是 [num_buttons, 2]，列为 negative/positive")
+        pos_weight = (counts[:, 0] / counts[:, 1].clamp_min(1.0)).clamp_min(1e-3)
+        positive_weight = torch.where(button_target > 0, pos_weight, torch.ones_like(button_target))
+    else:
+        positive_weight = torch.where(button_target > 0,
+                                      torch.as_tensor(weights.button_positive_weight, device=fast.button_logits.device,
+                                                      dtype=fast.button_logits.dtype),
+                                      torch.ones((), device=fast.button_logits.device,
+                                                 dtype=fast.button_logits.dtype))
     buttons = F.binary_cross_entropy_with_logits(fast.button_logits, button_target,
                                                  weight=positive_weight, reduction="none")
     duration = F.smooth_l1_loss(fast.duration, batch["duration_target"], reduction="none")

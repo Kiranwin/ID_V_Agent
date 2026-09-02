@@ -102,6 +102,33 @@ def _bounded_subset(dataset, limit: int):
     return Subset(dataset, indices)
 
 
+def _contiguous_subset(dataset, limit: int):
+    """Return up to ``limit`` records in contiguous episode runs.
+
+    If one episode is shorter than the requested cap, continue with the next
+    run; each run remains contiguous so only the run boundary incurs misses.
+    """
+    if limit <= 0 or len(dataset) <= limit:
+        return dataset
+    runs: list[tuple[int, int]] = []
+    start = 0
+    previous = dataset[0].get("episode_id")
+    for index in range(1, len(dataset)):
+        current = dataset[index].get("episode_id")
+        if current != previous:
+            runs.append((start, index))
+            start, previous = index, current
+    runs.append((start, len(dataset)))
+    # Prefer the longest run, then continue in source order if needed.
+    runs.sort(key=lambda run: (run[1] - run[0]), reverse=True)
+    selected: list[int] = []
+    for begin, end in runs:
+        if len(selected) >= limit:
+            break
+        selected.extend(range(begin, min(end, begin + limit - len(selected))))
+    return Subset(dataset, selected[:limit])
+
+
 ACTION_STRATA = ("interact", "move", "other_key", "stop")
 DEFAULT_STRATIFIED_RATIOS = {
     "interact": 0.35, "move": 0.35, "other_key": 0.15, "stop": 0.15,
@@ -184,31 +211,62 @@ def _stratified_subset(dataset, limit: int, *, seed: int = 0,
 
 
 def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: torch.device,
-                 frame_cache: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
-    """Encode real images one frame at a time and return ``[B, L, D]`` features."""
+                 frame_cache: dict[tuple[str, int, str], torch.Tensor] | None = None,
+                 frame_stats: dict[str, int] | None = None) -> torch.Tensor:
+    """Encode real images one frame at a time and return ``[B, L, D]`` features.
+
+    ``frame_cache`` deduplicates vision-tower forwards across calls by task and
+    frame path.  Cache entries are ``detach().cpu()`` snapshots, so a cache may only
+    be passed on inference paths that run under ``torch.no_grad()`` with the
+    adapter in eval mode; gradient training must keep it ``None`` (reusing a
+    detached feature would silently cut gradients for the trainable
+    projections).  Cached features fold instruction/mode conditioning
+    (``encode_frame`` adds the condition projection), so the key is
+    ``(instruction, mode_id, path)`` — path alone would wrongly reuse a
+    feature across different tasks.  When ``frame_stats`` is given it must
+    contain ``hits``/``encoded`` counters (pad slots are not counted); both
+    are accumulated in place.
+    """
     features = []
     cache_by_task: dict[tuple[str, int], Any] = {}
+    # Per-batch cache deliberately keeps graph-connected tensors.  This is
+    # safe for training and preserves gradient accumulation when duplicate
+    # frame/task pairs occur within one batch; persistent ``frame_cache``
+    # remains detached and is therefore restricted to inference.
+    batch_frame_cache: dict[tuple[str, int, str], torch.Tensor] = {}
     for paths, instruction, mode_id in zip(
         batch["frame_paths"], batch["task_instruction"], batch["mode_id"].tolist()
     ):
-        key = (instruction, int(mode_id))
+        task_key = (instruction, int(mode_id))
         # Dataset stores the canonical mode id; model cache needs its token.
         mode = ("standard", "joint_hunt", "blackjack")[int(mode_id)]
-        if key not in cache_by_task:
-            cache_by_task[key] = adapter.encode_task_once(instruction, mode, task_id=f"{instruction}:{mode}")
-        cache = cache_by_task[key]
+        if task_key not in cache_by_task:
+            cache_by_task[task_key] = adapter.encode_task_once(instruction, mode, task_id=f"{instruction}:{mode}")
+        cache = cache_by_task[task_key]
         row = []
         for path, image in zip(paths, _load_images(paths)):
-            cache_key = str(path) if path is not None else "<pad>"
-            if frame_cache is not None and cache_key in frame_cache:
+            cache_key = (instruction, int(mode_id),
+                         str(path) if path is not None else "<pad>")
+            if path is not None and cache_key in batch_frame_cache:
+                row.append(batch_frame_cache[cache_key])
+                if frame_stats is not None:
+                    frame_stats["hits"] += 1
+                continue
+            if path is not None and frame_cache is not None and cache_key in frame_cache:
                 row.append(frame_cache[cache_key].to(device=device))
+                if frame_stats is not None:
+                    frame_stats["hits"] += 1
                 continue
             if image is None:
                 row.append(torch.zeros(adapter.hidden_size, device=device, dtype=next(adapter.parameters()).dtype))
             else:
                 feature = adapter.encode_frame(image, cache)
-                if frame_cache is not None:
+                if path is not None:
+                    batch_frame_cache[cache_key] = feature
+                if path is not None and frame_cache is not None:
                     frame_cache[cache_key] = feature.detach().cpu()
+                if frame_stats is not None:
+                    frame_stats["encoded"] += 1
                 row.append(feature)
         features.append(torch.stack(row))
     return torch.stack(features).to(device)
@@ -251,9 +309,20 @@ def _scheduled_condition(core, slow, model_batch, *, teacher_forcing_ratio: floa
 
 
 def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weights=None,
-                 teacher_forcing_ratio: float = 0.0):
+                 teacher_forcing_ratio: float = 0.0,
+                 frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None):
+    """Forward + loss for one batch.
+
+    ``frame_cache``/``frame_stats`` are passed through to ``encode_batch``.
+    The gradient training loop must leave them ``None``: cache entries are
+    detached CPU snapshots, and reusing them across steps would silently
+    disconnect ``visual_projection``/``condition_projection`` from the loss.
+    Only ``eval()``+``torch.no_grad()`` evaluation paths (``_evaluate``,
+    ``_slow_accuracy``) may pass a cache.
+    """
     model_batch = _model_inputs(batch, device)
-    frame_features = encode_batch(adapter, batch, device=device)
+    frame_features = encode_batch(adapter, batch, device=device,
+                                  frame_cache=frame_cache, frame_stats=frame_stats)
     condition = core.initial_condition(frame_features.shape[0], device=device,
                                        mode_id=0)
     # Keep the per-record mode conditioning from v4 (normally all rows in the
@@ -322,7 +391,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     val_dataset = VLASequenceDataset(val_paths, verify_images=True) if val_paths else None
     max_val_samples = int(getattr(args, "max_val_samples", 64) or 0)
     if val_dataset is not None and max_val_samples > 0:
-        val_dataset = _bounded_subset(val_dataset, max_val_samples)
+        val_dataset = _contiguous_subset(val_dataset, max_val_samples)
     val_loader = (DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                              collate_fn=VLASequenceCollator(max_frames=8))
                   if val_dataset is not None else None)
@@ -345,14 +414,22 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim).to(device=device, dtype=torch.float32)
     from idv_agent.training.vla_loss import VLALossWeights
     global_counts = None
+    button_global_counts = None
     if args.move_direction_balance:
         global_counts = torch.zeros(9, dtype=torch.float32)
         for index in range(len(dataset)):
             global_counts += torch.bincount(dataset[index]["move_target"], minlength=9).to(torch.float32)
+    if getattr(args, "button_global_balance", False):
+        button_global_counts = torch.zeros((6, 2), dtype=torch.float32)
+        for index in range(len(dataset)):
+            target = dataset[index]["button_target"]
+            button_global_counts[:, 1] += target.sum(dim=0)
+            button_global_counts[:, 0] += (target.shape[0] - target.sum(dim=0))
     loss_weights = VLALossWeights(move_stop_weight=args.move_stop_weight,
                                    button_positive_weight=args.button_positive_weight,
                                    move_direction_balance=args.move_direction_balance,
-                                   move_global_counts=global_counts)
+                                   move_global_counts=global_counts,
+                                   button_global_counts=button_global_counts)
 
     # Materialize LazyLinear before constructing the optimizer/checkpoint.
     first_batch = next(iter(loader))
@@ -438,6 +515,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "button_positive_weight": args.button_positive_weight,
                   "move_direction_balance": args.move_direction_balance,
                   "global_move_counts": global_counts.tolist() if global_counts is not None else None,
+                  "global_button_counts": button_global_counts.tolist() if button_global_counts is not None else None,
                   "teacher_forcing_start": args.teacher_forcing_start,
                   "teacher_forcing_end": args.teacher_forcing_end,
                   "teacher_forcing_decay_steps": args.teacher_forcing_decay_steps},
@@ -468,17 +546,24 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def _slow_accuracy(adapter, core, loader, device, amp_enabled, *, max_samples: int | None = None):
-    """Compute slow intent accuracy over every sample in the training subset."""
+def _slow_accuracy(adapter, core, loader, device, amp_enabled, *, max_samples: int | None = None,
+                   frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None):
+    """Compute slow intent accuracy over every sample in the training subset.
+
+    Runs under ``eval()`` + ``torch.no_grad()``, so a frame cache is safe;
+    pass one in to share hits across multiple passes over the same loader.
+    """
     correct = 0
     total = 0
     core.eval()
     adapter.eval()
+    cache = {} if frame_cache is None else frame_cache
     with torch.no_grad():
         for batch in loader:
             if max_samples is not None and total >= max_samples:
                 break
-            _, out = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled)
+            _, out = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
+                                  frame_cache=cache, frame_stats=frame_stats)
             target = batch["intent_target"]
             valid = target != -100
             if bool(valid.any()):
@@ -503,9 +588,15 @@ def _evaluate(adapter, core, loader, device, amp_enabled):
     button_target = [0] * 6
     non_stop_pred = 0
     non_stop_total = 0
+    # Eval runs adapter.eval() + torch.no_grad(): safe to deduplicate vision
+    # forwards.  The cache is shared with the slow-accuracy pass below so the
+    # second traversal hits whatever the first one already encoded.
+    frame_cache: dict = {}
+    frame_stats = {"hits": 0, "encoded": 0}
     with torch.no_grad():
         for batch in loader:
-            values, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled)
+            values, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
+                                          frame_cache=frame_cache, frame_stats=frame_stats)
             losses.append(float(values["total"].detach().cpu()))
             mask = batch["fast_loss_mask"].to(output.fast.move_logits.device).bool()
             for value in output.fast.move_logits.argmax(-1)[mask].detach().cpu().reshape(-1).tolist():
@@ -530,8 +621,24 @@ def _evaluate(adapter, core, loader, device, amp_enabled):
                     intent_pred[int(value)] += 1
                 for value in batch["intent_target"][valid].detach().cpu().tolist():
                     intent_target[int(value)] += 1
+    # Slow-accuracy pass reuses the same cache (and stats) so its forward
+    # re-encodes nothing the loss pass above already encoded; the reported
+    # hits therefore cover BOTH traversals of this bounded loader (loss pass +
+    # slow-accuracy pass).  Without the cache those two passes would encode
+    # roughly twice the unique frames, so hit_rate near 0.5 or higher means
+    # the second traversal was almost fully served from cache.
+    slow_acc = _slow_accuracy(adapter, core, loader, device, amp_enabled,
+                              frame_cache=frame_cache, frame_stats=frame_stats)
+    hits = frame_stats["hits"]
+    total = frame_stats["encoded"] + hits
     return {"loss": (sum(losses) / len(losses) if losses else None),
-            "slow_accuracy": _slow_accuracy(adapter, core, loader, device, amp_enabled),
+            "slow_accuracy": slow_acc,
+            "frame_cache": {
+                "hits": hits, "misses": frame_stats["encoded"],
+                "encoded": frame_stats["encoded"],
+                "unique_frames_encoded": len(frame_cache),
+                "hit_rate": (hits / total if total else None),
+            },
             "move_pred_counts": move_pred, "move_target_counts": move_target,
             "intent_pred_counts": intent_pred, "intent_target_counts": intent_target,
             "button_pred_positive_counts": button_pred, "button_target_positive_counts": button_target,
@@ -569,6 +676,8 @@ def main(argv=None) -> int:
     parser.add_argument("--move-direction-balance", action="store_true",
                         help="batch>=4 时按 batch 频率；batch<4 时按采样训练集全局频率做 inverse-sqrt balance")
     parser.add_argument("--button-positive-weight", type=float, default=4.0)
+    parser.add_argument("--button-global-balance", action="store_true",
+                        help="按训练子集每个 button 的全局正/负计数计算 BCE 权重")
     parser.add_argument("--teacher-forcing-start", type=float, default=1.0,
                         help="训练开始时使用真实 intent/subgoal 的比例")
     parser.add_argument("--teacher-forcing-end", type=float, default=0.0,

@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
-from idv_agent.scripts.train_vla import (_bounded_subset, _dataset_paths, _load_act_backbone,
+from idv_agent.scripts.train_vla import (_contiguous_subset, _dataset_paths, _load_act_backbone,
                                           encode_batch, _model_inputs, _scheduled_condition)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
@@ -28,7 +28,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     amp_enabled = device.type == "cuda"
     dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
     if args.max_samples > 0:
-        dataset = _bounded_subset(dataset, args.max_samples)
+        dataset = _contiguous_subset(dataset, args.max_samples)
     loader = DataLoader(dataset, batch_size=max(1, min(args.batch_size, 2)), shuffle=False,
                         collate_fn=VLASequenceCollator(max_frames=8))
 
@@ -55,7 +55,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     core.load_state_dict(checkpoint["core"])
     adapter.eval()
     core.eval()
-    frame_cache: dict[str, torch.Tensor] = {}
+    frame_cache: dict[tuple[str, int, str], torch.Tensor] = {}
+    frame_stats = {"hits": 0, "encoded": 0}
 
     sums = {"loss": 0.0, "loss_count": 0, "move_correct": 0, "move_total": 0,
             "move_pred_counts": [0] * 9, "move_target_counts": [0] * 9,
@@ -68,7 +69,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     with torch.no_grad():
         for batch in loader:
             model_batch = _model_inputs(batch, device)
-            features = encode_batch(adapter, batch, device=device, frame_cache=frame_cache)
+            features = encode_batch(adapter, batch, device=device, frame_cache=frame_cache,
+                                    frame_stats=frame_stats)
             condition = core.initial_condition(features.shape[0], device=device, mode_id=0)
             condition.mode_id = model_batch["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
@@ -144,6 +146,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "parent_stage": parent_manifest["stage"],
         "unique_frames_encoded": len(frame_cache),
+        "frame_cache": {
+            "hits": frame_stats["hits"], "misses": frame_stats["encoded"],
+            "encoded": frame_stats["encoded"],
+            "hit_rate": (frame_stats["hits"] / (frame_stats["encoded"] + frame_stats["hits"])
+                         if frame_stats["encoded"] + frame_stats["hits"] else None),
+        },
         "loss": (sums["loss"] / sums["loss_count"] if sums["loss_count"] else None),
         "move_accuracy": ratio(sums["move_correct"], sums["move_total"]),
         "move_nonstop_accuracy": ratio(sums["move_nonstop_correct"], sums["move_nonstop_total"]),
@@ -173,7 +181,8 @@ def main(argv=None) -> int:
     parser.add_argument("--checkpoint", required=True, help="M3_ACT act_*.pt")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--max-samples", type=int, default=16)
+    parser.add_argument("--max-samples", type=int, default=256,
+                        help="评估连续样本数；连续抽样可复用相邻帧缓存")
     parser.add_argument("--temporal-dim", type=int, default=256)
     parser.add_argument("--output", default="reports/vla_eval.json")
     args = parser.parse_args(argv)

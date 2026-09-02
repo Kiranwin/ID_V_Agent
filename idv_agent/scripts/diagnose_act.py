@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
-from idv_agent.scripts.train_vla import (_bounded_subset, _dataset_paths,
+from idv_agent.scripts.train_vla import (_contiguous_subset, _bounded_subset, _stratified_subset, _dataset_paths,
                                           _load_act_backbone, _model_inputs,
                                           encode_batch, _scheduled_condition)
 from idv_agent.training.checkpoint_manifest import load_manifest
@@ -50,22 +50,26 @@ def _load(args):
     return device, amp, adapter, core, parent, manifest
 
 
-def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int, cache: dict[str, torch.Tensor]):
+def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int, cache: dict[tuple[str, int, str], torch.Tensor], sampling: str = "uniform", seed: int = 0, force_slow_mask: bool = False):
     dataset = VLASequenceDataset(_dataset_paths(paths), verify_images=True)
     if max_samples > 0:
-        dataset = _bounded_subset(dataset, max_samples)
+        dataset = _stratified_subset(dataset, max_samples, seed=seed) if sampling == "stratified" else _contiguous_subset(dataset, max_samples)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=VLASequenceCollator(max_frames=8))
+    stats = {"hits": 0, "encoded": 0}
     out: dict[str, Any] = {
         "name": name, "samples": len(dataset), "move_pred_counts": [0] * 9,
         "move_target_counts": [0] * 9, "slow_intent_pred_counts": [0] * len(INTENTS),
         "slow_intent_target_counts": [0] * len(INTENTS), "fast_condition_intent_counts": [0] * len(INTENTS),
         "slow_intent_loss_sum": 0.0, "slow_subgoal_loss_sum": 0.0, "slow_count": 0,
         "move_total": 0, "move_nonstop_pred": 0, "move_nonstop_total": 0,
+        "button_pred_positive_counts": [0] * 6, "button_target_positive_counts": [0] * 6,
     }
     with torch.no_grad():
         for batch in loader:
+            if force_slow_mask:
+                batch["slow_loss_mask"] = torch.ones_like(batch["slow_loss_mask"])
             mb = _model_inputs(batch, device)
-            features = encode_batch(adapter, batch, device=device, frame_cache=cache)
+            features = encode_batch(adapter, batch, device=device, frame_cache=cache, frame_stats=stats)
             condition = core.initial_condition(1, device=device, mode_id=0)
             condition.mode_id = mb["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
@@ -99,11 +103,25 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
                 if t != 0:
                     out["move_nonstop_total"] += 1
                     out["move_nonstop_pred"] += int(p != 0)
+            button_pred = (fast_pass.fast.button_logits[0] > 0).to(torch.int64)
+            button_target = mb["button_target"][0].to(torch.int64)
+            for i in range(button_pred.shape[-1]):
+                out["button_pred_positive_counts"][i] += int(button_pred[:, i].sum())
+                out["button_target_positive_counts"][i] += int(button_target[:, i].sum())
     if out["slow_count"]:
         out["slow_intent_loss_mean"] = out["slow_intent_loss_sum"] / out["slow_count"]
         out["slow_subgoal_loss_mean"] = out["slow_subgoal_loss_sum"] / out["slow_count"]
     out["move_nonstop_prediction_rate_on_nonstop_targets"] = (
         out["move_nonstop_pred"] / out["move_nonstop_total"] if out["move_nonstop_total"] else None)
+    out["interact_pred_positive"] = out["button_pred_positive_counts"][0]
+    out["interact_target_positive"] = out["button_target_positive_counts"][0]
+    total = stats["hits"] + stats["encoded"]
+    out["frame_cache"] = {
+        "hits": stats["hits"], "misses": stats["encoded"],
+        "encoded": stats["encoded"],
+        "hit_rate": (stats["hits"] / total if total else None),
+        "unique_frames_encoded": len(cache),
+    }
     out["slow_intent_pred_names"] = {INTENTS[i]: n for i, n in enumerate(out["slow_intent_pred_counts"]) if n}
     out["fast_condition_intent_names"] = {INTENTS[i]: n for i, n in enumerate(out["fast_condition_intent_counts"]) if n}
     return out
@@ -114,14 +132,19 @@ def main(argv=None):
     p.add_argument("--data", required=True); p.add_argument("--val-data", required=True)
     p.add_argument("--model-path", required=True); p.add_argument("--init-checkpoint", required=True)
     p.add_argument("--checkpoint", required=True); p.add_argument("--device", default="cuda")
-    p.add_argument("--temporal-dim", type=int, default=256); p.add_argument("--max-samples", type=int, default=256)
+    p.add_argument("--temporal-dim", type=int, default=256)
+    p.add_argument("--max-samples", type=int, default=256,
+                    help="每个 split 的连续样本数；连续抽样可复用相邻帧缓存")
     p.add_argument("--output", default="reports/act_diagnostics.json")
+    p.add_argument("--sampling", choices=("uniform", "stratified"), default="uniform")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--force-slow-mask", action="store_true")
     args = p.parse_args(argv)
     device, amp, adapter, core, parent, manifest = _load(args)
-    cache: dict[str, torch.Tensor] = {}
+    cache: dict[tuple[str, int, str], torch.Tensor] = {}
     result = {"checkpoint": str(Path(args.checkpoint).resolve()), "checkpoint_step": int(torch.load(args.checkpoint, map_location="cpu", weights_only=False).get("step", -1)),
-              "manifest": manifest, "train": _run("train", args.data, device=device, amp=amp, adapter=adapter, core=core, max_samples=args.max_samples, cache=cache),
-              "val": _run("val", args.val_data, device=device, amp=amp, adapter=adapter, core=core, max_samples=args.max_samples, cache=cache),
+              "manifest": manifest, "train": _run("train", args.data, device=device, amp=amp, adapter=adapter, core=core, max_samples=args.max_samples, cache=cache, sampling=args.sampling, seed=args.seed, force_slow_mask=args.force_slow_mask),
+              "val": _run("val", args.val_data, device=device, amp=amp, adapter=adapter, core=core, max_samples=args.max_samples, cache=cache, sampling=args.sampling, seed=args.seed, force_slow_mask=args.force_slow_mask),
               "note": "fast_condition_intent uses teacher_forcing_ratio=0, matching deployment; historical step-250 distributions require per-step logging and are not recoverable from a final checkpoint."}
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
