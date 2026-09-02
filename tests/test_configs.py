@@ -35,6 +35,42 @@ def test_subgoal_v1_aligns_all_vla_intents():
                for name in candidates)
 
 
+def test_subgoal_v1_matches_frozen_intent_table():
+    expected = {
+        "decipher": ("approach_cipher", "start_decoding", "handle_qte"),
+        "kite": ("locate_safe_point", "maintain_distance", "vault_window", "drop_pallet", "disengage"),
+        "rescue": ("approach_chair", "search_area", "rescue_teammate", "heal_teammate", "wait_opportunity"),
+        "rotate": ("disengage", "move_to_zone"),
+        "travel": ("find_cipher", "move_to_target", "avoid_obstacle"),
+        "search": ("find_chest", "open_chest", "pickup_item"),
+        "gate": ("move_to_gate", "open_gate", "escape"),
+        "idle": ("observe", "hide"),
+    }
+    assert INTENT_SUBGOALS == expected
+    assert set(name for names in expected.values() for name in names) <= set(SUBGOAL_NAMES)
+
+
+def test_subgoal_derivation_golden_samples():
+    from idv_agent.scripts.build_vla_chunks import _derive_subgoal
+
+    cases = [
+        ("decipher", {"state": "qte"}, {}, "handle_qte"),
+        ("decipher", {"interact_prompt": "yes"}, {}, "start_decoding"),
+        ("decipher", {}, {}, "approach_cipher"),
+        ("kite", {}, {}, "maintain_distance"),
+        ("rescue", {}, {}, "rescue_teammate"),
+        ("rotate", {}, {}, "move_to_zone"),
+        ("travel", {}, {"move_y": 1}, "move_to_target"),
+        ("travel", {}, {"cam_dx": 0.2}, "find_cipher"),
+        ("travel", {}, {}, "move_to_target"),
+        ("search", {}, {}, "find_chest"),
+        ("gate", {}, {}, "open_gate"),
+        ("idle", {}, {}, "observe"),
+    ]
+    for intent, state, action, expected in cases:
+        assert _derive_subgoal(intent, state, action) == expected
+
+
 def test_frame_feature_cache_and_temporal_encoder():
     import torch
     from idv_agent.model.temporal import FrameFeatureCache, SharedTemporalEncoder, TaskConditionCache
@@ -82,7 +118,7 @@ def test_build_vla_v4_adds_slow_labels_and_timestamp_mask(tmp_path):
     assert count > 0
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert records[0]["schema_version"] == VLA_SCHEMA_VERSION_V4
-    assert records[0]["slow_label"]["subgoal"] == "find_cipher"
+    assert records[0]["slow_label"]["subgoal"] == "find_chest"
     assert records[0]["loss_mask"] == {"slow": 1, "fast": 1}
     assert all("slow_label" in frame for frame in records[0]["observations"]["frames"])
 

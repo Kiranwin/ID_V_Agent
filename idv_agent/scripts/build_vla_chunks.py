@@ -165,28 +165,52 @@ def _load_frame_states(session: Path) -> dict[int, dict]:
 def _derive_subgoal(intent: str, state: dict, action: dict) -> str:
     """Derive a v1 subgoal without requiring a second manual label."""
     state_name = str(state.get("state", "")).strip().lower()
-    if state_name in {"qte", "calibration"} or str(state.get("decode_calibration", "")) in {"1", "yes", "true"}:
+    category = str(action.get("category_name", "")).upper()
+    if intent == "decipher" and (
+        state_name in {"qte", "calibration"}
+        or str(state.get("decode_calibration", "")).lower() in {"1", "yes", "true"}
+    ):
         candidate = "handle_qte"
     elif intent == "decipher":
-        if state_name == "decoding":
-            candidate = "maintain_decoding"
-        elif str(state.get("interact_prompt", "")).lower() in {"yes", "1", "true"}:
+        if str(state.get("interact_prompt", "")).lower() in {"yes", "1", "true"}:
             candidate = "start_decoding"
-        elif str(action.get("category_name", "")).upper().startswith("INTERACT_"):
+        elif category.startswith("INTERACT_"):
             candidate = "start_decoding"
         else:
-            candidate = "find_cipher"
-    elif intent == "search":
-        candidate = "find_cipher"
-    elif intent in {"travel", "rotate", "rescue", "gate"}:
-        candidate = {"rescue": "rescue_teammate", "gate": "open_gate"}.get(intent, "move_to_target")
+            candidate = "approach_cipher"
     elif intent == "kite":
-        candidate = "maintain_distance"
+        if category == "VAULT":
+            candidate = "vault_window"
+        elif category == "DROP_BOARD":
+            candidate = "drop_pallet"
+        else:
+            candidate = "maintain_distance"
+    elif intent == "rescue":
+        candidate = "rescue_teammate"
+    elif intent == "rotate":
+        candidate = "move_to_zone"
+    elif intent == "travel":
+        # Movement takes precedence when both signals are present.  A
+        # camera-only frame represents sweeping the scene to find the cipher.
+        moving = abs(_num(action.get("move_x"))) > 1e-6 or abs(_num(action.get("move_y"))) > 1e-6
+        looking = abs(_num(action.get("cam_dx"))) > 1e-6 or abs(_num(action.get("cam_dy"))) > 1e-6
+        candidate = "move_to_target" if moving else ("find_cipher" if looking else "move_to_target")
+    elif intent == "search":
+        if category == "OPEN_CHEST":
+            candidate = "open_chest"
+        elif category.startswith("ITEM_"):
+            candidate = "pickup_item"
+        else:
+            candidate = "find_chest"
+    elif intent == "gate":
+        candidate = "open_gate"
+    elif intent == "idle":
+        candidate = "hide" if state_name in {"hidden", "hiding"} else "observe"
     else:
         candidate = "observe"
     if candidate not in subgoals_for_intent(intent):
-        # State-derived QTE is only valid for decipher; fall back safely when
-        # a manually supplied segment has another top-level intent.
+        # Fall back safely when a state/action signal is not legal for the
+        # manually supplied top-level intent.
         candidate = subgoals_for_intent(intent)[0]
     return candidate
 
