@@ -23,6 +23,7 @@ class VLALossWeights:
     # Recorded trajectories contain many more stop than moving steps.  Keep
     # stop supervised, but prevent it from dominating the categorical head.
     move_stop_weight: float = 0.25
+    move_direction_balance: bool = False
     button_positive_weight: float = 4.0
 
 
@@ -39,6 +40,13 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
     move_class_weight = torch.ones(fast.move_logits.shape[-1], device=fast.move_logits.device,
                                    dtype=fast.move_logits.dtype)
     move_class_weight[0] = weights.move_stop_weight
+    if weights.move_direction_balance:
+        # Inverse-square-root frequency weighting is less unstable than pure
+        # inverse frequency while still preventing the dominant north class.
+        counts = torch.bincount(batch["move_target"].reshape(-1), minlength=fast.move_logits.shape[-1]).to(move_class_weight.dtype)
+        counts = counts.clamp_min(1.0)
+        move_class_weight = counts.rsqrt()
+        move_class_weight = move_class_weight / move_class_weight.mean()
     move = F.cross_entropy(fast.move_logits.transpose(1, 2), batch["move_target"],
                            weight=move_class_weight, reduction="none")
     cam_dx = F.cross_entropy(fast.camera_dx_logits.transpose(1, 2), batch["camera_dx_target"], reduction="none")

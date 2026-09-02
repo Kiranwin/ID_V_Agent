@@ -75,11 +75,17 @@ def _buttons(rows):
 
 
 def _action(rows, frame_indices):
-    n = max(len(rows), 1)
+    # Camera deltas are frame-wise increments.  Averaging them over a macro
+    # window makes normal left/right turns cancel out (and turns a real turn
+    # into the ``0`` bucket).  Aggregate the net angular displacement instead;
+    # the bucket is applied after accumulation.  This keeps the action-chunk
+    # label aligned with the movement keys that are active in the same window.
+    camera_dx = sum(_num(r.get("cam_dx")) for r in rows)
+    camera_dy = sum(_num(r.get("cam_dy")) for r in rows)
     return {
         "move_dir": _move_dir(rows),
-        "camera_dx": _camera_bucket(sum(_num(r.get("cam_dx")) for r in rows) / n),
-        "camera_dy": _camera_bucket(sum(_num(r.get("cam_dy")) for r in rows) / n),
+        "camera_dx": _camera_bucket(camera_dx),
+        "camera_dy": _camera_bucket(camera_dy),
         "buttons": _buttons(rows),
         "duration_frames": len(frame_indices),
     }

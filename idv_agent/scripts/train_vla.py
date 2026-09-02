@@ -294,7 +294,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim).to(device=device, dtype=torch.float32)
     from idv_agent.training.vla_loss import VLALossWeights
     loss_weights = VLALossWeights(move_stop_weight=args.move_stop_weight,
-                                   button_positive_weight=args.button_positive_weight)
+                                   button_positive_weight=args.button_positive_weight,
+                                   move_direction_balance=args.move_direction_balance)
 
     # Materialize LazyLinear before constructing the optimizer/checkpoint.
     first_batch = next(iter(loader))
@@ -366,7 +367,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "batch_size": args.batch_size, "temporal_dim": args.temporal_dim,
                   "max_samples": args.max_samples, "sampling": sampling,
                   "seed": int(getattr(args, "seed", 0)), "move_stop_weight": args.move_stop_weight,
-                  "button_positive_weight": args.button_positive_weight},
+                  "button_positive_weight": args.button_positive_weight,
+                  "move_direction_balance": args.move_direction_balance},
         schema_versions=["vla.action_chunk.v4"],
         artifacts={"act_checkpoint": str(checkpoint.name)},
         extra={"parent_stage": parent_manifest["stage"] if parent_manifest else None,
@@ -440,6 +442,8 @@ def main(argv=None) -> int:
     parser.add_argument("--temporal-dim", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--move-stop-weight", type=float, default=0.25)
+    parser.add_argument("--move-direction-balance", action="store_true",
+                        help="按当前 batch 的九方向频率做 inverse-sqrt class balance")
     parser.add_argument("--button-positive-weight", type=float, default=4.0)
     parser.add_argument("--sampling", choices=("uniform", "stratified"), default="uniform",
                         help="训练 chunk 采样策略；stratified 按交互/移动/按键/停止分层")

@@ -66,14 +66,16 @@ def test_build_vla_chunks(tmp_path: Path):
     with (session / "per_frame_actions.csv").open("w", encoding="utf-8", newline="") as f:
         f.write("frame_id,timestamp_ns,category_name,move_x,move_y,cam_dx,cam_dy\n")
         for i in range(60):
-            f.write(f"{i},{i * 1000},MOVE,0,1,0.1,0\n")
+            f.write(f"{i},{i * 1000},MOVE,0,1,0.09,0\n")
     output = tmp_path / "vla.jsonl"
     count = build(session, output, stride=3, macro_frames=6, outcome="success")
     assert count == 10
     rec = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
     validate_record(rec)
     assert rec["action_chunk"][0]["move_dir"] == 1
-    assert rec["action_chunk"][0]["camera_dx"] == 0
+    # Six frame-wise 0.09 increments represent a net turn and must not be
+    # averaged back into the neutral camera bucket.
+    assert rec["action_chunk"][0]["camera_dx"] == 1
     assert rec["alignment"]["action_start_frame"] == 8
 
 

@@ -58,6 +58,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     frame_cache: dict[str, torch.Tensor] = {}
 
     sums = {"loss": 0.0, "loss_count": 0, "move_correct": 0, "move_total": 0,
+            "move_pred_counts": [0] * 9, "move_target_counts": [0] * 9,
             "move_nonstop_correct": 0, "move_nonstop_total": 0,
             "camera_dx_correct": 0, "camera_dy_correct": 0, "camera_total": 0,
             "button_correct": 0, "button_total": 0, "button_exact": 0,
@@ -85,6 +86,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             dy_target = model_batch["camera_dy_target"]
             button_target = model_batch["button_target"]
             mask = sample_mask.unsqueeze(1).expand_as(move_target)
+            for index in range(9):
+                sums["move_pred_counts"][index] += int(((move_pred == index) & mask).sum())
+                sums["move_target_counts"][index] += int(((move_target == index) & mask).sum())
             sums["loss"] += float(losses["total"].detach().cpu()) * int(sample_mask.sum())
             sums["loss_count"] += int(sample_mask.sum())
             sums["move_correct"] += int(((move_pred == move_target) & mask).sum())
@@ -129,6 +133,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "loss": (sums["loss"] / sums["loss_count"] if sums["loss_count"] else None),
         "move_accuracy": ratio(sums["move_correct"], sums["move_total"]),
         "move_nonstop_accuracy": ratio(sums["move_nonstop_correct"], sums["move_nonstop_total"]),
+        "move_pred_counts": sums["move_pred_counts"],
+        "move_target_counts": sums["move_target_counts"],
         "camera_dx_accuracy": ratio(sums["camera_dx_correct"], sums["camera_total"]),
         "camera_dy_accuracy": ratio(sums["camera_dy_correct"], sums["camera_total"]),
         "button_element_accuracy": ratio(sums["button_correct"], sums["button_total"]),
