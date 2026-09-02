@@ -51,6 +51,30 @@ def test_direction_balance_loss_is_finite():
                                            VLALossWeights(move_direction_balance=True))["total"])
 
 
+def test_teacher_forcing_ratio_schedule_and_prediction_fallback():
+    from argparse import Namespace
+    import torch
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+    from idv_agent.scripts.train_vla import _scheduled_condition, _teacher_forcing_ratio
+
+    args = Namespace(steps=100, teacher_forcing_start=1.0,
+                     teacher_forcing_end=0.0, teacher_forcing_decay_steps=100)
+    assert _teacher_forcing_ratio(args, 0) == 1.0
+    assert _teacher_forcing_ratio(args, 50) == 0.5
+    assert _teacher_forcing_ratio(args, 100) == 0.0
+
+    model = SharedFastSlowVLA(frame_feature_dim=8, temporal_dim=12)
+    slow = model.slow_head(torch.randn(2, 12))
+    batch = {"mode_id": torch.zeros(2, dtype=torch.long),
+             "intent_target": torch.tensor([2, -100]),
+             "subgoal_target": torch.tensor([3, -100])}
+    forced = _scheduled_condition(model, slow, batch, teacher_forcing_ratio=1.0)
+    predicted = _scheduled_condition(model, slow, batch, teacher_forcing_ratio=0.0)
+    assert forced.intent_id[0].item() == 2 and forced.subgoal_id[0].item() == 3
+    assert forced.intent_id[1].item() == slow.intent_id[1].item()
+    assert torch.equal(predicted.intent_id, slow.intent_id)
+
+
 def test_act_requires_m2_checkpoint(monkeypatch):
     from argparse import Namespace
     from idv_agent.scripts.train_vla import train

@@ -101,6 +101,32 @@ class SharedFastSlowVLA(nn.Module):
         slow = self.slow_head(temporal) if run_slow else None
         return FastSlowVLAOutput(temporal_feature=temporal, fast=fast, slow=slow)
 
+    @staticmethod
+    def condition_from_slow_output(
+        slow: SlowVLAOutput,
+        mode_id: torch.Tensor,
+        *,
+        intent_id: Optional[torch.Tensor] = None,
+        subgoal_id: Optional[torch.Tensor] = None,
+    ) -> SlowCondition:
+        """Build the next fast-loop condition from a slow prediction.
+
+        ``intent_id``/``subgoal_id`` may be supplied for scheduled-sampling
+        teacher forcing.  The continuous context always comes from the slow
+        head, so gradients can flow from the fast loss back into that head
+        when ``detach_slow_condition=False`` is used by the caller.
+        """
+        if not isinstance(slow, SlowVLAOutput):
+            raise TypeError("slow 必须是 SlowVLAOutput")
+        predicted_intent = slow.intent_id
+        predicted_subgoal = slow.subgoal_id
+        return SlowCondition(
+            intent_id=predicted_intent if intent_id is None else intent_id.to(predicted_intent.device),
+            subgoal_id=predicted_subgoal if subgoal_id is None else subgoal_id.to(predicted_subgoal.device),
+            context_embedding=slow.context_embedding,
+            mode_id=mode_id.to(predicted_intent.device),
+        )
+
 
 class FixedRateTrigger:
     """Absolute-deadline trigger independent of producer/capture frequency."""
@@ -118,4 +144,3 @@ class FixedRateTrigger:
         skipped = (timestamp_ns - self.next_deadline_ns) // self.period_ns
         self.next_deadline_ns += (skipped + 1) * self.period_ns
         return True
-

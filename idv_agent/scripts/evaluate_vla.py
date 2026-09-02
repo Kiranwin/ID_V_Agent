@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 from idv_agent.scripts.train_vla import (_bounded_subset, _dataset_paths, _load_act_backbone,
-                                          encode_batch, _model_inputs)
+                                          encode_batch, _model_inputs, _scheduled_condition)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
 from idv_agent.training.vla_loss import compute_vla_loss
@@ -72,9 +72,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             condition = core.initial_condition(features.shape[0], device=device, mode_id=0)
             condition.mode_id = model_batch["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                output = core(features, condition,
-                              valid_mask=model_batch["frame_valid_mask"],
-                              time_deltas=model_batch["time_deltas"], run_slow=True)
+                # Evaluation must mirror deployment: the fast head consumes
+                # the slow head's own discrete predictions and context, never
+                # ground-truth intent/subgoal (teacher forcing ratio=0).
+                slow_pass = core(features, condition,
+                                 valid_mask=model_batch["frame_valid_mask"],
+                                 time_deltas=model_batch["time_deltas"], run_slow=True)
+                if slow_pass.slow is None:
+                    raise RuntimeError("slow pass 未产生 SlowVLAOutput")
+                next_condition = _scheduled_condition(
+                    core, slow_pass.slow, model_batch, teacher_forcing_ratio=0.0,
+                )
+                fast_pass = core(features, next_condition,
+                                 valid_mask=model_batch["frame_valid_mask"],
+                                 time_deltas=model_batch["time_deltas"], run_slow=False,
+                                 detach_slow_condition=False)
+                output = type(slow_pass)(temporal_feature=fast_pass.temporal_feature,
+                                         fast=fast_pass.fast, slow=slow_pass.slow)
                 losses = compute_vla_loss(output.fast, output.slow, model_batch)
             sample_mask = model_batch["fast_loss_mask"] > 0
             move_pred = output.fast.move_logits.argmax(-1)

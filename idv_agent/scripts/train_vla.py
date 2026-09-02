@@ -21,7 +21,7 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Subset
 
-from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+from idv_agent.model.fast_slow_vla import FastSlowVLAOutput, SharedFastSlowVLA
 from idv_agent.model.qwen_backbone_adapter import Qwen3VLBackboneAdapter, load_qwen3vl_backbone
 from idv_agent.training.checkpoint_manifest import build_manifest, load_manifest, sha256_file, write_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
@@ -221,7 +221,37 @@ def _model_inputs(batch: dict[str, Any], device: torch.device) -> dict[str, torc
     return {key: batch[key].to(device) for key in keys}
 
 
-def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weights=None):
+def _scheduled_condition(core, slow, model_batch, *, teacher_forcing_ratio: float):
+    """Mix ground-truth and predicted slow discrete conditions.
+
+    The target labels are only used when valid and when the per-sample
+    scheduled-sampling coin flip succeeds.  The continuous context is always
+    predicted by the slow head, which keeps the fast loss differentiable with
+    respect to the slow representation.
+    """
+    ratio = float(teacher_forcing_ratio)
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("teacher_forcing_ratio 必须在 [0, 1]")
+    pred_intent = slow.intent_id
+    pred_subgoal = slow.subgoal_id
+    intent_target = model_batch["intent_target"].to(pred_intent.device)
+    subgoal_target = model_batch["subgoal_target"].to(pred_subgoal.device)
+    valid = (intent_target >= 0) & (subgoal_target >= 0)
+    if ratio <= 0.0:
+        use_teacher = torch.zeros_like(valid)
+    elif ratio >= 1.0:
+        use_teacher = valid
+    else:
+        use_teacher = valid & (torch.rand(valid.shape, device=valid.device) < ratio)
+    intent_id = torch.where(use_teacher, intent_target, pred_intent)
+    subgoal_id = torch.where(use_teacher, subgoal_target, pred_subgoal)
+    return core.condition_from_slow_output(
+        slow, model_batch["mode_id"], intent_id=intent_id, subgoal_id=subgoal_id,
+    )
+
+
+def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weights=None,
+                 teacher_forcing_ratio: float = 0.0):
     model_batch = _model_inputs(batch, device)
     frame_features = encode_batch(adapter, batch, device=device)
     condition = core.initial_condition(frame_features.shape[0], device=device,
@@ -231,9 +261,28 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
     # mode for convenience, so replace it with the batched ids here.
     condition.mode_id = model_batch["mode_id"]
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-        output = core(frame_features, condition,
-                      valid_mask=model_batch["frame_valid_mask"],
-                      time_deltas=model_batch["time_deltas"], run_slow=True)
+        # First pass updates the slow state from the current visual window.
+        slow_pass = core(frame_features, condition,
+                         valid_mask=model_batch["frame_valid_mask"],
+                         time_deltas=model_batch["time_deltas"], run_slow=True)
+        if slow_pass.slow is None:  # defensive; run_slow=True above is required
+            raise RuntimeError("slow pass 未产生 SlowVLAOutput")
+        # Second pass is the actual fast decision.  During training the
+        # discrete condition follows scheduled sampling; validation/inference
+        # uses ratio=0 and therefore consumes the slow prediction.
+        next_condition = _scheduled_condition(
+            core, slow_pass.slow, model_batch,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+        )
+        fast_pass = core(frame_features, next_condition,
+                         valid_mask=model_batch["frame_valid_mask"],
+                         time_deltas=model_batch["time_deltas"], run_slow=False,
+                         detach_slow_condition=False)
+        output = FastSlowVLAOutput(
+            temporal_feature=fast_pass.temporal_feature,
+            fast=fast_pass.fast,
+            slow=slow_pass.slow,
+        )
         losses = compute_vla_loss(output.fast, output.slow, model_batch,
                                   weights=loss_weights) if loss_weights is not None else compute_vla_loss(output.fast, output.slow, model_batch)
     return losses, output
@@ -306,7 +355,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     baseline_losses, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=amp_enabled,
-                                      loss_weights=loss_weights)
+                                      loss_weights=loss_weights,
+                                      teacher_forcing_ratio=_teacher_forcing_ratio(args, 0))
     baseline = float(baseline_losses["total"].detach().cpu())
     history: list[float] = []
     peak_memory = 0
@@ -320,7 +370,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             batch = next(iterator)
         optimizer.zero_grad(set_to_none=True)
         losses, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
-                                      loss_weights=loss_weights)
+                                      loss_weights=loss_weights,
+                                      teacher_forcing_ratio=_teacher_forcing_ratio(args, step - 1))
         total = losses["total"]
         if not torch.isfinite(total):
             raise FloatingPointError(f"step {step}: loss 非有限值")
@@ -368,7 +419,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "max_samples": args.max_samples, "sampling": sampling,
                   "seed": int(getattr(args, "seed", 0)), "move_stop_weight": args.move_stop_weight,
                   "button_positive_weight": args.button_positive_weight,
-                  "move_direction_balance": args.move_direction_balance},
+                  "move_direction_balance": args.move_direction_balance,
+                  "teacher_forcing_start": args.teacher_forcing_start,
+                  "teacher_forcing_end": args.teacher_forcing_end,
+                  "teacher_forcing_decay_steps": args.teacher_forcing_decay_steps},
         schema_versions=["vla.action_chunk.v4"],
         artifacts={"act_checkpoint": str(checkpoint.name)},
         extra={"parent_stage": parent_manifest["stage"] if parent_manifest else None,
@@ -426,6 +480,17 @@ def _evaluate(adapter, core, loader, device, amp_enabled):
             "slow_accuracy": _slow_accuracy(adapter, core, loader, device, amp_enabled)}
 
 
+def _teacher_forcing_ratio(args: argparse.Namespace, step: int) -> float:
+    """Linear scheduled-sampling ratio for one-based training progress."""
+    start = float(getattr(args, "teacher_forcing_start", 1.0))
+    end = float(getattr(args, "teacher_forcing_end", 0.0))
+    decay = int(getattr(args, "teacher_forcing_decay_steps", 0) or args.steps)
+    if not 0.0 <= start <= 1.0 or not 0.0 <= end <= 1.0 or decay < 1:
+        raise ValueError("teacher forcing 参数必须在 [0,1] 且 decay_steps>=1")
+    progress = min(max(int(step), 0), decay) / decay
+    return start + (end - start) * progress
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True, help="vla_chunks_v4.jsonl")
@@ -445,6 +510,12 @@ def main(argv=None) -> int:
     parser.add_argument("--move-direction-balance", action="store_true",
                         help="按当前 batch 的九方向频率做 inverse-sqrt class balance")
     parser.add_argument("--button-positive-weight", type=float, default=4.0)
+    parser.add_argument("--teacher-forcing-start", type=float, default=1.0,
+                        help="训练开始时使用真实 intent/subgoal 的比例")
+    parser.add_argument("--teacher-forcing-end", type=float, default=0.0,
+                        help="scheduled sampling 结束时使用真实标签的比例")
+    parser.add_argument("--teacher-forcing-decay-steps", type=int, default=0,
+                        help="teacher forcing 线性退火步数；0 表示使用总训练步数")
     parser.add_argument("--sampling", choices=("uniform", "stratified"), default="uniform",
                         help="训练 chunk 采样策略；stratified 按交互/移动/按键/停止分层")
     parser.add_argument("--seed", type=int, default=0)

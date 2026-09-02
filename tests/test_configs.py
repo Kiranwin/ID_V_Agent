@@ -170,6 +170,23 @@ def test_vla_joint_loss_is_finite():
     losses["total"].backward()
 
 
+def test_slow_prediction_condition_is_used_by_fast_pass():
+    import torch
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+
+    model = SharedFastSlowVLA(frame_feature_dim=8, temporal_dim=12)
+    slow = model.slow_head(torch.randn(1, 12))
+    condition = model.condition_from_slow_output(slow, torch.tensor([0]))
+    assert torch.equal(condition.intent_id, slow.intent_id)
+    assert torch.equal(condition.subgoal_id, slow.subgoal_id)
+    assert condition.context_embedding is slow.context_embedding
+    forced = model.condition_from_slow_output(
+        slow, torch.tensor([0]), intent_id=torch.tensor([2]), subgoal_id=torch.tensor([3]),
+    )
+    assert forced.intent_id.item() == 2
+    assert forced.subgoal_id.item() == 3
+
+
 def test_xanylabeling_json_to_yolo_handles_missing_negative_sidecars(tmp_path):
     import json
     from PIL import Image

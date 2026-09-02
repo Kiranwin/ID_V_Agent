@@ -231,3 +231,23 @@ anchor/历史帧中的 `slow_label.intent`。现有 v3 记录中的 `intent` 空
 - 推理只有一个 M0 特征流，慢头和快头不各自重复跑视觉 backbone；
 - 如果未来因显存或延迟必须拆成两个推理进程，仍从同一个 M0 checkpoint 导出，并视为
   部署复制，不得进行两套互不约束的独立微调。
+
+### 6.1 慢条件的训练/推理闭环（冻结）
+
+ACT 训练不能把真实 `intent/subgoal` 永久喂给快头，否则会产生 exposure bias：
+训练时快头看到理想慢标签，推理时却只能看到慢头自己的预测。当前实现采用两遍前向
+和 scheduled sampling：第一遍用上一份安全慢条件产生 `SlowVLAOutput`，第二遍把慢头
+输出的 `context_embedding` 与离散条件送入 FiLM，再产生快头 action chunk。
+
+```text
+视觉窗口 + condition(t-1)
+        → Slow Head → (intent_hat, subgoal_hat, context_hat)
+        → 按 teacher_forcing_ratio 在真实标签/预测之间采样离散条件
+        → FiLM + 时序编码 → Fast Head
+```
+
+`teacher_forcing_ratio` 默认从 1.0 线性退火到 0.0（训练步数范围内）；标签无效的样本
+强制使用慢头预测。验证和部署固定为 0.0，只使用慢头预测。`context_embedding` 始终
+来自慢头，并在 `detach_slow_condition=False` 时允许快头损失反向传播到慢头；离散
+`argmax` 本身不传梯度，慢头仍由 `slow_intent/slow_subgoal` 监督。这样既保留了早期
+teacher forcing 的收敛稳定性，也逐步让训练分布接近真实推理分布。
