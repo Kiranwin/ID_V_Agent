@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from threading import Lock
 import time
 from datetime import datetime
 from pathlib import Path
@@ -26,61 +27,73 @@ from idv_agent.vla.action_chunk import (
 )
 
 
-def record(args) -> Path:
-    session_id = f"{datetime.now():%Y%m%d_%H%M%S}"
+class RecordingControls:
+    """Thread-safe F9/F10 state shared by the hotkey listener and loop."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._toggle_pending = False
+        self.exit_requested = False
+
+    def on_key(self, key_name: str) -> None:
+        key_name = str(key_name).lower()
+        with self._lock:
+            if key_name == "f9":
+                self._toggle_pending = True
+            elif key_name == "f10":
+                self.exit_requested = True
+                # F10 while recording also acts as an implicit stop.
+                self._toggle_pending = True
+
+    def consume_toggle(self) -> bool:
+        with self._lock:
+            pending = self._toggle_pending
+            self._toggle_pending = False
+            return pending
+
+
+def _start_control_listener(controls: RecordingControls):
+    """Start a small global listener for F9/F10 and return it for cleanup."""
+    try:
+        from pynput import keyboard
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("pynput 未安装，无法监听 F9/F10") from exc
+
+    pressed: set[str] = set()
+
+    def on_press(key):
+        try:
+            name = key.name if isinstance(key, keyboard.Key) else None
+        except Exception:
+            name = None
+        if name in {"f9", "f10"} and name not in pressed:
+            pressed.add(name)
+            controls.on_key(name)
+
+    def on_release(key):
+        try:
+            name = key.name if isinstance(key, keyboard.Key) else None
+        except Exception:
+            name = None
+        if name in pressed:
+            pressed.remove(name)
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+    return listener
+
+
+def _new_session(args):
+    session_id = f"{datetime.now():%Y%m%d_%H%M%S_%f}"
     session_dir = args.output / session_id
     frames_dir = session_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
-    events_csv = session_dir / "events.csv"
-    positions_csv = session_dir / "mouse_positions.csv"
+    return session_id, session_dir, frames_dir
+
+
+def _finalize_session(*, args, session_id, session_dir, frame_timestamps,
+                      n_frames, start_ts, end_ts) -> Path:
     frame_ts_csv = session_dir / "frame_timestamps.csv"
-
-    import cv2
-
-    recorder = InputRecorder(events_csv=events_csv, positions_csv=positions_csv)
-    frame_timestamps: list[tuple[int, int]] = []
-    start_ts = time.perf_counter_ns()
-    start_wall = time.perf_counter()
-    frame_interval = 1.0 / max(args.fps, 1)
-    next_deadline = time.perf_counter()
-    n_frames = 0
-    print(f"[record-vla] raw session={session_dir}")
-    print("[record-vla] 仅限官方自定义剧本/训练营；本命令不注入输入")
-    recorder.start()
-    try:
-        with ScreenCapture(CaptureConfig(fps=args.fps, window_title=args.window_title)) as cap:
-            print("[record-vla] 录制开始；Ctrl+C 结束")
-            while True:
-                now = time.perf_counter()
-                if now < next_deadline:
-                    time.sleep(next_deadline - now)
-                elif now - next_deadline > frame_interval:
-                    next_deadline = now
-                if args.max_seconds > 0 and time.perf_counter() - start_wall >= args.max_seconds:
-                    break
-                if args.max_frames > 0 and n_frames >= args.max_frames:
-                    break
-                frame = cap.grab()
-                if frame is None:
-                    continue
-                capture_ts = time.perf_counter_ns()
-                h, w = frame.shape[:2]
-                if w > args.max_width:
-                    scale = args.max_width / w
-                    frame = cv2.resize(frame, (int(w * scale), int(h * scale)),
-                                       interpolation=cv2.INTER_AREA)
-                path = frames_dir / f"{n_frames:08d}.jpg"
-                cv2.imwrite(str(path), frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
-                frame_timestamps.append((n_frames, capture_ts))
-                n_frames += 1
-                next_deadline += frame_interval
-    except KeyboardInterrupt:
-        print("\n[record-vla] 中断")
-    finally:
-        recorder.stop()
-
-    end_ts = time.perf_counter_ns()
     frame_ts_csv.write_text(
         "frame_id,timestamp_ns\n" + "".join(f"{i},{ts}\n" for i, ts in frame_timestamps),
         encoding="utf-8",
@@ -112,6 +125,86 @@ def record(args) -> Path:
     )
     print(f"[record-vla] 完成：{n_frames} 帧 -> {session_dir}")
     return session_dir
+
+
+def record(args) -> Path | None:
+    import cv2
+
+    print("[record-vla] 仅限官方自定义剧本/训练营；本命令不注入输入")
+    print("[record-vla] F9 开始/结束当前录制段，F10 退出 CLI")
+    controls = RecordingControls()
+    hotkey_listener = _start_control_listener(controls)
+    last_session = None
+    try:
+        with ScreenCapture(CaptureConfig(fps=args.fps, window_title=args.window_title)) as cap:
+            while not controls.exit_requested:
+                if not controls.consume_toggle():
+                    time.sleep(0.05)
+                    continue
+                if controls.exit_requested:
+                    break
+
+                session_id, session_dir, frames_dir = _new_session(args)
+                last_session = session_dir
+                events_csv = session_dir / "events.csv"
+                positions_csv = session_dir / "mouse_positions.csv"
+                recorder = InputRecorder(
+                    events_csv=events_csv,
+                    positions_csv=positions_csv,
+                    ignored_codes={"key:f9", "key:f10"},
+                )
+                frame_timestamps: list[tuple[int, int]] = []
+                start_ts = time.perf_counter_ns()
+                start_wall = time.perf_counter()
+                frame_interval = 1.0 / max(args.fps, 1)
+                next_deadline = time.perf_counter()
+                n_frames = 0
+                print(f"[record-vla] 录制开始：{session_dir}")
+                recorder.start()
+                try:
+                    while not controls.exit_requested:
+                        now = time.perf_counter()
+                        if now < next_deadline:
+                            time.sleep(next_deadline - now)
+                        elif now - next_deadline > frame_interval:
+                            next_deadline = now
+                        if controls.consume_toggle():
+                            break
+                        if args.max_seconds > 0 and time.perf_counter() - start_wall >= args.max_seconds:
+                            break
+                        if args.max_frames > 0 and n_frames >= args.max_frames:
+                            break
+                        frame = cap.grab()
+                        if frame is None:
+                            continue
+                        capture_ts = time.perf_counter_ns()
+                        h, w = frame.shape[:2]
+                        if w > args.max_width:
+                            scale = args.max_width / w
+                            frame = cv2.resize(frame, (int(w * scale), int(h * scale)),
+                                               interpolation=cv2.INTER_AREA)
+                        path = frames_dir / f"{n_frames:08d}.jpg"
+                        cv2.imwrite(str(path), frame,
+                                    [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
+                        frame_timestamps.append((n_frames, capture_ts))
+                        n_frames += 1
+                        next_deadline += frame_interval
+                finally:
+                    recorder.stop()
+                    _finalize_session(args=args, session_id=session_id, session_dir=session_dir,
+                                      frame_timestamps=frame_timestamps, n_frames=n_frames,
+                                      start_ts=start_ts, end_ts=time.perf_counter_ns())
+                if controls.exit_requested:
+                    break
+                print("[record-vla] 已停止；F9 开始下一段，F10 退出")
+    except KeyboardInterrupt:
+        print("\n[record-vla] 中断，退出")
+    finally:
+        try:
+            hotkey_listener.stop()
+        except Exception:
+            pass
+    return last_session
 
 
 def main(argv=None) -> int:

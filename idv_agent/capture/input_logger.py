@@ -84,9 +84,11 @@ class EventLogger:
 class InputRecorder:
     """pynput 后台监听，事件转发到 EventLogger。`start()` / `stop()` 生命周期。"""
 
-    def __init__(self, events_csv: Path, positions_csv: Path, poll_position_hz: float = 100.0):
+    def __init__(self, events_csv: Path, positions_csv: Path, poll_position_hz: float = 100.0,
+                 ignored_codes: set[str] | None = None):
         self.logger = EventLogger(events_csv=events_csv, positions_csv=positions_csv)
         self._poll_position_hz = poll_position_hz
+        self._ignored_codes = set(ignored_codes or ())
         self._stop = False
         self._threads: list[Thread] = []
         self._listeners = []
@@ -99,7 +101,9 @@ class InputRecorder:
 
         def on_key(kind: str):
             def _cb(key):
-                self.logger.log_event(kind, _key_to_str(key))
+                code = _key_to_str(key)
+                if code not in self._ignored_codes:
+                    self.logger.log_event(kind, code)
             return _cb
 
         kb_listener = keyboard.Listener(

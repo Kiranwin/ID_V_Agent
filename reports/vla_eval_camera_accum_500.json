@@ -1,0 +1,69 @@
+{
+  "data": [
+    "data/vla_raw_sessions/20260901_151543/vla_chunks_v4.jsonl,data/vla_raw_sessions/20260901_152105/vla_chunks_v4.jsonl"
+  ],
+  "samples": 256,
+  "checkpoint": "C:\\Codespace\\ID_V_Agent\\checkpoints\\M3_ACT\\act_camera_accum_500.pt",
+  "parent_stage": "M2_VG",
+  "unique_frames_encoded": 2048,
+  "loss": 1.3171285011339933,
+  "move_accuracy": 0.712890625,
+  "move_nonstop_accuracy": 0.0,
+  "move_pred_counts": [
+    1024,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "move_target_counts": [
+    730,
+    187,
+    53,
+    26,
+    2,
+    4,
+    2,
+    12,
+    8
+  ],
+  "camera_dx_accuracy": 0.9951171875,
+  "camera_dy_accuracy": 0.9990234375,
+  "button_element_accuracy": 0.9300130208333334,
+  "button_exact_accuracy": 0.5859375,
+  "button_pressed_precision": 0.6015625,
+  "button_pressed_recall": 0.9655172413793104,
+  "duration_mae_frames": 0.032203673828125,
+  "intent_accuracy": 0.2265625,
+  "intent_buckets": {
+    "decipher": {
+      "correct": 0,
+      "total": 155,
+      "accuracy": 0.0
+    },
+    "kite": {
+      "correct": 0,
+      "total": 39,
+      "accuracy": 0.0
+    },
+    "rescue": {
+      "correct": 0,
+      "total": 1,
+      "accuracy": 0.0
+    },
+    "travel": {
+      "correct": 58,
+      "total": 58,
+      "accuracy": 1.0
+    },
+    "idle": {
+      "correct": 0,
+      "total": 3,
+      "accuracy": 0.0
+    }
+  }
+}
