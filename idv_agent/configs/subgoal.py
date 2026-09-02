@@ -41,12 +41,9 @@ SUBGOAL_NAMES = tuple(item.name.lower() for item in SubgoalCategory)
 # mapping is intentionally many-to-one: v1 is meant to be rule-derived, not a
 # second annotation task.
 INTENT_SUBGOALS: dict[str, tuple[str, ...]] = {
-    "decipher": (
-        "find_cipher", "approach_cipher", "face_cipher", "start_decoding",
-        "maintain_decoding", "handle_qte", "recover_target",
-    ),
+    "decipher": ("find_cipher", "approach_cipher", "start_decoding","handle_qte", "recover_target"),
     "kite": ("locate_safe_point", "maintain_distance", "avoid_obstacle", "escape"),
-    "rescue": ("search_area", "move_to_target", "rescue_teammate", "escape"),
+    "rescue": ("search_area", "move_to_target", "rescue_teammate", "heal_teammate", "escape"),
     "rotate": ("choose_destination", "move_to_target", "avoid_obstacle"),
     "travel": ("move_to_target", "avoid_obstacle", "recover_target"),
     "search": ("search_area", "find_cipher", "recover_target"),
