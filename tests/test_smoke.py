@@ -111,3 +111,20 @@ def test_decode_single_q_tap_enters():
     tracker = DecodeStateTracker()
     st = tracker.on_frame(100_000_000, replay.frame_state(100_000_000, 0))
     assert st.active, "一次 Q tap（按下+抬起均发生在帧间）应进入破译态"
+
+
+def test_state_replay_uses_raw_mouse_deltas_when_available():
+    import pandas as pd
+    from idv_agent.labels.state_machine import StateReplay
+
+    events = pd.DataFrame(columns=["timestamp_ns", "kind", "code", "value"])
+    positions = pd.DataFrame(columns=["timestamp_ns", "x", "y"])
+    deltas = pd.DataFrame([
+        {"timestamp_ns": 100, "dx": 4, "dy": -1},
+        {"timestamp_ns": 200, "dx": -2, "dy": 3},
+    ])
+    replay = StateReplay(events, positions, mouse_deltas=deltas)
+
+    state = replay.frame_state(250, 0)
+    assert state.mouse_dx == 2
+    assert state.mouse_dy == 2

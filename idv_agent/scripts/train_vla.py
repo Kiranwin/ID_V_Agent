@@ -479,6 +479,25 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             optimizer.step()
         history.append(float(total.detach().cpu()))
         component_history.append({key: float(value.detach().cpu()) for key, value in losses.items()})
+        log_interval = max(1, int(getattr(args, "log_interval", 25)))
+        if step == 1 or step % log_interval == 0 or step == args.steps:
+            with torch.no_grad():
+                move_pred = output.fast.move_logits.argmax(-1)
+                move_target = batch["move_target"].to(output.fast.move_logits.device)
+                nonstop = move_target != 0
+                move_hit = ((move_pred != 0) & nonstop).sum().item() / max(1, nonstop.sum().item())
+                intent_pred = int(output.slow.intent_logits.argmax(-1)[0].item()) if output.slow is not None else -1
+                interact_pred = int((output.fast.button_logits[..., 0] > 0).sum().item())
+                interact_target = int((batch["button_target"][..., 0].to(output.fast.button_logits.device) > 0).sum().item())
+            print(
+                f"[step {step}/{args.steps}] total={float(total.detach().cpu()):.4f} "
+                f"move={float(losses['fast_move'].detach().cpu()):.4f} "
+                f"slow_intent={float(losses['slow_intent'].detach().cpu()):.4f} "
+                f"slow_subgoal={float(losses['slow_subgoal'].detach().cpu()):.4f} "
+                f"interact={interact_pred}/{interact_target} "
+                f"move_nonstop_hit={move_hit:.3f} intent_pred={intent_pred} "
+                f"tf={_teacher_forcing_ratio(args, step - 1):.3f}", flush=True,
+            )
         if device.type == "cuda":
             peak_memory = max(peak_memory, torch.cuda.max_memory_allocated(device))
 
@@ -689,6 +708,8 @@ def main(argv=None) -> int:
     parser.add_argument("--overfit-slow-mask", action="store_true",
                         help="小数据过拟合验证时将每条样本 slow_loss_mask 置 1")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--log-interval", type=int, default=25,
+                        help="训练过程分量日志间隔（步）")
     parser.add_argument("--checkpoint", default="checkpoints/vla_minimal.pt")
     args = parser.parse_args(argv)
     result = train(args)

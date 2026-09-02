@@ -106,7 +106,7 @@ def _prompt_present(label_path: Path) -> bool:
 
 
 def _mouse_motion(session: Path) -> tuple[list[int], list[int], list[int]]:
-    path = session / "mouse_positions.csv"
+    path = session / "mouse_deltas.csv"
     if not path.is_file():
         return [], [], []
     with path.open(encoding="utf-8-sig", newline="") as handle:
@@ -115,10 +115,10 @@ def _mouse_motion(session: Path) -> tuple[list[int], list[int], list[int]]:
     for index, row in enumerate(rows):
         try:
             timestamps.append(int(float(row["timestamp_ns"])))
-            xs.append(int(float(row["x"])))
-            ys.append(int(float(row["y"])))
+            xs.append(int(float(row["dx"])))
+            ys.append(int(float(row["dy"])))
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{path}:{index + 2} 鼠标坐标无效") from exc
+            raise ValueError(f"{path}:{index + 2} 鼠标位移无效") from exc
     return timestamps, xs, ys
 
 
@@ -130,7 +130,7 @@ def _mouse_changed_between(timestamp_ns: int, previous_ns: int | None,
     end = bisect_right(timestamps, timestamp_ns)
     if end - start < 2:
         return False
-    return xs[end - 1] != xs[start] or ys[end - 1] != ys[start]
+    return any(xs[i] or ys[i] for i in range(start, end))
 
 
 def _load_action_states(session: Path) -> dict[int, dict[str, str]]:

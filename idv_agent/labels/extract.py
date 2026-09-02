@@ -1,4 +1,4 @@
-"""从 session 目录（events.csv / mouse_positions.csv / frame 时间网格）推导每帧动作。
+"""从 session 目录（events.csv / mouse_deltas.csv / frame 时间网格）推导每帧动作。
 
 输出 per_frame_actions.csv：
     frame_id, timestamp_ns, category_id, category_name,
@@ -132,13 +132,14 @@ def infer_category(
 
 def build_frame_grid(
     events: pd.DataFrame,
-    positions: pd.DataFrame,
     frame_ts: list[int],
     keymap: SurvivorKeymap,
     params: ExtractParams,
+    mouse_deltas: Optional[pd.DataFrame] = None,
 ) -> list[dict]:
     """核心提取逻辑：返回每帧动作 dict 列表。"""
-    replay = StateReplay(events, positions, end_ts_ns=frame_ts[-1] if frame_ts else None)
+    replay = StateReplay(events, end_ts_ns=frame_ts[-1] if frame_ts else None,
+                         mouse_deltas=mouse_deltas)
     decode_tracker = DecodeStateTracker(keymap.interact, keymap.vault, params)
 
     rows: list[dict] = []
@@ -182,7 +183,10 @@ def extract_session(session_dir: Path,
     params = params or ExtractParams()
 
     events = pd.read_csv(session_dir / "events.csv")
-    positions = pd.read_csv(session_dir / "mouse_positions.csv")
+    mouse_delta_path = session_dir / "mouse_deltas.csv"
+    if not mouse_delta_path.exists():
+        raise ValueError("缺少 mouse_deltas.csv；新 VLA session 必须使用 Raw Input 鼠标数据")
+    mouse_deltas = pd.read_csv(mouse_delta_path)
 
     meta = {}
     meta_path = session_dir / "meta.json"
@@ -203,7 +207,7 @@ def extract_session(session_dir: Path,
     else:
         frame_ts = [int(start_ts + int(i / fps * 1e9)) for i in range(n_frames)] if n_frames else []
 
-    rows = build_frame_grid(events, positions, frame_ts, keymap, params)
+    rows = build_frame_grid(events, frame_ts, keymap, params, mouse_deltas=mouse_deltas)
     df = pd.DataFrame(rows)
     out = session_dir / "per_frame_actions.csv"
     df.to_csv(out, index=False)

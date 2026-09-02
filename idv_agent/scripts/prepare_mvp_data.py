@@ -106,10 +106,13 @@ def _stats(items: list[tuple[str, list[dict]]]) -> dict:
 
 
 def prepare(root: Path, output: Path, *, val_ratio: float, seed: int,
-            val_sessions: set[str] | None, travel_scope: str) -> dict:
+            val_sessions: set[str] | None, travel_scope: str,
+            max_session_chunks: int | None = None) -> dict:
     sessions = []
     for path in sorted(root.glob("*/vla_chunks_v4.jsonl")):
         rows = _session_records(path, travel_scope)
+        if max_session_chunks is not None and len(rows) > max_session_chunks:
+            continue
         if rows:
             sessions.append((path.parent.name, rows))
     train, val = _split(sessions, val_ratio, seed, val_sessions)
@@ -122,6 +125,7 @@ def prepare(root: Path, output: Path, *, val_ratio: float, seed: int,
     train_stats, val_stats = _stats(train), _stats(val)
     missing = {side: sorted(KEEP - set(stats["intents"])) for side, stats in (("train", train_stats), ("val", val_stats))}
     report = {"schema": "mvp.v1", "keep_intents": sorted(KEEP), "travel_scope": travel_scope,
+              "max_session_chunks": max_session_chunks,
               "seed": seed, "train": train_stats, "val": val_stats,
               "missing_intents": missing, "session_overlap": sorted(set(train_stats["sessions"]) & set(val_stats["sessions"])),
               "gate_pass": not any(missing.values()) and not (set(train_stats["sessions"]) & set(val_stats["sessions"]))}
@@ -157,10 +161,13 @@ def main(argv=None) -> int:
     p.add_argument("--seed", type=int, default=20260902)
     p.add_argument("--val-sessions", default="", help="comma separated session ids")
     p.add_argument("--travel-scope", choices=("all", "pre_decipher"), default="pre_decipher")
+    p.add_argument("--max-session-chunks", type=int, default=500,
+                   help="只纳入筛选后不超过该数量的短 session；0 表示不限制")
     args = p.parse_args(argv)
     report = prepare(args.sessions_root, args.output, val_ratio=args.val_ratio, seed=args.seed,
                      val_sessions={s.strip() for s in args.val_sessions.split(",") if s.strip()} or None,
-                     travel_scope=args.travel_scope)
+                     travel_scope=args.travel_scope,
+                     max_session_chunks=(args.max_session_chunks or None))
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["gate_pass"] else 2
 

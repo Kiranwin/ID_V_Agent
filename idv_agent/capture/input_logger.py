@@ -8,7 +8,7 @@
 事件 kind：
     key_down / key_up     key 列给 "key:w" 形式
     mouse_down / mouse_up 给 "btn:left" 形式
-    scroll / mouse_move    记录在 mouse_positions.csv（鼠标移动）
+    scroll                  记录在 events.csv；鼠标相对位移由 Raw Input 单独记录
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock
 from typing import Optional
 
 from .screen_capture import CaptureConfig
@@ -41,18 +41,13 @@ def _key_to_str(key) -> str:
 class EventLogger:
     """把键鼠事件追加写入 CSV。可被独立启动 / 停止。"""
     events_csv: Path
-    positions_csv: Path
     _events_fh = None
-    _positions_fh = None
 
     def __post_init__(self) -> None:
         self.events_csv.parent.mkdir(parents=True, exist_ok=True)
         self._events_fh = self.events_csv.open("w", encoding="utf-8")
         self._events_fh.write("timestamp_ns,kind,code,value\n")
-        self._positions_fh = self.positions_csv.open("w", encoding="utf-8")
-        self._positions_fh.write("timestamp_ns,x,y\n")
         self._lock = Lock()
-        self._last_pos = None
 
     # ---- 写入 ----
     def log_event(self, kind: str, code: str, value: float = 1.0) -> None:
@@ -63,34 +58,21 @@ class EventLogger:
             self._events_fh.write(f"{ts},{kind},{code},{value}\n")
             self._events_fh.flush()
 
-    def log_mouse_position(self, x: int, y: int) -> None:
-        ts = time.perf_counter_ns()
-        with self._lock:
-            if self._positions_fh is None:
-                return
-            self._positions_fh.write(f"{ts},{x},{y}\n")
-            self._positions_fh.flush()
-
     def close(self) -> None:
         with self._lock:
             if self._events_fh is not None:
                 self._events_fh.close()
                 self._events_fh = None
-            if self._positions_fh is not None:
-                self._positions_fh.close()
-                self._positions_fh = None
 
 
 class InputRecorder:
     """pynput 后台监听，事件转发到 EventLogger。`start()` / `stop()` 生命周期。"""
 
-    def __init__(self, events_csv: Path, positions_csv: Path, poll_position_hz: float = 100.0,
+    def __init__(self, events_csv: Path,
                  ignored_codes: set[str] | None = None):
-        self.logger = EventLogger(events_csv=events_csv, positions_csv=positions_csv)
-        self._poll_position_hz = poll_position_hz
+        self.logger = EventLogger(events_csv=events_csv)
         self._ignored_codes = set(ignored_codes or ())
         self._stop = False
-        self._threads: list[Thread] = []
         self._listeners = []
 
     def start(self) -> None:
@@ -119,17 +101,6 @@ class InputRecorder:
         self._listeners = [kb_listener, ms_listener]
         kb_listener.start()
         ms_listener.start()
-        # 后台高频轮询鼠标位置（pynput 的 on_move 会刷屏，用 on_move 记录稀疏轮询）
-        def _poll_position():
-            from pynput import mouse as _mouse
-            controller = _mouse.Controller()
-            while not self._stop:
-                pos = controller.position
-                self.logger.log_mouse_position(*pos)
-                time.sleep(1.0 / self._poll_position_hz)
-        t = Thread(target=_poll_position, name="mouse-poll", daemon=True)
-        self._threads.append(t)
-        t.start()
 
     def stop(self) -> None:
         self._stop = True
@@ -138,8 +109,6 @@ class InputRecorder:
                 listener.stop()
             except Exception:
                 pass
-        for t in self._threads:
-            t.join(timeout=1.0)
         self.logger.close()
 
 

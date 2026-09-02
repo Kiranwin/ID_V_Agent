@@ -26,9 +26,21 @@ def validate(session: Path) -> list[str]:
         errors.append(f"vla_schema_version 必须是 {VLA_SCHEMA_VERSION}")
     if meta.get("mode") not in GAME_MODE_CHOICES:
         errors.append(f"mode 必须是 {GAME_MODE_CHOICES}")
-    for name in ("events.csv", "mouse_positions.csv", "frame_timestamps.csv"):
+    for name in ("events.csv", "mouse_deltas.csv", "frame_timestamps.csv"):
         if not (session / name).is_file():
             errors.append(f"缺少 {name}")
+    delta_path = session / "mouse_deltas.csv"
+    try:
+        with delta_path.open(encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        required = {"timestamp_ns", "dx", "dy"}
+        if rows and not required.issubset(rows[0]):
+            errors.append("mouse_deltas.csv 列必须包含 timestamp_ns,dx,dy")
+        delta_ts = [int(row["timestamp_ns"]) for row in rows]
+        if delta_ts != sorted(delta_ts):
+            errors.append("mouse_deltas.csv timestamp_ns 必须递增")
+    except Exception as exc:
+        errors.append(f"mouse_deltas.csv 无法解析: {exc}")
     frames = sorted((session / "frames").glob("*.jpg"), key=lambda p: int(p.stem))
     ts_path = session / "frame_timestamps.csv"
     timestamps = []

@@ -85,14 +85,24 @@ class FrameState:
 class StateReplay:
     """按帧时间网格回放每帧 FrameState。"""
 
-    def __init__(self, events: pd.DataFrame, positions: pd.DataFrame, end_ts_ns: Optional[int] = None):
+    def __init__(self, events: pd.DataFrame, positions: Optional[pd.DataFrame] = None,
+                 end_ts_ns: Optional[int] = None,
+                 mouse_deltas: Optional[pd.DataFrame] = None):
         self.intervals = build_press_intervals(events, end_ts_ns=end_ts_ns)
         self._event_ts = list(map(int, events["timestamp_ns"])) if len(events) else []
         self._release_events = [iv for iv in self.intervals]
-        self._positions = positions
-        self._pos_ts = list(map(int, positions["timestamp_ns"])) if len(positions) else []
-        self._pos_x = list(map(int, positions["x"])) if len(positions) else []
-        self._pos_y = list(map(int, positions["y"])) if len(positions) else []
+        self._mouse_deltas = mouse_deltas
+        if mouse_deltas is not None:
+            required = {"timestamp_ns", "dx", "dy"}
+            missing = required - set(mouse_deltas.columns)
+            if missing:
+                raise ValueError(f"mouse_deltas 缺少列: {', '.join(sorted(missing))}")
+            md = mouse_deltas.sort_values("timestamp_ns")
+            self._delta_ts = list(map(int, md["timestamp_ns"]))
+            self._delta_x = list(map(float, md["dx"]))
+            self._delta_y = list(map(float, md["dy"]))
+        else:
+            self._delta_ts, self._delta_x, self._delta_y = [], [], []
         # 预计算每个 interval 的 (press, release)；用于二分查询
         self._release_sorted = sorted(self.intervals, key=lambda iv: iv.release_ts)
 
@@ -112,15 +122,14 @@ class StateReplay:
             if lo < iv.release_ts <= ts:
                 released[iv.code] = iv.duration_ms
 
-        # 鼠标位置与增量
-        if self._pos_ts:
-            idx = max(0, bisect_right(self._pos_ts, ts) - 1)
-            x, y = self._pos_x[idx], self._pos_y[idx]
-            dx = dy = 0.0
-            if prev_ts is not None:
-                pidx = max(0, bisect_right(self._pos_ts, prev_ts) - 1)
-                dx = float(x - self._pos_x[pidx])
-                dy = float(y - self._pos_y[pidx])
+        # 优先使用 Raw Input 相对位移；按帧窗口累加所有报告。
+        if self._delta_ts:
+            import numpy as np
+            hi = bisect_right(self._delta_ts, ts)
+            lo_idx = bisect_right(self._delta_ts, prev_ts) if prev_ts is not None else 0
+            dx = float(np.sum(self._delta_x[lo_idx:hi]))
+            dy = float(np.sum(self._delta_y[lo_idx:hi]))
+            x = y = None
         else:
             x = y = None
             dx = dy = 0.0

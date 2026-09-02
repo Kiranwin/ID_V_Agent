@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from idv_agent.capture.input_logger import InputRecorder
+from idv_agent.capture.raw_input_mouse import RawInputMouse, write_deltas_csv
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
 from idv_agent.configs.game_mode import DEFAULT_GAME_MODE, GAME_MODE_CHOICES
 from idv_agent.vla.action_chunk import (
@@ -98,6 +99,10 @@ def _finalize_session(*, args, session_id, session_dir, frame_timestamps,
         "frame_id,timestamp_ns\n" + "".join(f"{i},{ts}\n" for i, ts in frame_timestamps),
         encoding="utf-8",
     )
+    mouse_deltas_path = session_dir / "mouse_deltas.csv"
+    raw_mouse = getattr(args, "_raw_mouse", None)
+    if raw_mouse is not None:
+        write_deltas_csv(mouse_deltas_path, raw_mouse.deltas)
     duration_s = max((end_ts - start_ts) / 1e9, 1e-9)
     meta = {
         "recording_type": "vla_raw",
@@ -119,6 +124,8 @@ def _finalize_session(*, args, session_id, session_dir, frame_timestamps,
         "max_width": args.max_width,
         "jpeg_quality": args.jpeg_quality,
         "note": args.note,
+        "mouse_input_source": "raw_input",
+        "camera_motion_valid": True,
     }
     (session_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -147,10 +154,8 @@ def record(args) -> Path | None:
                 session_id, session_dir, frames_dir = _new_session(args)
                 last_session = session_dir
                 events_csv = session_dir / "events.csv"
-                positions_csv = session_dir / "mouse_positions.csv"
                 recorder = InputRecorder(
                     events_csv=events_csv,
-                    positions_csv=positions_csv,
                     ignored_codes={"key:f9", "key:f10"},
                 )
                 frame_timestamps: list[tuple[int, int]] = []
@@ -161,6 +166,9 @@ def record(args) -> Path | None:
                 n_frames = 0
                 print(f"[record-vla] 录制开始：{session_dir}")
                 recorder.start()
+                raw_mouse = RawInputMouse()
+                raw_mouse.start()
+                args._raw_mouse = raw_mouse
                 try:
                     while not controls.exit_requested:
                         now = time.perf_counter()
@@ -190,6 +198,7 @@ def record(args) -> Path | None:
                         n_frames += 1
                         next_deadline += frame_interval
                 finally:
+                    raw_mouse.stop()
                     recorder.stop()
                     _finalize_session(args=args, session_id=session_id, session_dir=session_dir,
                                       frame_timestamps=frame_timestamps, n_frames=n_frames,
