@@ -25,8 +25,8 @@ def test_load_replay_events_merges_keyboard_and_raw_mouse_on_relative_timeline(t
     events = load_replay_events(session, mouse_deltas=mouse)
 
     assert events == [
-        ReplayEvent(0.0, "press", "key:w"),
         ReplayEvent(0.0, "mouse_move", None, 2.0, 0.0),
         ReplayEvent(0.0000002, "mouse_move", None, -1.0, 3.0),
-        ReplayEvent(0.0000001, "release", "key:w"),
+        ReplayEvent(0.0000008, "press", "key:w"),
+        ReplayEvent(0.0000003, "release", "key:w"),
     ]

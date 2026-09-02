@@ -55,32 +55,26 @@ def load_replay_events(session: Path, *, mouse_deltas: Path | None = None,
                 keyboard_raw.append((ts, "release", code, 0.0, 0.0))
         elif kind in {"mouse_down", "mouse_up"}:
             keyboard_raw.append((ts, "press" if kind == "mouse_down" else "release", code, 0.0, 0.0))
-    # A separate diagnostic run has a different perf_counter epoch. Normalize
-    # that external stream independently; same-session files keep their
-    # original shared clock and therefore preserve keyboard/mouse alignment.
-    raw = []
-    if keyboard_raw:
-        origin = keyboard_raw[0][0]
-        raw.extend((ts - origin, kind, code, dx, dy) for ts, kind, code, dx, dy in keyboard_raw)
+    # Same-session files share the perf_counter clock and must be normalized
+    # together; an external diagnostic run has a different epoch and is
+    # normalized independently before merging.
+    raw = list(keyboard_raw)
+    same_session_mouse = mouse_deltas is not None and mouse_deltas.resolve().parent == session.resolve()
     if mouse_deltas is not None:
         mouse_raw = _load_mouse_delta_events(mouse_deltas, scale=scale)
         if mouse_raw:
-            if mouse_deltas.resolve().parent == session.resolve():
-                # Rebase to keyboard origin below after appending.
-                raw.extend((ts, kind, code, dx, dy) for ts, kind, code, dx, dy in mouse_raw)
+            if same_session_mouse:
+                raw.extend(mouse_raw)
             else:
                 origin = mouse_raw[0][0]
                 raw.extend((ts - origin, kind, code, dx, dy) for ts, kind, code, dx, dy in mouse_raw)
+    if same_session_mouse and raw:
+        origin = min(item[0] for item in raw)
+        raw = [(ts - origin, kind, code, dx, dy) for ts, kind, code, dx, dy in raw]
     raw.sort(key=lambda item: item[0])
     if not raw:
         return []
     out: list[ReplayEvent] = []
-    # Same-session mouse timestamps are absolute perf_counter values while
-    # keyboard entries above are already keyboard-relative.
-    if mouse_deltas is not None and mouse_deltas.resolve().parent == session.resolve() and keyboard_raw:
-        keyboard_origin = keyboard_raw[0][0]
-        raw = [(ts - keyboard_origin, kind, code, dx, dy) for ts, kind, code, dx, dy in raw]
-        raw.sort(key=lambda item: item[0])
     prev = raw[0][0]
     for ts, kind, code, dx, dy in raw:
         out.append(ReplayEvent(max(0.0, (ts - prev) / 1e9), kind, code, dx, dy))
