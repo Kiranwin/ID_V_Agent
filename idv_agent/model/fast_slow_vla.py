@@ -1,4 +1,9 @@
-"""Composable fast/slow VLA core operating on cached frame features."""
+"""Composable fast/slow VLA core operating on cached frame features.
+
+Architecture change (2026-09-03): Separated temporal encoders to prevent
+gradient conflicts between slow (discrete classification) and fast (continuous
+control) objectives.  The two heads now have independent GRU paths.
+"""
 
 from __future__ import annotations
 
@@ -49,7 +54,13 @@ class FastSlowVLAOutput:
 
 
 class SharedFastSlowVLA(nn.Module):
-    """Shared temporal core plus slow and fast heads.
+    """Separated temporal encoders plus slow and fast heads.
+
+    Architecture change (2026-09-03): Slow and fast heads now use independent
+    GRU temporal encoders to prevent gradient conflicts.  The slow head learns
+    long-horizon intent transitions; the fast head learns short-horizon action
+    responses.  This increases parameters by ~2M (512-dim GRU × 2) but eliminates
+    the gradient tug-of-war between discrete classification and continuous control.
 
     The visual backbone deliberately remains outside this module.  Runtime
     supplies cached per-frame features, ensuring the two heads cannot trigger
@@ -60,7 +71,8 @@ class SharedFastSlowVLA(nn.Module):
                  history_action_dim: int = 0):
         super().__init__()
         self.conditioner = FiLMConditioner(frame_feature_dim)
-        self.temporal = SharedTemporalEncoder(frame_feature_dim, temporal_dim)
+        self.slow_temporal = SharedTemporalEncoder(frame_feature_dim, temporal_dim)
+        self.fast_temporal = SharedTemporalEncoder(frame_feature_dim, temporal_dim)
         self.slow_head = SlowVLAHead(temporal_dim)
         self.fast_head = FastVLAHead(temporal_dim, history_action_dim=history_action_dim)
 
@@ -92,6 +104,12 @@ class SharedFastSlowVLA(nn.Module):
         run_slow: bool = False,
         detach_slow_condition: bool = True,
     ) -> FastSlowVLAOutput:
+        """Forward pass with separated temporal encoders.
+
+        ``detach_slow_condition`` is now less critical because the two heads
+        no longer share temporal parameters.  It remains available for optional
+        ablation experiments.
+        """
         if frame_features.ndim == 2:
             frame_features = frame_features.unsqueeze(0)
         condition = slow_condition.detached() if detach_slow_condition else slow_condition
@@ -102,10 +120,15 @@ class SharedFastSlowVLA(nn.Module):
             condition.context_embedding,
             condition.mode_id,
         )
-        temporal = self.temporal(conditioned, valid_mask=valid_mask, time_deltas=time_deltas)
-        fast = self.fast_head(temporal, history_actions=history_actions)
-        slow = self.slow_head(temporal) if run_slow else None
-        return FastSlowVLAOutput(temporal_feature=temporal, fast=fast, slow=slow)
+        # Separated paths: slow and fast each run their own GRU.
+        slow_temporal = self.slow_temporal(conditioned, valid_mask=valid_mask, time_deltas=time_deltas) if run_slow else None
+        fast_temporal = self.fast_temporal(conditioned, valid_mask=valid_mask, time_deltas=time_deltas)
+
+        fast = self.fast_head(fast_temporal, history_actions=history_actions)
+        slow = self.slow_head(slow_temporal) if run_slow and slow_temporal is not None else None
+
+        # Return fast_temporal as the canonical temporal feature for compatibility
+        return FastSlowVLAOutput(temporal_feature=fast_temporal, fast=fast, slow=slow)
 
     @staticmethod
     def condition_from_slow_output(
