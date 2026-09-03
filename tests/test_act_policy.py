@@ -27,6 +27,23 @@ def test_act_policy_cold_start_uses_travel_and_waits_for_three_frames():
     assert policy.observe(1, frame_index=1, timestamp_ns=2) is False
 
 
+def test_act_policy_logs_action_chunk_metadata(capsys):
+    core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
+    policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
+                       device="cpu", send=lambda _commands: None)
+    for i in range(3):
+        policy.observe(1, frame_index=i, timestamp_ns=i + 1)
+    policy.tick(now=0.0)
+    output = capsys.readouterr().out
+    assert "[act]" in output
+    assert "frame=" in output
+    assert "intent=" in output
+    assert "move=" in output
+    assert "camera=" in output
+    assert "buttons=" in output
+    assert "duration=" in output
+
+
 def test_act_policy_uses_real_history_after_executor_starts_a_step():
     core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
     sent = []

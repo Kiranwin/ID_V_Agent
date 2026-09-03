@@ -13,7 +13,7 @@ from idv_agent.agent.act_action_executor import ACTActionChunkExecutor
 from idv_agent.agent.act_scheduler import ACTChunkScheduler
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA, SlowCondition
 from idv_agent.model.temporal import FrameFeatureCache, TaskConditionCache
-from idv_agent.vla.action_chunk import BUTTON_NAMES, CAMERA_BUCKETS, INTENTS
+from idv_agent.vla.action_chunk import BUTTON_NAMES, CAMERA_BUCKETS, INTENTS, MOVE_DIRECTIONS
 from idv_agent.configs.game_mode import GAME_MODE_CHOICES
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
 
@@ -114,6 +114,9 @@ class ACTPolicy:
         self.condition = self.core.condition_from_slow_output(output.slow,
                                                                self.condition.mode_id)
         self._last_slow = now
+        print(f"[act:slow] frame={self.features.latest().frame_index} "
+              f"intent={INTENTS[int(self.condition.intent_id[0])]} "
+              f"subgoal={int(self.condition.subgoal_id[0])}")
 
     def _predict_chunk(self, _feature: object) -> list[ACTActionStep]:
         values, timestamps, valid = self.features.window(self.history_frames)
@@ -128,9 +131,20 @@ class ACTPolicy:
         dys = fast.camera_dy_logits.argmax(-1)[0].tolist()
         buttons = (fast.button_logits.sigmoid() >= 0.5)[0]
         durations = fast.duration[0].round().clamp(1, 30).to(torch.int64).tolist()
-        return [ACTActionStep(int(move), CAMERA_BUCKETS[int(dxs[i])], CAMERA_BUCKETS[int(dys[i])],
-                              tuple(int(v) for v in buttons[i].tolist()), int(durations[i]))
-                for i, move in enumerate(moves)]
+        steps = [ACTActionStep(int(move), CAMERA_BUCKETS[int(dxs[i])], CAMERA_BUCKETS[int(dys[i])],
+                               tuple(int(v) for v in buttons[i].tolist()), int(durations[i]))
+                 for i, move in enumerate(moves)]
+        latest = self.features.latest()
+        first = steps[0]
+        pressed = ",".join(name for name, value in zip(BUTTON_NAMES, first.buttons) if value) or "-"
+        age_ms = max(0.0, time.perf_counter() - latest.timestamp_ns / 1_000_000_000.0) * 1000
+        print(f"[act] frame={latest.frame_index} "
+              f"intent={INTENTS[int(self.condition.intent_id[0])]} "
+              f"move={MOVE_DIRECTIONS[first.move_dir]}({first.move_dir}) "
+              f"camera=({first.camera_dx},{first.camera_dy}) "
+              f"buttons={pressed} duration={first.duration_frames} "
+              f"feature_age_ms={age_ms:.1f}")
+        return steps
 
     def tick(self, *, now: float | None = None) -> bool:
         """Run due slow/fast ticks. ``now`` is a monotonic seconds timestamp."""
