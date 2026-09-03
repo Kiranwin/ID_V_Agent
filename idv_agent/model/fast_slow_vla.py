@@ -17,6 +17,8 @@ from idv_agent.model.vla_heads import (
     SlowVLAHead,
     SlowVLAOutput,
 )
+from idv_agent.vla.action_chunk import INTENTS
+from idv_agent.configs.subgoal import SUBGOAL_NAMES
 
 
 @dataclass
@@ -64,13 +66,17 @@ class SharedFastSlowVLA(nn.Module):
 
     @staticmethod
     def initial_condition(batch_size: int, device: torch.device | str = "cpu",
-                          mode_id: int = 0) -> SlowCondition:
+                          mode_id: int = 0, intent_id: int = 7,
+                          subgoal_id: int | None = 1) -> SlowCondition:
         if batch_size < 1:
             raise ValueError("batch_size 必须为正数")
-        # idle=7 and observe=1 are the safe cold-start condition.
+        if not 0 <= intent_id < len(INTENTS):
+            raise ValueError("intent_id 超出范围")
+        if subgoal_id is None:
+            subgoal_id = SUBGOAL_NAMES.index("observe")
         return SlowCondition(
-            intent_id=torch.full((batch_size,), 7, dtype=torch.long, device=device),
-            subgoal_id=torch.full((batch_size,), 1, dtype=torch.long, device=device),
+            intent_id=torch.full((batch_size,), intent_id, dtype=torch.long, device=device),
+            subgoal_id=torch.full((batch_size,), subgoal_id, dtype=torch.long, device=device),
             context_embedding=torch.zeros((batch_size, CONTEXT_EMBEDDING_DIM), device=device),
             mode_id=torch.full((batch_size,), mode_id, dtype=torch.long, device=device),
         )

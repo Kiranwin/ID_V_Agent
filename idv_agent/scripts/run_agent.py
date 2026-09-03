@@ -16,6 +16,7 @@ import argparse
 from pathlib import Path
 
 from idv_agent.agent.action_executor import ActionExecutor
+from idv_agent.agent.act_policy import ACTPolicy
 from idv_agent.agent.memory import MatchMemory
 from idv_agent.agent.realtime_agent import RealtimeAgent
 from idv_agent.agent.rule_agent import CipherVisualServo, RuleAgent
@@ -40,6 +41,19 @@ def build_policy(args, device):
         # blocked 脱困分支；无 bbox 几何时仍回退到旧的粗粒度规则。
         rp = RulePolicy(RuleAgent(visual_servo=CipherVisualServo()))
         return rp, None
+    if args.mode == "act":
+        if not args.act_checkpoint or not args.act_init_checkpoint:
+            raise ValueError("ACT 模式必须提供 --act-checkpoint 与 --act-init-checkpoint")
+        policy = ACTPolicy.from_checkpoint(
+            args.act_checkpoint, model_path=args.model_path,
+            init_checkpoint=args.act_init_checkpoint,
+            instruction=args.instruction, mode=args.game_mode, device=device,
+            capture_fps=args.fps, fast_hz=args.fast_hz, slow_hz=args.slow_hz,
+            history_frames=args.history_frames,
+            max_feature_age_s=args.max_feature_age_s,
+            cam_pixel_scale=args.cam_pixel_scale,
+        )
+        return policy, policy
     raise ValueError(f"未知 mode: {args.mode}")
 
 
@@ -92,8 +106,8 @@ def run_image_test(args, policy) -> int:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["rule"], default="rule",
-                   help="rule=规则安全兜底；VLA 动作块运行器尚在开发")
+    p.add_argument("--mode", choices=["rule", "act"], default="rule",
+                   help="rule=规则安全兜底；act=ACT 动作块策略")
     p.add_argument("--title", default="第五人格")
     p.add_argument("--cipher-template", type=Path, default=None,
                    help="密码机模板图片（建议同分辨率、同地图；不传则不触发自动找机）")
@@ -114,6 +128,18 @@ def main(argv=None) -> int:
     p.add_argument("--send-input", action="store_true", help="真发送键鼠（仅沙盒！）")
     p.add_argument("--dry-run", action="store_true", help="显式声明仅记录命令（默认行为）")
     p.add_argument("--device", default="cpu")
+    p.add_argument("--act-checkpoint", type=Path, default=None,
+                   help="M3_ACT 动作块 checkpoint")
+    p.add_argument("--act-init-checkpoint", type=Path, default=None,
+                   help="ACT 的 M2_VG 初始化目录")
+    p.add_argument("--model-path", default=None,
+                   help="Qwen 基础模型目录；不传则使用 M2 manifest")
+    p.add_argument("--instruction", default="找到密码机，靠近并进入破译")
+    p.add_argument("--game-mode", choices=["standard", "joint_hunt", "blackjack"], default="standard")
+    p.add_argument("--fast-hz", type=float, default=15.0)
+    p.add_argument("--slow-hz", type=float, default=1.0)
+    p.add_argument("--history-frames", type=int, default=3)
+    p.add_argument("--max-feature-age-s", type=float, default=0.5)
     test_group = p.add_mutually_exclusive_group()
     test_group.add_argument("--test-image", action="append", default=None,
                             help="离线测试单张图片；可重复传入多张")
@@ -143,9 +169,11 @@ def main(argv=None) -> int:
             raise RuntimeError(
                 "--send-input 必须从管理员权限终端运行；当前 Python 进程未提升。"
             )
-    policy, _ = build_policy(args, device)
+    policy, act_policy = build_policy(args, device)
 
     if args.test_image or args.test_dir:
+        if act_policy is not None:
+            p.error("ACT 模式需要连续帧缓存，离线单图测试请使用 benchmark_act_realtime 或规则模式")
         return run_image_test(args, policy)
 
     capture_cfg = CaptureConfig(
@@ -153,6 +181,19 @@ def main(argv=None) -> int:
         region=args.region,
         window_title=args.title,
     )
+    if act_policy is not None:
+        if args.test_image or args.test_dir:
+            return run_image_test(args, policy)
+        # ACTActionChunkExecutor emits through the same safety-aware executor
+        # as the legacy path; dry-run remains the default.
+        act_executor = ActionExecutor(dry_run=not args.send_input)
+        act_policy.executor.set_send(act_executor.execute)
+        print(f"[run_agent] mode=act, dry_run={not args.send_input}, duration={args.duration}s")
+        count = act_policy.run_capture(capture_cfg, duration_s=args.duration,
+                                       max_frames=int(args.fps * args.duration))
+        print(f"[run_agent] 结束，帧数={count}")
+        act_executor.shutdown()
+        return 0
     executor = ActionExecutor(dry_run=not args.send_input)
     agent = RealtimeAgent(
         policy=policy,

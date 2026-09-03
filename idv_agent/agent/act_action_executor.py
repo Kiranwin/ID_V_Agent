@@ -5,6 +5,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable
+from collections import deque
+
+import torch
 
 from idv_agent.agent.action_decoder import Command
 from idv_agent.configs.keymap import DEFAULT_SURVIVOR_KEYMAP, SurvivorKeymap
@@ -50,10 +53,15 @@ class ACTActionChunkExecutor:
         self._active: _ActiveStep | None = None
         self._held: set[str] = set()
         self._virtual_time = 0.0
+        self._history: deque[object] = deque(maxlen=8)
 
     @property
     def active(self) -> bool:
         return self._active is not None or bool(self._queue)
+
+    def set_send(self, send: Callable[[Iterable[Command]], None]) -> None:
+        """Attach/replace the physical or dry-run command sink."""
+        self.send = send
 
     def submit(self, steps: Iterable[object]) -> None:
         incoming = list(steps)
@@ -91,6 +99,22 @@ class ACTActionChunkExecutor:
         if commands:
             self.send(commands)
         self._held = target
+        self._history.append(step)
+
+    @property
+    def history_actions(self) -> tuple[object, ...]:
+        """Recently applied macro steps, oldest first (up to eight)."""
+        return tuple(self._history)
+
+    def history_tensor(self, *, device: torch.device | str = "cpu") -> torch.Tensor:
+        """Encode executed history using the v4 9-field action representation."""
+        values: list[float] = []
+        for step in self._history:
+            values.extend((float(step.move_dir), float(CAMERA_BUCKETS.index(step.camera_dx)),
+                           float(CAMERA_BUCKETS.index(step.camera_dy))))
+            values.extend(float(v) for v in step.buttons)
+        values.extend([0.0] * (8 * 9 - len(values)))
+        return torch.tensor(values, dtype=torch.float32, device=device).reshape(1, -1)
 
     def tick(self, dt_s: float | None = None) -> bool:
         """Advance execution by one decision tick; return whether active."""

@@ -20,6 +20,7 @@ class ACTChunkScheduler:
         self.next_tick = 0.0
         self._feature = None
         self._feature_timestamp: float | None = None
+        self._pending_steps: list[object] | None = None
 
     def update_feature(self, feature: object, *, timestamp: float) -> None:
         self._feature = feature
@@ -29,14 +30,22 @@ class ACTChunkScheduler:
         now = float(now)
         self.executor.tick(dt_s=self.period)
         if self._feature_timestamp is None or now - self._feature_timestamp > self.max_feature_age_s:
+            self._pending_steps = None
             self.executor.shutdown()
             self.next_tick = now + self.period
             return False
-        if now < self.next_tick or self.executor.active:
-            return self.executor.active
-        self.next_tick = now + self.period
-        self.executor.submit(self.predict(self._feature))
+        if now >= self.next_tick:
+            self.next_tick = now + self.period
+            # Prediction cadence is independent from execution cadence.  Keep
+            # only the newest not-yet-started block while the current block is
+            # running; this avoids both mid-block discontinuities and an
+            # unbounded queue when inference is faster than execution.
+            self._pending_steps = list(self.predict(self._feature))
+        if not self.executor.active and self._pending_steps is not None:
+            self.executor.submit(self._pending_steps)
+            self._pending_steps = None
         return self.executor.active
 
     def shutdown(self) -> None:
+        self._pending_steps = None
         self.executor.shutdown()
