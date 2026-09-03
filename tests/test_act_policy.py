@@ -36,12 +36,14 @@ def test_act_policy_logs_action_chunk_metadata(capsys):
     policy.tick(now=0.0)
     output = capsys.readouterr().out
     assert "[act]" in output
+    assert "pred=" in output
     assert "frame=" in output
     assert "intent=" in output
     assert "move=" in output
     assert "camera=" in output
     assert "buttons=" in output
     assert "duration=" in output
+    assert "feature_mean=" in output
 
 
 def test_act_policy_uses_real_history_after_executor_starts_a_step():

@@ -21,6 +21,7 @@ class ACTChunkScheduler:
         self._feature = None
         self._feature_timestamp: float | None = None
         self._pending_steps: list[object] | None = None
+        self._last_tick: float | None = None
 
     def update_feature(self, feature: object, *, timestamp: float) -> None:
         self._feature = feature
@@ -28,7 +29,11 @@ class ACTChunkScheduler:
 
     def tick(self, *, now: float) -> bool:
         now = float(now)
-        self.executor.tick(dt_s=self.period)
+        if self._last_tick is not None:
+            elapsed = max(0.0, now - self._last_tick)
+            if elapsed:
+                self.executor.tick(dt_s=elapsed)
+        self._last_tick = now
         if self._feature_timestamp is None or now - self._feature_timestamp > self.max_feature_age_s:
             self._pending_steps = None
             self.executor.shutdown()
@@ -48,4 +53,5 @@ class ACTChunkScheduler:
 
     def shutdown(self) -> None:
         self._pending_steps = None
+        self._last_tick = None
         self.executor.shutdown()

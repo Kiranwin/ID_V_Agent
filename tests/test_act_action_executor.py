@@ -73,3 +73,23 @@ def test_scheduler_keeps_latest_prediction_until_active_chunk_finishes():
     scheduler.tick(now=0.134)  # active block completes; latest block is used
     assert executor.active
     assert len(requested) == 3
+
+
+def test_scheduler_consumes_chunk_at_wall_clock_rate_not_call_rate():
+    calls = []
+    executor = ACTActionChunkExecutor(send=lambda cmds: calls.extend(cmds), capture_fps=30, tick_hz=15)
+    scheduler = ACTChunkScheduler(
+        predict=lambda _payload: [_step(move=1, duration=6)],
+        executor=executor, fast_hz=15, max_feature_age_s=1.0,
+    )
+    scheduler.update_feature("f", timestamp=0.0)
+    # Calls arrive at capture cadence (30 Hz), while execution must consume
+    # six frames over 200 ms, not six frames over 100 ms.
+    for i in range(4):
+        scheduler.tick(now=i / 30.0)
+    assert executor.active
+    scheduler.tick(now=0.24)
+    # The first six-frame step has completed after ~200 ms and the pending
+    # prediction starts immediately; it was not consumed twice as fast.
+    assert executor.active
+    assert any(getattr(command, "kind", None) == "release" for command in calls)

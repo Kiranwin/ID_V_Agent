@@ -63,6 +63,7 @@ class ACTPolicy:
                                                 intent_id=INTENTS.index("travel"))
         self.history_actions = torch.zeros((1, 72), dtype=torch.float32, device=self.device)
         self._last_slow = 0.0
+        self._prediction_count = 0
         self.slow_period = 1.0 / float(slow_hz)
         self.executor = ACTActionChunkExecutor(
             send=send or (lambda _commands: None), capture_fps=capture_fps,
@@ -138,12 +139,14 @@ class ACTPolicy:
         first = steps[0]
         pressed = ",".join(name for name, value in zip(BUTTON_NAMES, first.buttons) if value) or "-"
         age_ms = max(0.0, time.perf_counter() - latest.timestamp_ns / 1_000_000_000.0) * 1000
-        print(f"[act] frame={latest.frame_index} "
+        self._prediction_count += 1
+        fingerprint = float(values[-1].detach().float().mean().cpu())
+        print(f"[act] pred={self._prediction_count} frame={latest.frame_index} "
               f"intent={INTENTS[int(self.condition.intent_id[0])]} "
               f"move={MOVE_DIRECTIONS[first.move_dir]}({first.move_dir}) "
               f"camera=({first.camera_dx},{first.camera_dy}) "
               f"buttons={pressed} duration={first.duration_frames} "
-              f"feature_age_ms={age_ms:.1f}")
+              f"feature_mean={fingerprint:.5f} feature_age_ms={age_ms:.1f}")
         return steps
 
     def tick(self, *, now: float | None = None) -> bool:
