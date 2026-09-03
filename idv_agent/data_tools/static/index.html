@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VLA Data Workbench</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">VLA</span><div><strong>Data Workbench</strong><small>offline session preparation</small></div></div>
+    <div class="top-status"><span class="dot"></span><span id="server-status">Local server</span><span class="session-pill" id="selected-session">No session</span></div>
+  </header>
+  <main class="shell">
+    <aside class="sidebar panel">
+      <div class="section-heading"><span>Sessions</span><button class="icon-button" id="refresh-sessions" title="Refresh sessions">↻</button></div>
+      <div id="session-list" class="session-list"><div class="empty">Loading...</div></div>
+      <div class="sidebar-foot"><span class="legend green"></span> raw valid <span class="legend amber"></span> needs work</div>
+    </aside>
+    <section class="workspace">
+      <div id="empty-state" class="empty-panel panel"><div class="empty-icon">◫</div><h1>Select a raw session</h1><p>Choose a session to inspect and prepare its training labels.</p></div>
+      <div id="session-view" hidden>
+        <section class="hero-row">
+          <div><p class="eyebrow">RAW SESSION / REVIEW</p><h1 id="session-title">Session</h1><p class="subtle" id="session-meta">Select a session to begin.</p></div>
+          <div class="actions"><button class="button secondary" id="extract-actions" data-output="per-frame-actions">↗ Extract actions</button><button class="button secondary" id="init-intents">＋ Init intent segments</button><button class="button primary" id="build-chunks">▣ Generate vla_chunks_v4</button></div>
+        </section>
+        <section class="metrics-grid">
+          <div class="metric panel"><span>Frames</span><strong id="metric-frames">—</strong><small id="metric-range">—</small></div>
+          <div class="metric panel"><span>Duration</span><strong id="metric-duration">—</strong><small id="metric-fps">— FPS</small></div>
+          <div class="metric panel"><span>Raw check</span><strong id="metric-raw">—</strong><small>integrity gate</small></div>
+          <div class="metric panel"><span>Label outputs</span><strong id="metric-outputs">—</strong><small id="metric-output-detail">actions / intents / v4 chunks / audit</small></div>
+        </section>
+        <section class="diagnostics-grid">
+          <div class="panel section-panel"><div class="section-heading"><span>Action distribution</span><span class="read-only">READ ONLY</span></div><div id="action-chart" class="bar-chart"><div class="empty">No action file yet.</div></div></div>
+          <div class="panel section-panel"><div class="section-heading"><span>Motion coverage</span><span class="read-only">PER FRAME</span></div><div class="coverage"><div class="coverage-row"><span>Move frames</span><strong id="move-frames">—</strong></div><div class="coverage-row"><span>Camera frames</span><strong id="camera-frames">—</strong></div><div id="mean-values" class="mean-values"></div></div></div>
+        </section>
+        <section class="panel section-panel event-panel"><div class="section-heading"><div><span>Input events</span><small class="section-note">Mapped to the nearest captured frame. Repeated consecutive keydowns are grouped for review.</small></div><span class="read-only"><strong id="event-total">0</strong> TOTAL · <strong id="key-total">0</strong> KEY EVENTS</span></div><div id="key-stats" class="key-stats"><div class="empty">No events.csv yet.</div></div><div class="event-table-wrap"><table id="event-table"><thead><tr><th>Frame</th><th>Time</th><th>Key</th><th>Event</th><th>Value</th></tr></thead><tbody><tr><td colspan="5" class="empty">No input events yet.</td></tr></tbody></table></div></section>
+        <section id="frame-viewer" class="panel section-panel preview-panel">
+          <div class="section-heading"><div><span>Frame review</span><small class="section-note">Browse every captured frame to confirm the intended action.</small></div><span class="read-only">FULL FRAME ACCESS</span></div>
+          <div class="frame-toolbar">
+            <button class="icon-button" id="frame-previous" title="Previous frame" aria-label="Previous frame">←</button>
+            <button class="button secondary frame-play-button" id="frame-play" title="Play frames" aria-label="Play frames">▶ Play</button>
+            <button class="icon-button" id="frame-next" title="Next frame" aria-label="Next frame">→</button>
+            <label class="frame-jump">Frame <input id="frame-input" type="number" min="0" step="1" inputmode="numeric"><span>/ <strong id="frame-total">—</strong></span></label>
+          </div>
+          <input id="frame-slider" class="frame-slider" type="range" min="0" max="0" value="0" step="1" aria-label="Frame position">
+          <div class="frame-canvas"><img id="frame-image" alt="current captured frame"><div id="frame-empty" class="empty">No frames.</div></div>
+          <div class="frame-caption"><strong id="frame-current">Frame —</strong><span id="frame-time">—</span><span id="frame-events">No input events on this frame</span></div>
+        </section>
+        <section class="panel section-panel intent-panel"><div class="section-heading"><div><span>Intent segments</span><small class="section-note">Edit ranges and intent, then save to CSV.</small></div><div class="intent-actions"><span id="intent-validation" class="validation"></span><button class="button primary small" id="save-intents">Save intents</button></div></div><div class="table-wrap"><table id="intent-table"><thead><tr><th>ID</th><th>Start</th><th>End</th><th>Intent</th><th>Candidate reason</th><th>Notes</th></tr></thead><tbody><tr><td colspan="6" class="empty">No intent segments yet.</td></tr></tbody></table></div></section>
+        <section id="error-panel" class="error-panel" hidden><strong>Validation / operation error</strong><div id="error-list"></div></section>
+        <div id="operation-status" class="operation-status" role="status"></div>
+      </div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
