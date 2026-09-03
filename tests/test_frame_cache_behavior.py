@@ -68,3 +68,67 @@ def test_contiguous_subset_preserves_adjacent_records():
     dataset = [{"episode_id": "a", "i": i} for i in range(5)] + [{"episode_id": "b", "i": i} for i in range(5)]
     subset = _contiguous_subset(dataset, 4)
     assert [item["i"] for item in subset] == [0, 1, 2, 3]
+
+
+class _BatchAdapter(_Adapter):
+    def __init__(self):
+        super().__init__()
+        self.batch_calls = []
+
+    def encode_frames(self, images, task_cache, *, micro_batch_size=None):
+        self.batch_calls.append(len(images))
+        self.frames += len(images)
+        values = [float(image.getpixel((0, 0))[0]) for image in images]
+        return torch.tensor(values).reshape(-1, 1) * self.scale
+
+
+def test_encode_batch_uses_batched_vision_encoder_for_uncached_frames():
+    from idv_agent.scripts.train_vla import encode_batch
+
+    adapter = _BatchAdapter()
+    paths = [Path(f"frame-{index}.png") for index in range(3)]
+    # Avoid filesystem I/O: patch the image loader at the module boundary.
+    import idv_agent.scripts.train_vla as train_vla
+    original = train_vla._load_images
+    train_vla._load_images = lambda _paths: [Image.new("RGB", (1, 1), (i + 1, 0, 0))
+                                             for i, _ in enumerate(_paths)]
+    try:
+        batch = {"frame_paths": [paths], "task_instruction": ["same"],
+                 "mode_id": torch.zeros(1, dtype=torch.long)}
+        features = encode_batch(adapter, batch, device=torch.device("cpu"),
+                                vision_micro_batch_size=2)
+    finally:
+        train_vla._load_images = original
+
+    assert adapter.batch_calls == [2, 1]
+    assert torch.equal(features[0, :, 0], torch.tensor([1.0, 2.0, 3.0]))
+
+
+def test_qwen_batch_singleton_keeps_batch_dimension():
+    from types import SimpleNamespace
+    from idv_agent.model.qwen_backbone_adapter import Qwen3VLBackboneAdapter
+    from idv_agent.model.temporal import TaskConditionCache
+
+    class Visual(torch.nn.Module):
+        def forward(self, hidden_states=None, grid_thw=None, **kwargs):
+            return hidden_states.mean(dim=1, keepdim=True)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = Visual()
+            self.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=2, vocab_size=8))
+
+    class Processor:
+        def image_processor(self, *, images, return_tensors="pt"):
+            return {"pixel_values": torch.as_tensor(images).reshape(1, 1, 2),
+                    "image_grid_thw": torch.tensor([[1, 1, 1]])}
+
+    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor())
+    adapter.visual_projection = torch.nn.Linear(2, 2, bias=False)
+    adapter.visual_projection.weight.data.copy_(torch.eye(2))
+    adapter.condition_projection = torch.nn.Linear(4, 2, bias=False)
+    adapter.condition_projection.weight.data.zero_()
+    task = TaskConditionCache(torch.zeros(2), torch.zeros(2), task_id="t")
+    result = adapter.encode_frames([[[1.0, 2.0]]], task)
+    assert result.shape == (1, 2)
