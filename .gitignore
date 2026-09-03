@@ -28,3 +28,4 @@ Thumbs.db
 *.jar
 build/
 dist/
+tmp/remote_setup.py

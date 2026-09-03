@@ -27,6 +27,8 @@ from idv_agent.training.checkpoint_manifest import build_manifest, load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
 from idv_agent.training.vla_loss import compute_vla_loss
 from idv_agent.training.utils import set_seed
+from idv_agent.configs.subgoal import SUBGOAL_NAMES
+from idv_agent.vla.action_chunk import INTENTS
 
 
 def _freeze_qwen(adapter: torch.nn.Module) -> None:
@@ -309,6 +311,25 @@ def _scheduled_condition(core, slow, model_batch, *, teacher_forcing_ratio: floa
     )
 
 
+def _interact_stage_counts(button_logits: torch.Tensor, button_target: torch.Tensor,
+                           intent_target: torch.Tensor, subgoal_target: torch.Tensor) -> dict[str, dict[str, int]]:
+    """Summarize interact predictions by the sample's intent/subgoal stage."""
+    predicted = (button_logits[..., 0] > 0).sum(dim=-1).detach().cpu()
+    targets = (button_target[..., 0] > 0).sum(dim=-1).detach().cpu()
+    intents = intent_target.detach().cpu().reshape(-1)
+    subgoals = subgoal_target.detach().cpu().reshape(-1)
+    out: dict[str, dict[str, int]] = {}
+    for pred, target, intent, subgoal in zip(predicted.tolist(), targets.tolist(), intents.tolist(), subgoals.tolist()):
+        if intent < 0 or intent >= len(INTENTS):
+            continue
+        subgoal_name = SUBGOAL_NAMES[subgoal] if 0 <= subgoal < len(SUBGOAL_NAMES) else "unknown"
+        out[f"{INTENTS[intent]}/{subgoal_name}"] = {
+            "pred": out.get(f"{INTENTS[intent]}/{subgoal_name}", {}).get("pred", 0) + int(pred),
+            "target": out.get(f"{INTENTS[intent]}/{subgoal_name}", {}).get("target", 0) + int(target),
+        }
+    return out
+
+
 def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weights=None,
                  teacher_forcing_ratio: float = 0.0,
                  frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None):
@@ -492,6 +513,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 intent_pred = int(output.slow.intent_logits.argmax(-1)[0].item()) if output.slow is not None else -1
                 interact_pred = int((output.fast.button_logits[..., 0] > 0).sum().item())
                 interact_target = int((batch["button_target"][..., 0].to(output.fast.button_logits.device) > 0).sum().item())
+                interact_stages = _interact_stage_counts(
+                    output.fast.button_logits,
+                    batch["button_target"].to(output.fast.button_logits.device),
+                    batch["intent_target"].to(output.fast.button_logits.device),
+                    batch["subgoal_target"].to(output.fast.button_logits.device),
+                )
             print(
                 f"[step {step}/{args.steps}] total={float(total.detach().cpu()):.4f} "
                 f"move={float(losses['fast_move'].detach().cpu()):.4f} "
@@ -501,6 +528,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"move_nonstop_hit={move_hit:.3f} intent_pred={intent_pred} "
                 f"tf={_teacher_forcing_ratio(args, step - 1):.3f}", flush=True,
             )
+            if step == 1 or step % (log_interval * 4) == 0 or step == args.steps:
+                print(f"[interact_stage step={step}] {json.dumps(interact_stages, ensure_ascii=False)}", flush=True)
         if device.type == "cuda":
             peak_memory = max(peak_memory, torch.cuda.max_memory_allocated(device))
 

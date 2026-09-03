@@ -90,6 +90,19 @@ def test_mvp_split_keeps_train_nonempty_with_two_mixed_sessions():
     assert {r["slow_label"]["intent"] for r in val[0][1]} == {"travel", "decipher"}
 
 
+def test_interact_stage_counts_group_predictions_by_intent_and_subgoal():
+    import torch
+    from idv_agent.scripts.train_vla import _interact_stage_counts
+
+    predicted = torch.tensor([[[5.0] * 6] * 4, [[-5.0] * 6] * 4])
+    target = torch.tensor([[[1, 0, 0, 0, 0, 0]] * 4, [[0, 0, 0, 0, 0, 0]] * 4], dtype=torch.float32)
+    intent = torch.tensor([4, 0])  # travel, decipher
+    subgoal = torch.tensor([16, 2])
+    result = _interact_stage_counts(predicted, target, intent, subgoal)
+    assert result["travel/move_to_target"] == {"pred": 4, "target": 4}
+    assert result["decipher/start_decoding"] == {"pred": 0, "target": 0}
+
+
 def test_teacher_forcing_ratio_schedule_and_prediction_fallback():
     from argparse import Namespace
     import torch
