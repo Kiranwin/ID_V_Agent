@@ -4,19 +4,21 @@
 
 ## 1. 总体决定
 
-采用**单一共享 M0 + 两个任务头**，不是两个独立微调模型：
+采用**单一共享 M0 + 分离时序编码器 + 两个任务头**，不是两个独立微调模型：
 
 ```text
 每帧图像
   → M0 单帧 backbone（每帧最多一次）
   → FrameFeatureCache（滚动缓存）
-  → 共享时序编码器
-      ├─ Slow Head：低频 intent/subgoal/context
-      └─ Fast Head：高频 action chunk
+  → FiLM(condition)                    ← slow/fast 共用的调制输入
+      ├─ slow_temporal → Slow Head：低频 intent/subgoal/context
+      └─ fast_temporal → Fast Head：高频 action chunk
 ```
 
-慢头和快头可以有各自的小型投影层或 LoRA target，但不能复制一套完整视觉语言
-backbone。模式适配器仍按 `M0 + mode LoRA` 管理。
+慢头和快头共享 M0 backbone，但各自拥有独立的时序 GRU（`slow_temporal`/`fast_temporal`），
+消除了两者对同一份循环权重的竞争；不能复制一套完整视觉语言 backbone。FiLM 条件融合仍在
+分叉之前，是两者共用的输入路径（见第 3 节的耦合说明）。模式适配器仍按 `M0 + mode LoRA` 管理。
+架构变更记录见 [docs/18-架构变更历史.md](18-架构变更历史.md)。
 
 ## 2. 时序建模位置（冻结）
 
@@ -62,8 +64,11 @@ temporal_feature = temporal_encoder(
 通过 `valid_mask` 标记，不补造图像。第一版训练默认使用 8 帧滚动窗口，仍可从旧的
 3 帧样本迁移为带 mask 的短窗口。
 
-时序编码器使用轻量 causal Transformer/GRU，不能再次调用 M0。它只处理已经缓存的
-`frame_feature`，因此增加历史帧不会重复运行 backbone。
+时序编码器使用轻量 causal GRU，不能再次调用 M0。它只处理已经缓存的
+`frame_feature`，因此增加历史帧不会重复运行 backbone。慢头和快头分别使用
+`slow_temporal`/`fast_temporal` 两个独立 GRU 实例（2026-09-03 起，见
+[docs/18-架构变更历史.md](18-架构变更历史.md)），不再共用同一份循环权重；
+两者仍读取同一个 FiLM 调制后的 `frame_feature_window`。
 
 ## 3. context_embedding 融合机制（冻结）
 
@@ -85,14 +90,23 @@ conditioned_frame = LayerNorm(
 )
 ```
 
-同一个 `gamma/beta` 应用于当前窗口中的每个帧特征，然后再进入共享时序编码器；快头
-从时序特征读取慢层条件。在线推理这里使用的是**上一快/慢 tick 的跨 tick 状态**：
-上一份有效的慢层条件 `condition_{t-1}` 先调制当前窗口，慢头消费完当前窗口后生成
-`condition_t`，从下一采集帧开始生效。它不是把不同 episode 或不同训练样本的状态串接起来。
-离线训练样本彼此独立，每条样本都从安全的 `initial_condition` 开始，并在同一条样本
-内部做两遍前向（第一遍 Slow、第二遍 Fast）；因此不会发生跨样本状态泄漏。慢头输出的
-`context_embedding` 维度固定为 256。
-慢头 warm-up 阶段，快头损失对慢头输出使用 stop-gradient；联合训练稳定后再解除该限制。
+同一个 `gamma/beta` 应用于当前窗口中的每个帧特征，然后再分别进入 `slow_temporal`/
+`fast_temporal`；快头从自己的时序特征读取慢层条件。在线推理这里使用的是**上一快/慢
+tick 的跨 tick 状态**：上一份有效的慢层条件 `condition_{t-1}` 先调制当前窗口，慢头
+消费完当前窗口后生成 `condition_t`，从下一采集帧开始生效。它不是把不同 episode 或
+不同训练样本的状态串接起来。离线训练样本彼此独立，每条样本都从安全的
+`initial_condition` 开始，并在同一条样本内部做两遍前向（第一遍 Slow、第二遍 Fast）；
+因此不会发生跨样本状态泄漏。慢头输出的 `context_embedding` 维度固定为 256。
+
+**梯度耦合现状**：分离 `slow_temporal`/`fast_temporal` 只消除了两个头对同一份循环
+权重的竞争；FiLM 在分叉之前运行，是两者共用的输入路径。第二遍前向若使用
+`detach_slow_condition=False`（当前 `train_vla.py` 默认），快头损失仍会经
+`context_embedding → FiLMConditioner` 回传进 `slow_head`/`slow_temporal`——这是有意
+保留的耦合（否则快头学不到如何使用慢头上下文），已用
+`tests/test_two_pass_training_scheme_still_couples_fast_loss_into_slow_head` 实测确认，
+可用 `detach_slow_condition=True` 关闭。原计划的"慢头 warm-up 阶段 stop-gradient、
+联合训练稳定后解除"尚未实现为分阶段调度，目前是训练全程固定同一 `detach_slow_condition`
+取值；如需 warm-up 需在训练脚本按 step 切换该参数。
 
 接口定义：
 
@@ -131,11 +145,11 @@ Capture loop（例如 30 FPS）：
 
 Fast loop（例如 10/15 Hz）：
   按固定 deadline 读取 cache.latest_window(8)
-  → temporal_encoder → Fast Head → 执行动作块
+  → fast_temporal → Fast Head → 执行动作块
 
 Slow loop（例如 1 Hz 或事件触发）：
   读取同一 cache.latest_window(8)
-  → Slow Head → 更新 condition_t
+  → slow_temporal → Slow Head → 更新 condition_t
 ```
 
 如果捕获频率高于快头，期间的特征只进入缓存，不额外触发快头；如果快头快于捕获，
@@ -159,8 +173,8 @@ sleep”的相对延时写法。慢循环独立调度，不能阻塞快循环。
 - 慢头刷新不能阻塞快头，慢头计算期间快头继续使用上一份有效条件；
 - 若缓存为空或慢层条件过期，快头输出 `stop_or_replan`，由安全策略接管。
 
-目标频率为 15 Hz。15 Hz 是否达标只测 `encode_frame + temporal_encoder + fast_head` 的
-路径；慢头耗时单独统计，不计入快头每步预算。
+目标频率为 15 Hz。15 Hz 是否达标只测 `encode_frame + fast_temporal + fast_head` 的
+路径；慢头耗时（含 `slow_temporal`）单独统计，不计入快头每步预算。
 
 ## 5. 慢标签采样粒度（冻结）
 
@@ -229,9 +243,11 @@ anchor/历史帧中的 `slow_label.intent`。现有 v3 记录中的 `intent` 空
 ## 6. 训练与部署边界
 
 - WK/VG 训练更新 M0 的共享语义能力；
-- ACT 训练共享时序编码器、Slow Head 和 Fast Head；
+- ACT 训练同时更新 `slow_temporal`、`fast_temporal`、Slow Head 和 Fast Head；
+  两个 GRU 参数独立，但都下游于同一个 FiLM 条件融合（见第 3 节耦合说明）；
 - 快慢头使用联合损失，但先冻结 backbone，再逐步解冻顶部 LoRA；
-- 推理只有一个 M0 特征流，慢头和快头不各自重复跑视觉 backbone；
+- 推理只有一个 M0 特征流，慢头和快头不各自重复跑视觉 backbone（各自的时序 GRU
+  仍要分别跑一次，但都消费同一份 `frame_feature`，不重复调用 M0）；
 - 如果未来因显存或延迟必须拆成两个推理进程，仍从同一个 M0 checkpoint 导出，并视为
   部署复制，不得进行两套互不约束的独立微调。
 
@@ -246,7 +262,7 @@ ACT 训练不能把真实 `intent/subgoal` 永久喂给快头，否则会产生 
 视觉窗口 + condition(t-1)
         → Slow Head → (intent_hat, subgoal_hat, context_hat)
         → 按 teacher_forcing_ratio 在真实标签/预测之间采样离散条件
-        → FiLM + 时序编码 → Fast Head
+        → FiLM → fast_temporal → Fast Head
 ```
 
 `teacher_forcing_ratio` 默认从 1.0 线性退火到 0.0（训练步数范围内）；标签无效的样本

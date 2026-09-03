@@ -1,8 +1,15 @@
 """Composable fast/slow VLA core operating on cached frame features.
 
-Architecture change (2026-09-03): Separated temporal encoders to prevent
-gradient conflicts between slow (discrete classification) and fast (continuous
-control) objectives.  The two heads now have independent GRU paths.
+Architecture change (2026-09-03): the shared temporal GRU was split into
+``slow_temporal``/``fast_temporal``.  This removes competition over the
+*recurrent* parameters between the slow (discrete classification) and fast
+(continuous control) objectives.  It does **not** fully decouple the two
+losses: when the caller passes ``detach_slow_condition=False`` (the training
+default in ``train_vla.py``'s second pass), the fast loss still reaches
+``slow_head``/``slow_temporal`` through the FiLM ``context_embedding`` path,
+since that conditioning is applied before the temporal split.  That remaining
+channel is deliberate (it is how the fast head learns to use the slow head's
+context) and is controlled explicitly via ``detach_slow_condition``.
 """
 
 from __future__ import annotations
@@ -56,11 +63,16 @@ class FastSlowVLAOutput:
 class SharedFastSlowVLA(nn.Module):
     """Separated temporal encoders plus slow and fast heads.
 
-    Architecture change (2026-09-03): Slow and fast heads now use independent
-    GRU temporal encoders to prevent gradient conflicts.  The slow head learns
-    long-horizon intent transitions; the fast head learns short-horizon action
-    responses.  This increases parameters by ~2M (512-dim GRU × 2) but eliminates
-    the gradient tug-of-war between discrete classification and continuous control.
+    Architecture change (2026-09-03): slow and fast heads now use independent
+    GRU temporal encoders instead of one shared GRU, so the two objectives no
+    longer compete for the same recurrent weights.  This increases parameters
+    by ~1.2M (per ``temporal_dim``-sized GRU; negligible next to the frozen
+    vision-language backbone).  The FiLM conditioning path (``context_embedding``
+    -> ``FiLMConditioner``) still runs *before* the slow/fast split, so it
+    remains a shared, intentional coupling point: with
+    ``detach_slow_condition=False`` the fast loss can still update
+    ``slow_head``/``slow_temporal`` through that path.  See
+    ``docs/18-架构变更历史.md`` for the measured effect and remaining caveats.
 
     The visual backbone deliberately remains outside this module.  Runtime
     supplies cached per-frame features, ensuring the two heads cannot trigger
@@ -106,9 +118,11 @@ class SharedFastSlowVLA(nn.Module):
     ) -> FastSlowVLAOutput:
         """Forward pass with separated temporal encoders.
 
-        ``detach_slow_condition`` is now less critical because the two heads
-        no longer share temporal parameters.  It remains available for optional
-        ablation experiments.
+        ``detach_slow_condition`` still controls a real gradient path: FiLM
+        conditioning happens before the slow/fast split, so an attached
+        ``context_embedding`` lets the fast loss update ``slow_temporal``/
+        ``slow_head`` through the conditioner even though the two GRUs are
+        otherwise independent.
         """
         if frame_features.ndim == 2:
             frame_features = frame_features.unsqueeze(0)

@@ -33,11 +33,13 @@
 
 ## 关键概念速览
 
-- **动作空间**：VLA v3 九方向移动 + 五档相机桶 + 六个按键状态，见 `vla/action_chunk.py`。
-- **时序输入**：固定 3 帧历史，滚动预测 4 步宏动作块。
+- **动作空间**：VLA v4 九方向移动 + 五档相机桶 + 六个按键状态，见 `vla/action_chunk.py`。
+- **时序输入**：`FrameFeatureCache` 滚动窗口最多 8 帧（最少 3 帧，`valid_mask` 标记短窗口），滚动预测 4 步宏动作块。
+- **时序编码器已分离**：`SharedFastSlowVLA` 内 `slow_temporal`/`fast_temporal` 是两个独立 GRU，慢头（intent/subgoal）和快头（action chunk）梯度互不干扰，详见 `docs/18-架构变更历史.md` 与 `idv_agent/model/fast_slow_vla.py`。
+- **三阶段训练继承**：WK（游戏知识 LoRA）→ VG（视觉 grounding，冻结 lora_wk）→ ACT（动作块，冻结 Qwen 主干+两阶段 LoRA），后一阶段必须加载前一阶段 checkpoint，见 `docs/17-三阶段训练继承协议.md`。
 - **VG 标注**：YOLO 只保留 `cipher_visible/cipher_highlight/interact_prompt` 三类；帧状态由 `frame_states.jsonl` 标注 `decoding/idle/walking/chased`，转换后写入 VG JSON 的顶层 `state`。
 - **破译状态机**：第五人格按一次 Q 即自动破译（无后续按键事件），需识别该隐式状态并把解码段语义重写为 `INTERACT_HOLD`（`labels/state_machine.py`）。
-- **数据文件**：每 raw session 一个 `frames/`+`events.csv`+`mouse_positions.csv`+`frame_timestamps.csv`+`meta.json`，构建脚本产出 `vla_chunks.jsonl`。
+- **数据文件**：每 raw session 一个 `frames/`+`events.csv`+`mouse_deltas.csv`（Raw Input 相对位移）+`frame_timestamps.csv`+`meta.json`，构建脚本产出 `vla_chunks_v4.jsonl`。相机动作只来自 `mouse_deltas.csv`，不使用绝对坐标。
 - **训练精度**：RTX 2080 Ti 使用 FP16 + GradScaler；VLA 训练不再依赖旧 `samples.jsonl`/BC 管线。
 
 ## 变更工作流
@@ -45,7 +47,7 @@
 1. 先想清楚改哪一层，动 `configs` 前先看是否会影响下游（schema 是全局约定）。
 2. 每次小步改完跑相关测试（无 GPU/游戏也能跑)：`python -m idv_agent.scripts.smoke_test`。
 3. 改模型 / 训练逻辑时跑 `tests/` 或 `scripts/smoke_test` 里对应的 forward 检查。
-4. 涉及文档：所有内容写进 `docs/`，按编号命名（`01-审查报告`、`02-架构设计`…）。
+4. 涉及文档：所有内容写进 `docs/`，按编号命名（`03-数据格式`、`15-快慢VLA接口`…）；架构/性能类变更追加到 `docs/18-架构变更历史.md`，不新建编号文档。
 5. 提交前 `git status` 自查，不残留测试产物/临时文件。
 
 ## 反作弊操作知识（重要）

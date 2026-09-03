@@ -68,8 +68,14 @@ def test_separated_forward_produces_valid_outputs():
     assert output_fast.fast.move_logits.shape == (batch_size, 4, 9)
 
 
-def test_separated_temporal_gradient_flow_is_independent():
-    """Verify fast loss does not propagate to slow temporal encoder."""
+def test_single_pass_gradient_flow_is_independent_when_condition_is_fixed():
+    """A single forward call with a fixed (non-graph) condition keeps the two
+    GRUs fully independent: fast loss touches only fast_temporal, slow loss
+    touches only slow_temporal.  This is the cold-start case (condition comes
+    from ``initial_condition``, a fresh constant tensor with no autograd
+    history) -- it does NOT cover the two-pass training scheme, see the next
+    test for that.
+    """
     core = SharedFastSlowVLA(frame_feature_dim=64, temporal_dim=128, history_action_dim=72)
 
     batch_size = 1
@@ -79,18 +85,15 @@ def test_separated_temporal_gradient_flow_is_independent():
     condition = core.initial_condition(batch_size, device="cpu")
     history_actions = torch.zeros(batch_size, 72)
 
-    # Forward pass with detach_slow_condition=False (allow gradient flow to context_embedding)
     output = core(
         frame_features, condition,
         history_actions=history_actions,
         run_slow=True, detach_slow_condition=False
     )
 
-    # Compute a dummy fast loss (only affects fast head)
     fast_loss = output.fast.move_logits.sum()
     fast_loss.backward(retain_graph=True)
 
-    # Check gradients: fast_temporal should have gradients, slow_temporal should not
     fast_temporal_has_grad = any(
         p.grad is not None and p.grad.abs().sum() > 0
         for p in core.fast_temporal.parameters()
@@ -103,14 +106,11 @@ def test_separated_temporal_gradient_flow_is_independent():
     assert fast_temporal_has_grad, "Fast temporal should have gradients from fast loss"
     assert not slow_temporal_has_grad, "Slow temporal should NOT have gradients from fast loss"
 
-    # Clear gradients
     core.zero_grad()
 
-    # Compute a dummy slow loss (only affects slow head)
     slow_loss = output.slow.intent_logits.sum()
     slow_loss.backward()
 
-    # Now only slow_temporal should have gradients
     fast_temporal_has_grad = any(
         p.grad is not None and p.grad.abs().sum() > 0
         for p in core.fast_temporal.parameters()
@@ -124,8 +124,61 @@ def test_separated_temporal_gradient_flow_is_independent():
     assert slow_temporal_has_grad, "Slow temporal should have gradients from slow loss"
 
 
+def test_two_pass_training_scheme_still_couples_fast_loss_into_slow_head():
+    """Document the real (non-independent) behavior of train_vla.py's scheme.
+
+    Pass 1 runs the slow head; pass 2 builds ``next_condition`` from that
+    slow output via ``condition_from_slow_output`` and feeds it back with
+    ``detach_slow_condition=False``.  FiLM conditioning is applied *before*
+    the slow/fast split, so ``context_embedding`` -- and therefore
+    ``slow_head``/``slow_temporal`` -- still receives gradient from the fast
+    loss in this scheme.  Separating the GRUs removed competition over the
+    *recurrent* weights, but did not remove this FiLM coupling; that is
+    intentional (it is how the fast head learns to use slow context) and
+    remains controllable via ``detach_slow_condition``.
+    """
+    core = SharedFastSlowVLA(frame_feature_dim=64, temporal_dim=128, history_action_dim=72)
+
+    batch_size = 1
+    frame_features = torch.randn(batch_size, 8, 64)
+    condition = core.initial_condition(batch_size, device="cpu")
+    history_actions = torch.zeros(batch_size, 72)
+
+    slow_pass = core(frame_features, condition, history_actions=history_actions, run_slow=True)
+    next_condition = core.condition_from_slow_output(
+        slow_pass.slow, mode_id=torch.zeros(batch_size, dtype=torch.long)
+    )
+    fast_pass = core(frame_features, next_condition, history_actions=history_actions,
+                     run_slow=False, detach_slow_condition=False)
+
+    fast_pass.fast.move_logits.sum().backward()
+
+    slow_temporal_has_grad = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in core.slow_temporal.parameters()
+    )
+    slow_head_has_grad = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in core.slow_head.parameters()
+    )
+    assert slow_temporal_has_grad, "FiLM path should still couple fast loss into slow_temporal"
+    assert slow_head_has_grad, "FiLM path should still couple fast loss into slow_head"
+
+    # detach_slow_condition=True on the second pass removes this coupling.
+    core.zero_grad()
+    fast_pass_detached = core(frame_features, next_condition, history_actions=history_actions,
+                              run_slow=False, detach_slow_condition=True)
+    fast_pass_detached.fast.move_logits.sum().backward()
+    slow_temporal_has_grad = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in core.slow_temporal.parameters()
+    )
+    assert not slow_temporal_has_grad, "detach_slow_condition=True should block the FiLM coupling"
+
+
 if __name__ == "__main__":
     test_separated_temporal_encoders_have_independent_parameters()
     test_separated_forward_produces_valid_outputs()
-    test_separated_temporal_gradient_flow_is_independent()
+    test_single_pass_gradient_flow_is_independent_when_condition_is_fixed()
+    test_two_pass_training_scheme_still_couples_fast_loss_into_slow_head()
     print("All tests passed!")

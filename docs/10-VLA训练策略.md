@@ -67,12 +67,12 @@ YOLO 框可作为标注工具和辅助字段，但模型推理不能强依赖 YO
 
 ### 阶段 ACT · VLA 动作块监督
 
-ACT 必须加载 VG 阶段输出的 `M2_VG`，继承 `lora_wk` 与 VG 语义能力；第一轮冻结 Qwen 主干和两阶段 LoRA，只训练时序编码器、FiLM、Slow Head 和 Fast Head。完整继承链见 [17-三阶段训练继承协议.md](17-三阶段训练继承协议.md)。
+ACT 必须加载 VG 阶段输出的 `M2_VG`，继承 `lora_wk` 与 VG 语义能力；第一轮冻结 Qwen 主干和两阶段 LoRA，只训练 `slow_temporal`/`fast_temporal`（分离时序编码器，见 [18-架构变更历史.md](18-架构变更历史.md)）、FiLM、Slow Head 和 Fast Head。完整继承链见 [17-三阶段训练继承协议.md](17-三阶段训练继承协议.md)。
 
 在继承后的模型上训练因果动作块：
 
 ```text
-3 帧 + <mode:...> + 任务指令 + 历史动作
+最多 8 帧滚动窗口（最少 3 帧，valid_mask 标记短窗口）+ <mode:...> + 任务指令 + 历史动作
 → 4 步 move_dir / camera buckets / buttons / duration
 ```
 
