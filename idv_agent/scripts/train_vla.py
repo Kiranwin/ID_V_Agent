@@ -251,7 +251,18 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
             cache_by_task[task_key] = adapter.encode_task_once(instruction, mode, task_id=f"{instruction}:{mode}")
         cache = cache_by_task[task_key]
         row = [None] * len(paths)
-        for col_index, (path, image) in enumerate(zip(paths, _load_images(paths))):
+        images = []
+        load_paths = []
+        for path in paths:
+            path_key = (instruction, int(mode_id), str(path) if path is not None else "<pad>")
+            if path is None or path_key in batch_frame_cache or (frame_cache is not None and path_key in frame_cache) or (raw_feature_cache is not None and path in raw_feature_cache):
+                images.append(None)
+            else:
+                images.append("__LOAD__")
+                load_paths.append(path)
+        loaded = iter(_load_images(load_paths))
+        images = [next(loaded) if image == "__LOAD__" else image for image in images]
+        for col_index, (path, image) in enumerate(zip(paths, images)):
             cache_key = (instruction, int(mode_id),
                          str(path) if path is not None else "<pad>")
             if path is not None and cache_key in batch_frame_cache:
