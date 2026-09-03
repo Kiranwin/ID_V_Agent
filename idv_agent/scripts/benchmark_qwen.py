@@ -61,14 +61,23 @@ def _stats(values):
             "hz_capacity": 1000.0 / max(values)}
 
 
+def _sync(device: str) -> None:
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def run(adapter, cache, *, seconds: float, device: str):
     width = adapter.hidden_size
     try:
         model_dtype = next(adapter.model.parameters()).dtype
     except StopIteration:
         model_dtype = torch.float32
+    # The adapter's trainable visual projection (and the ACT heads in the
+    # checkpoint) are FP32 even when Qwen's frozen tower is FP16.  Keep this
+    # benchmark on the same deployment dtype; otherwise a mixed-dtype error
+    # occurs before any latency samples are collected.
     core = SharedFastSlowVLA(frame_feature_dim=width, temporal_dim=min(256, width)).to(
-        device=device, dtype=model_dtype).eval()
+        device=device, dtype=torch.float32).eval()
     # Pass a PIL image so the real Qwen processor supplies image_grid_thw;
     # fake mode accepts it as well.
     image = Image.new("RGB", (224, 224), color=(0, 0, 0))
@@ -76,17 +85,45 @@ def run(adapter, cache, *, seconds: float, device: str):
     with torch.inference_mode():
         for _ in range(3):
             feat = adapter.encode_frame(image, cache)
-            out = core.temporal(feat.view(1, 1, -1))
+            # Match temporal auxiliary inputs to the loaded model dtype.  The
+            # real Qwen path is FP16 on CUDA; TemporalEncoder otherwise
+            # receives its default FP32 time-delta tensor and fails in the
+            # Linear projection before latency can be measured.
+            feat = feat.to(dtype=torch.float32)
+            out = core.temporal(feat.view(1, 1, -1),
+                                time_deltas=torch.zeros((1, 1), device=feat.device,
+                                                         dtype=feat.dtype))
             core.fast_head(out)
+        _sync(device)
         samples = []
+        encode_samples = []
+        fast_samples = []
+        slow_samples = []
         deadline = time.perf_counter() + seconds
         while time.perf_counter() < deadline or len(samples) < 10:
+            _sync(device)
             t0 = time.perf_counter()
             feat = adapter.encode_frame(image, cache)
-            temporal = core.temporal(feat.view(1, 1, -1))
+            _sync(device)
+            encode_samples.append((time.perf_counter() - t0) * 1000.0)
+            feat = feat.to(dtype=torch.float32)
+            t1 = time.perf_counter()
+            temporal = core.temporal(feat.view(1, 1, -1),
+                                     time_deltas=torch.zeros((1, 1), device=feat.device,
+                                                              dtype=feat.dtype))
             core.fast_head(temporal)
+            _sync(device)
+            fast_samples.append((time.perf_counter() - t1) * 1000.0)
+            t2 = time.perf_counter()
+            core.slow_head(temporal)
+            _sync(device)
+            slow_samples.append((time.perf_counter() - t2) * 1000.0)
             samples.append((time.perf_counter() - t0) * 1000.0)
-    return _stats(samples)
+    result = _stats(samples)
+    result["encode"] = _stats(encode_samples)
+    result["fast_core"] = _stats(fast_samples)
+    result["slow_head"] = _stats(slow_samples)
+    return result
 
 
 def main(argv=None) -> int:
@@ -116,6 +153,9 @@ def main(argv=None) -> int:
           f"p50={result['p50_ms']:.2f}ms p95={result['p95_ms']:.2f}ms "
           f"capacity={result['hz_capacity']:.2f}Hz target={args.target_hz:.1f}Hz "
           f"budget={budget_ms:.2f}ms meets={result['meets_15hz']}")
+    for name in ("encode", "fast_core", "slow_head"):
+        stats = result[name]
+        print(f"{name}=mean={stats['mean_ms']:.2f}ms p50={stats['p50_ms']:.2f}ms p95={stats['p95_ms']:.2f}ms")
     return 0 if result["meets_15hz"] else 2
 
 

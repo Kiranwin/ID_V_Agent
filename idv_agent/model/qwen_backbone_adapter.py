@@ -252,8 +252,18 @@ class Qwen3VLBackboneAdapter(nn.Module):
             grids = merged["image_grid_thw"].tolist()
             vision_config = getattr(getattr(self.model, "config", None), "vision_config", None)
             merge_size = int(getattr(vision_config, "spatial_merge_size", 2))
-            counts = [max(1, int(t * h * w // (merge_size * merge_size))) for t, h, w in grids]
-            if sum(counts) != out.shape[0]:
+            # Qwen3-VL versions differ: some return one row per unmerged
+            # patch (t*h*w), while others return spatially merged rows.  The
+            # public helper does not expose which form it used, so derive the
+            # split from the actual row count and accept either convention.
+            unmerged_counts = [max(1, int(t * h * w)) for t, h, w in grids]
+            merged_counts = [max(1, int(t * h * w // (merge_size * merge_size)))
+                             for t, h, w in grids]
+            if sum(unmerged_counts) == out.shape[0]:
+                counts = unmerged_counts
+            elif sum(merged_counts) == out.shape[0]:
+                counts = merged_counts
+            else:
                 raise ValueError("无法按 image_grid_thw 拆分批量视觉输出")
             pooled = torch.stack([chunk.mean(dim=0) for chunk in out.split(counts, dim=0)])
         else:

@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
 # 数据与产物（体积大、不入库）
 data/
@@ -14,12 +15,12 @@ outputs/
 *.pth
 *.safetensors
 *.onnx
-
+reports/
 # 本地配置
 .env
 .vscode/
 .worktrees/
-
+tmp/
 # 系统
 Thumbs.db
 .DS_Store

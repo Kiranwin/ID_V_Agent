@@ -712,28 +712,33 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
                                           frame_cache=frame_cache, frame_stats=frame_stats,
                                           raw_feature_cache=raw_feature_cache)
             losses.append(float(values["total"].detach().cpu()))
-            mask = batch["fast_loss_mask"].to(output.fast.move_logits.device).bool()
+            # Collators intentionally keep supervision tensors on CPU.  Move
+            # every tensor participating in boolean indexing to the output
+            # device; indexing a CPU target with the CUDA mask raises during
+            # the final validation pass after training.
+            output_device = output.fast.move_logits.device
+            mask = batch["fast_loss_mask"].to(output_device).bool()
             for value in output.fast.move_logits.argmax(-1)[mask].detach().cpu().reshape(-1).tolist():
                 move_pred[int(value)] += 1
-            targets = batch["move_target"][mask].detach().cpu().reshape(-1).tolist()
+            targets = batch["move_target"].to(output_device)[mask].detach().cpu().reshape(-1).tolist()
             for value in targets:
                 move_target[int(value)] += 1
-            target_tensor = batch["move_target"][mask]
+            target_tensor = batch["move_target"].to(output_device)[mask]
             pred_tensor = output.fast.move_logits.argmax(-1)[mask]
             non_stop = target_tensor != 0
             non_stop_total += int(non_stop.sum())
             non_stop_pred += int(((pred_tensor != 0) & non_stop).sum())
             button_logits = output.fast.button_logits[mask]
-            button_targets = batch["button_target"][mask]
+            button_targets = batch["button_target"].to(output_device)[mask]
             button_pred_tensor = (button_logits > 0).to(torch.int64)
             for i in range(button_pred_tensor.shape[-1]):
                 button_pred[i] += int(button_pred_tensor[..., i].sum())
                 button_target[i] += int((button_targets[..., i] > 0).sum())
             if output.slow is not None:
-                valid = batch["intent_target"] >= 0
+                valid = (batch["intent_target"].to(output_device) >= 0)
                 for value in output.slow.intent_logits.argmax(-1)[valid].detach().cpu().tolist():
                     intent_pred[int(value)] += 1
-                for value in batch["intent_target"][valid].detach().cpu().tolist():
+                for value in batch["intent_target"].to(output_device)[valid].detach().cpu().tolist():
                     intent_target[int(value)] += 1
     # Slow-accuracy pass reuses the same cache (and stats) so its forward
     # re-encodes nothing the loss pass above already encoded; the reported

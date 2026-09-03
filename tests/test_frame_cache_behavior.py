@@ -1,7 +1,9 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from PIL import Image
+import pytest
 
 
 class _Adapter(torch.nn.Module):
@@ -132,6 +134,74 @@ def test_qwen_batch_singleton_keeps_batch_dimension():
     task = TaskConditionCache(torch.zeros(2), torch.zeros(2), task_id="t")
     result = adapter.encode_frames([[[1.0, 2.0]]], task)
     assert result.shape == (1, 2)
+
+
+def test_evaluate_moves_cpu_targets_before_gpu_mask_indexing(monkeypatch):
+    """Evaluation must accept the collator's CPU targets with CUDA outputs."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA to reproduce device-mismatch indexing")
+    import idv_agent.scripts.train_vla as train_vla
+
+    class Module(torch.nn.Module):
+        pass
+
+    adapter, core = Module(), Module()
+    device = torch.device("cuda")
+    fast = SimpleNamespace(
+        move_logits=torch.zeros(1, 2, 9, device=device),
+        button_logits=torch.zeros(1, 2, 6, device=device),
+    )
+    slow = SimpleNamespace(intent_logits=torch.zeros(1, 8, device=device))
+    output = SimpleNamespace(fast=fast, slow=slow)
+    batch = {
+        "fast_loss_mask": torch.tensor([[True, False]]),
+        "move_target": torch.tensor([[1, 0]]),
+        "button_target": torch.zeros(1, 2, 6),
+        "intent_target": torch.tensor([0]),
+    }
+    monkeypatch.setattr(train_vla, "forward_loss", lambda *args, **kwargs: ({"total": torch.tensor(1.)}, output))
+    monkeypatch.setattr(train_vla, "_slow_accuracy", lambda *args, **kwargs: 1.0)
+
+    result = train_vla._evaluate(adapter, core, [batch], device, amp_enabled=False)
+    assert result["move_target_counts"][1] == 1
+    assert result["button_target_positive_counts"][0] == 0
+
+
+def test_qwen_batch_splits_unmerged_flattened_visual_tokens():
+    """Qwen may return one flattened row per patch (before spatial merge)."""
+    from types import SimpleNamespace
+    from idv_agent.model.qwen_backbone_adapter import Qwen3VLBackboneAdapter
+    from idv_agent.model.temporal import TaskConditionCache
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                text_config=SimpleNamespace(hidden_size=2, vocab_size=8),
+                vision_config=SimpleNamespace(spatial_merge_size=2),
+            )
+
+        def get_image_features(self, pixel_values, image_grid_thw, **kwargs):
+            # Two images, each grid has 4 unmerged patch rows.  The real
+            # Qwen3-VL path returns [sum(t*h*w), D] in this case.
+            return torch.arange(16, dtype=torch.float32).reshape(8, 2)
+
+    class Processor:
+        def image_processor(self, *, images, return_tensors="pt"):
+            return {
+                "pixel_values": torch.zeros(1, 1, 2),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            }
+
+    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor())
+    adapter.visual_projection = torch.nn.Linear(2, 2, bias=False)
+    adapter.visual_projection.weight.data.copy_(torch.eye(2))
+    adapter.condition_projection = torch.nn.Linear(4, 2, bias=False)
+    adapter.condition_projection.weight.data.zero_()
+    task = TaskConditionCache(torch.zeros(2), torch.zeros(2), task_id="t")
+    result = adapter.encode_frames([[[1.0, 2.0]], [[3.0, 4.0]]], task)
+    assert result.shape == (2, 2)
+    assert torch.equal(result[:, 0], torch.tensor([3.0, 11.0]))
 
 
 def test_raw_feature_projection_matches_encode_frames_exactly():
