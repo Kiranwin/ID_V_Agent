@@ -40,7 +40,8 @@ class ACTPolicy:
                  send: Callable[[Iterable[Any]], None] | None = None,
                  capture_fps: float = 30.0, fast_hz: float = 15.0,
                  slow_hz: float = 1.0, history_frames: int = 3,
-                 max_feature_age_s: float = 0.5, cam_pixel_scale: float = 120.0):
+                 max_feature_age_s: float = 0.5, cam_pixel_scale: float = 120.0,
+                 use_time_deltas: bool = False, zero_history: bool = False):
         if mode not in GAME_MODE_CHOICES:
             raise ValueError(f"未知模式: {mode}")
         if not instruction.strip():
@@ -54,6 +55,10 @@ class ACTPolicy:
         self.mode_id = GAME_MODE_CHOICES.index(mode)
         self.instruction = instruction
         self.history_frames = int(history_frames)
+        if self.history_frames > 8:
+            raise ValueError("history_frames 不能超过 8")
+        self.use_time_deltas = bool(use_time_deltas)
+        self.zero_history = bool(zero_history)
         self.task_cache: TaskConditionCache = adapter.encode_task_once(
             instruction, mode, task_id=f"act:{id(self)}")
         self.features = FrameFeatureCache(max_length=max(8, self.history_frames))
@@ -106,12 +111,12 @@ class ACTPolicy:
     def _run_slow_if_due(self, now: float) -> None:
         if not self.ready or now - self._last_slow < self.slow_period:
             return
-        values, timestamps, valid = self.features.window(self.history_frames)
-        deltas = (timestamps - timestamps[-1]).to(values.dtype) / 1_000_000_000.0
+        values, deltas, valid = self._temporal_inputs()
+        history = torch.zeros_like(self.history_actions) if self.zero_history else self.history_actions
         with torch.inference_mode():
             output = self.core(values.unsqueeze(0), self.condition,
-                               valid_mask=valid.unsqueeze(0), time_deltas=deltas.unsqueeze(0),
-                               history_actions=self.history_actions, run_slow=True)
+                               valid_mask=valid.unsqueeze(0), time_deltas=None if deltas is None else deltas.unsqueeze(0),
+                               history_actions=history, run_slow=True)
         self.condition = self.core.condition_from_slow_output(output.slow,
                                                                self.condition.mode_id)
         self._last_slow = now
@@ -120,12 +125,12 @@ class ACTPolicy:
               f"subgoal={int(self.condition.subgoal_id[0])}")
 
     def _predict_chunk(self, _feature: object) -> list[ACTActionStep]:
-        values, timestamps, valid = self.features.window(self.history_frames)
-        deltas = (timestamps - timestamps[-1]).to(values.dtype) / 1_000_000_000.0
+        values, deltas, valid = self._temporal_inputs()
+        history = torch.zeros_like(self.history_actions) if self.zero_history else self.history_actions
         with torch.inference_mode():
             output = self.core(values.unsqueeze(0), self.condition,
-                               valid_mask=valid.unsqueeze(0), time_deltas=deltas.unsqueeze(0),
-                               history_actions=self.history_actions, run_slow=False)
+                               valid_mask=valid.unsqueeze(0), time_deltas=None if deltas is None else deltas.unsqueeze(0),
+                               history_actions=history, run_slow=False)
         fast = output.fast
         moves = fast.move_logits.argmax(-1)[0].tolist()
         dxs = fast.camera_dx_logits.argmax(-1)[0].tolist()
@@ -141,13 +146,23 @@ class ACTPolicy:
         age_ms = max(0.0, time.perf_counter() - latest.timestamp_ns / 1_000_000_000.0) * 1000
         self._prediction_count += 1
         fingerprint = float(values[-1].detach().float().mean().cpu())
+        chunk_text = ";".join(f"{MOVE_DIRECTIONS[s.move_dir]}/{s.camera_dx},{s.camera_dy}/"
+                              f"{','.join(n for n,v in zip(BUTTON_NAMES,s.buttons) if v) or '-'}@{s.duration_frames}"
+                              for s in steps)
         print(f"[act] pred={self._prediction_count} frame={latest.frame_index} "
               f"intent={INTENTS[int(self.condition.intent_id[0])]} "
               f"move={MOVE_DIRECTIONS[first.move_dir]}({first.move_dir}) "
               f"camera=({first.camera_dx},{first.camera_dy}) "
               f"buttons={pressed} duration={first.duration_frames} "
-              f"feature_mean={fingerprint:.5f} feature_age_ms={age_ms:.1f}")
+              f"feature_mean={fingerprint:.5f} feature_age_ms={age_ms:.1f} chunk={chunk_text}")
         return steps
+
+    def _temporal_inputs(self):
+        values, timestamps, valid = self.features.window(self.history_frames)
+        deltas = None
+        if self.use_time_deltas:
+            deltas = (timestamps - timestamps[-1]).to(values.dtype) / 1_000_000_000.0
+        return values, deltas, valid
 
     def tick(self, *, now: float | None = None) -> bool:
         """Run due slow/fast ticks. ``now`` is a monotonic seconds timestamp."""
@@ -160,7 +175,8 @@ class ACTPolicy:
             return False
         self.scheduler.update_feature(latest, timestamp=latest.timestamp_ns / 1_000_000_000.0)
         active = self.scheduler.tick(now=current)
-        self.history_actions = self.executor.history_tensor(device=self.device)
+        self.history_actions = (torch.zeros_like(self.history_actions)
+                                if self.zero_history else self.executor.history_tensor(device=self.device))
         return active
 
     def shutdown(self) -> None:

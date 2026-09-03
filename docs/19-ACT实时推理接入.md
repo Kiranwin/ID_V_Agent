@@ -21,4 +21,14 @@ python -m idv_agent.scripts.run_agent `
   --duration 30
 ```
 
+## 训练/离线对齐诊断开关
+
+离线 `evaluate_vla.py` 使用 8 帧视觉窗口、数据集中真实 `history_actions`，且不注入时间差（等价全零 `time_deltas`）。早期实机闭环默认 3 帧窗口、自回归 history、并注入真实负时间差，导致输入分布与训练不一致。为隔离「输入协议不一致」与「模型动作头塌缩」，ACT 运行时提供三个对齐开关：
+
+- `--history-frames 8`：改用 8 帧窗口，对齐训练/离线评估。
+- `--use-time-deltas`：显式注入真实帧时间差；默认关闭以对齐训练。
+- `--zero-history`：诊断模式，每次推理都用全零 history，不读取执行器历史（可单独观察自回归 history 的影响）。
+
+对齐复现建议：先用 `--history-frames 8`（不传 `--use-time-deltas`、不传 `--zero-history`）复现最接近离线的条件；再逐步开启 `--zero-history`、`--use-time-deltas` 对照，观察完整 4-step `chunk=` 序列与 logits 差异。
+
 实机发送只在确认处于官方自定义剧本/训练模式后显式加入 `--send-input`。建议先用默认 dry-run 检查动作日志，再进行发送测试。

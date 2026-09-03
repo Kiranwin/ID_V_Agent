@@ -50,6 +50,8 @@ def build_policy(args, device):
             instruction=args.instruction, mode=args.game_mode, device=device,
             capture_fps=args.fps, fast_hz=args.fast_hz, slow_hz=args.slow_hz,
             history_frames=args.history_frames,
+            use_time_deltas=args.use_time_deltas,
+            zero_history=args.zero_history,
             max_feature_age_s=args.max_feature_age_s,
             cam_pixel_scale=args.cam_pixel_scale,
         )
@@ -139,6 +141,10 @@ def main(argv=None) -> int:
     p.add_argument("--fast-hz", type=float, default=15.0)
     p.add_argument("--slow-hz", type=float, default=1.0)
     p.add_argument("--history-frames", type=int, default=3)
+    p.add_argument("--use-time-deltas", action="store_true",
+                   help="将真实帧时间差送入 temporal GRU；默认关闭以对齐训练/离线评估")
+    p.add_argument("--zero-history", action="store_true",
+                   help="诊断模式：每次推理都使用全零 history，不读取执行器历史")
     p.add_argument("--max-feature-age-s", type=float, default=0.5)
     test_group = p.add_mutually_exclusive_group()
     test_group.add_argument("--test-image", action="append", default=None,

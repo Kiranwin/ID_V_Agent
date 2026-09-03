@@ -27,6 +27,28 @@ def test_act_policy_cold_start_uses_travel_and_waits_for_three_frames():
     assert policy.observe(1, frame_index=1, timestamp_ns=2) is False
 
 
+def test_act_policy_alignment_controls_window_and_time_deltas():
+    core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
+    policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
+                       device="cpu", history_frames=8, use_time_deltas=False)
+    assert policy.history_frames == 8
+    assert policy.use_time_deltas is False
+    for i in range(8):
+        policy.observe(1, frame_index=i, timestamp_ns=i + 1)
+    features, deltas, valid = policy._temporal_inputs()
+    assert features.shape == (8, 4)
+    assert deltas is None
+    assert valid.shape == (8,)
+
+
+def test_act_policy_zero_history_diagnostic_does_not_consume_executor_history():
+    core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
+    policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
+                       device="cpu", zero_history=True)
+    assert policy.zero_history is True
+    assert torch.count_nonzero(policy.history_actions).item() == 0
+
+
 def test_act_policy_logs_action_chunk_metadata(capsys):
     core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
     policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
@@ -44,6 +66,7 @@ def test_act_policy_logs_action_chunk_metadata(capsys):
     assert "buttons=" in output
     assert "duration=" in output
     assert "feature_mean=" in output
+    assert "chunk=" in output
 
 
 def test_act_policy_uses_real_history_after_executor_starts_a_step():
