@@ -214,7 +214,8 @@ def _stratified_subset(dataset, limit: int, *, seed: int = 0,
 def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: torch.device,
                  frame_cache: dict[tuple[str, int, str], torch.Tensor] | None = None,
                  frame_stats: dict[str, int] | None = None,
-                 vision_micro_batch_size: int = 8) -> torch.Tensor:
+                 vision_micro_batch_size: int = 8,
+                 raw_feature_cache: Any | None = None) -> torch.Tensor:
     """Encode real images in vision micro-batches and return ``[B, L, D]`` features.
 
     ``frame_cache`` deduplicates vision-tower forwards across calls by task and
@@ -262,6 +263,16 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
                 row[col_index] = frame_cache[cache_key].to(device=device)
                 if frame_stats is not None:
                     frame_stats["hits"] += 1
+                continue
+            if path is not None and raw_feature_cache is not None and path in raw_feature_cache:
+                project = getattr(adapter, "project_raw_features", None)
+                if project is None:
+                    raise TypeError("raw_feature_cache 需要 adapter.project_raw_features")
+                feature = project(raw_feature_cache.get(path).to(device=device).reshape(1, -1), cache)[0]
+                batch_frame_cache[cache_key] = feature
+                row[col_index] = feature
+                if frame_stats is not None:
+                    frame_stats["raw_cache_hits"] = frame_stats.get("raw_cache_hits", 0) + 1
                 continue
             if image is None:
                 row[col_index] = torch.zeros(adapter.hidden_size, device=device, dtype=next(adapter.parameters()).dtype)
@@ -334,7 +345,8 @@ def _scheduled_condition(core, slow, model_batch, *, teacher_forcing_ratio: floa
 def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weights=None,
                  teacher_forcing_ratio: float = 0.0,
                  frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None,
-                 vision_micro_batch_size: int = 8):
+                 vision_micro_batch_size: int = 8,
+                 raw_feature_cache: Any | None = None):
     """Forward + loss for one batch.
 
     ``frame_cache``/``frame_stats`` are passed through to ``encode_batch``.
@@ -347,7 +359,8 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
     model_batch = _model_inputs(batch, device)
     frame_features = encode_batch(adapter, batch, device=device,
                                   frame_cache=frame_cache, frame_stats=frame_stats,
-                                  vision_micro_batch_size=vision_micro_batch_size)
+                                  vision_micro_batch_size=vision_micro_batch_size,
+                                  raw_feature_cache=raw_feature_cache)
     condition = core.initial_condition(frame_features.shape[0], device=device,
                                        mode_id=0)
     # Keep the per-record mode conditioning from v4 (normally all rows in the
@@ -410,6 +423,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     # selecting a size that fits the available GPU memory.
     batch_size = max(1, int(args.batch_size))
     vision_micro_batch_size = max(1, int(getattr(args, "vision_micro_batch_size", 8)))
+    raw_feature_cache = None
+    if getattr(args, "raw_feature_cache", ""):
+        from idv_agent.training.raw_feature_cache import RawFeatureCache
+        raw_feature_cache = RawFeatureCache(args.raw_feature_cache)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                         collate_fn=VLASequenceCollator(max_frames=8))
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
@@ -473,6 +490,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     baseline_losses, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=amp_enabled,
                                       vision_micro_batch_size=vision_micro_batch_size,
+                                      raw_feature_cache=raw_feature_cache,
                                       loss_weights=loss_weights,
                                       teacher_forcing_ratio=_teacher_forcing_ratio(args, 0))
     baseline = float(baseline_losses["total"].detach().cpu())
@@ -492,6 +510,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         optimizer.zero_grad(set_to_none=True)
         losses, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
                                       vision_micro_batch_size=vision_micro_batch_size,
+                                      raw_feature_cache=raw_feature_cache,
                                       loss_weights=loss_weights,
                                       teacher_forcing_ratio=_teacher_forcing_ratio(args, step - 1))
         total = losses["total"]
@@ -720,6 +739,8 @@ def main(argv=None) -> int:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--vision-micro-batch-size", type=int, default=8,
                         help="每次送入视觉塔的图像数；2080 Ti 建议从 4/8 试起")
+    parser.add_argument("--raw-feature-cache", default="",
+                        help="增量预编码的冻结视觉特征目录；启用后训练查表")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--max-samples", type=int, default=32)
     parser.add_argument("--temporal-dim", type=int, default=256)
