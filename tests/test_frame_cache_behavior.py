@@ -164,6 +164,30 @@ def test_raw_feature_projection_matches_encode_frames_exactly():
     assert torch.equal(direct, projected)
 
 
+def test_raw_feature_projection_matches_single_frame_exactly():
+    from types import SimpleNamespace
+    from idv_agent.model.qwen_backbone_adapter import Qwen3VLBackboneAdapter
+    from idv_agent.model.temporal import TaskConditionCache
+    class Visual(torch.nn.Module):
+        def forward(self, hidden_states=None, grid_thw=None, **kwargs):
+            return hidden_states.mean(dim=1, keepdim=True)
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.visual = Visual()
+            self.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=2, vocab_size=8))
+    class Processor:
+        def image_processor(self, *, images, return_tensors="pt"):
+            return {"pixel_values": torch.as_tensor(images).reshape(1, 1, 2),
+                    "image_grid_thw": torch.tensor([[1, 1, 1]])}
+    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor())
+    adapter.visual_projection = torch.nn.Linear(2, 2, bias=False)
+    adapter.condition_projection = torch.nn.Linear(4, 2, bias=False)
+    task = TaskConditionCache(torch.tensor([1., 2.]), torch.tensor([3., 4.]), task_id="t")
+    image = [[[1., 2.]]]
+    assert torch.equal(adapter.encode_frame(image, task),
+                       adapter.project_raw_features(adapter.encode_raw_frames([image]), task)[0])
+
+
 def test_incremental_raw_cache_adds_only_new_paths(tmp_path):
     from idv_agent.training.raw_feature_cache import RawFeatureCache
     cache = RawFeatureCache(tmp_path / "cache")
@@ -177,6 +201,19 @@ def test_incremental_raw_cache_adds_only_new_paths(tmp_path):
     assert loaded.count == 3
     assert torch.equal(loaded.get(tmp_path / "b.png"), features[1])
     assert torch.equal(loaded.get(tmp_path / "c.png"), torch.tensor([5., 6.]))
+
+
+def test_raw_cache_reuses_loaded_shard(tmp_path, monkeypatch):
+    from idv_agent.training.raw_feature_cache import RawFeatureCache
+    cache = RawFeatureCache(tmp_path / "cache")
+    path = tmp_path / "a.png"
+    cache.add_shard("s", [path], torch.tensor([[1., 2.]])); cache.save()
+    loaded = RawFeatureCache(tmp_path / "cache")
+    calls = []
+    original = torch.load
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: (calls.append(args[0]), original(*args, **kwargs))[1])
+    loaded.get(path); loaded.get(path)
+    assert len(calls) == 1
 
 
 def test_encode_batch_uses_raw_cache_and_keeps_projection_gradient(tmp_path):

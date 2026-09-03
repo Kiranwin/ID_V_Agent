@@ -330,6 +330,9 @@ class Qwen3VLBackboneAdapter(nn.Module):
         if instruction_embedding is None or mode_embedding is None:
             raise ValueError("必须提供 task_cache 或 instruction/mode embedding")
         visual = self._visual_forward(self._prepare_image(image))
+        if task_cache is not None:
+            instruction_embedding = task_cache.instruction_embedding
+            mode_embedding = task_cache.mode_embedding
         ins = instruction_embedding.to(visual).reshape(-1)
         mode = mode_embedding.to(visual).reshape(-1)
         if ins.numel() != self.hidden_size or mode.numel() != self.hidden_size:

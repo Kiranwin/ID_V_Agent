@@ -22,6 +22,7 @@ class RawFeatureCache:
     def __init__(self, root: str | Path):
         self.root = Path(root)
         self.index_path = self.root / "index.json"
+        self._shard_cache: dict[str, torch.Tensor] = {}
         self.index = json.loads(self.index_path.read_text(encoding="utf-8")) if self.index_path.is_file() else {
             "schema": "vla.raw_feature_cache.v1", "pooling": POOLING_VERSION,
             "features": {}, "shards": {}, "raw_dim": None, "dtype": None,
@@ -33,7 +34,11 @@ class RawFeatureCache:
     def get(self, path: str | Path) -> torch.Tensor:
         key = normalize_frame_path(path)
         entry = self.index["features"][key]
-        shard = torch.load(self.root / entry["shard"], map_location="cpu", weights_only=True)
+        shard_name = entry["shard"]
+        shard = self._shard_cache.get(shard_name)
+        if shard is None:
+            shard = torch.load(self.root / shard_name, map_location="cpu", weights_only=True)
+            self._shard_cache[shard_name] = shard
         return shard[entry["offset"]]
 
     def add_shard(self, session_id: str, paths: Iterable[str | Path], features: torch.Tensor) -> int:

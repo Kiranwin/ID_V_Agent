@@ -607,8 +607,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "peak_memory_mb": peak_memory / (1024 * 1024), "elapsed_sec": elapsed,
             "manifest": str(manifest_path.resolve()),
             "checkpoint_manifest_embedded": True,
-            "slow_accuracy": _slow_accuracy(adapter, core, eval_loader, device, amp_enabled),
-            "val": (_evaluate(adapter, core, val_loader, device, amp_enabled)
+            "slow_accuracy": _slow_accuracy(adapter, core, eval_loader, device, amp_enabled,
+                                             raw_feature_cache=raw_feature_cache),
+            "val": (_evaluate(adapter, core, val_loader, device, amp_enabled,
+                              raw_feature_cache=raw_feature_cache)
                     if val_loader is not None else None)}
     (checkpoint.parent / "metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -616,7 +618,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _slow_accuracy(adapter, core, loader, device, amp_enabled, *, max_samples: int | None = None,
-                   frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None):
+                   frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None,
+                   raw_feature_cache: Any | None = None):
     """Compute slow intent accuracy over every sample in the training subset.
 
     Runs under ``eval()`` + ``torch.no_grad()``, so a frame cache is safe;
@@ -632,7 +635,8 @@ def _slow_accuracy(adapter, core, loader, device, amp_enabled, *, max_samples: i
             if max_samples is not None and total >= max_samples:
                 break
             _, out = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
-                                  frame_cache=cache, frame_stats=frame_stats)
+                                  frame_cache=cache, frame_stats=frame_stats,
+                                  raw_feature_cache=raw_feature_cache)
             target = batch["intent_target"]
             valid = target != -100
             if bool(valid.any()):
@@ -642,7 +646,7 @@ def _slow_accuracy(adapter, core, loader, device, amp_enabled, *, max_samples: i
     return (float(correct / total) if total else None)
 
 
-def _evaluate(adapter, core, loader, device, amp_enabled):
+def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: Any | None = None):
     """Evaluate a bounded validation loader without updating model parameters."""
     if loader is None:
         return None
@@ -665,7 +669,8 @@ def _evaluate(adapter, core, loader, device, amp_enabled):
     with torch.no_grad():
         for batch in loader:
             values, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
-                                          frame_cache=frame_cache, frame_stats=frame_stats)
+                                          frame_cache=frame_cache, frame_stats=frame_stats,
+                                          raw_feature_cache=raw_feature_cache)
             losses.append(float(values["total"].detach().cpu()))
             mask = batch["fast_loss_mask"].to(output.fast.move_logits.device).bool()
             for value in output.fast.move_logits.argmax(-1)[mask].detach().cpu().reshape(-1).tolist():
@@ -697,7 +702,8 @@ def _evaluate(adapter, core, loader, device, amp_enabled):
     # roughly twice the unique frames, so hit_rate near 0.5 or higher means
     # the second traversal was almost fully served from cache.
     slow_acc = _slow_accuracy(adapter, core, loader, device, amp_enabled,
-                              frame_cache=frame_cache, frame_stats=frame_stats)
+                              frame_cache=frame_cache, frame_stats=frame_stats,
+                              raw_feature_cache=raw_feature_cache)
     hits = frame_stats["hits"]
     total = frame_stats["encoded"] + hits
     return {"loss": (sum(losses) / len(losses) if losses else None),
