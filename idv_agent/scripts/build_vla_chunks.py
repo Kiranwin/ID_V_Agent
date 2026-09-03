@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from idv_agent.configs.game_mode import DEFAULT_GAME_MODE, mode_token
+from idv_agent.labels.extract import extract_session
 
 from idv_agent.vla.action_chunk import (
     ACTION_CHUNK_HORIZON,
@@ -251,10 +252,18 @@ def build(session: Path, output: Path, *, stride: int = 3,
     frames = sorted((session / "frames").glob("*.jpg"), key=lambda p: int(p.stem))
     if not frames:
         raise ValueError(f"没有帧: {session / 'frames'}")
-    actions = {}
     action_csv = session / "per_frame_actions.csv"
-    if not action_csv.is_file():
-        raise ValueError(f"缺少 {action_csv}，请先运行 extract")
+    # New VLA recordings use Raw Input relative motion as the sole camera
+    # source.  Always rebuild the frame-aligned action table from it before
+    # chunking so a stale/manual table cannot reintroduce absolute-position
+    # semantics or an outdated camera aggregation.
+    mouse_delta_csv = session / "mouse_deltas.csv"
+    if not mouse_delta_csv.is_file():
+        raise ValueError(f"缺少 {mouse_delta_csv}；新 VLA session 必须提供 Raw Input 相对位移")
+    extract_session(session)
+    if not action_csv.is_file():  # defensive: extract_session writes this file
+        raise ValueError(f"动作提取失败，未生成 {action_csv}")
+    actions = {}
     with action_csv.open(encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             try:

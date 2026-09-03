@@ -87,13 +87,13 @@ python -m idv_agent.scripts.doctor
 python -m idv_agent.scripts.record_vla --window-title "第五人格" --mode standard
 
 # VLA 原始会话完整性检查
-python -m idv_agent.scripts.validate_vla_raw data/vla_raw_sessions/<session_id>
+python -m idv_agent.scripts.validate_vla_raw data/new_vla_raw_sessions/<session_id>
 
 # M0 捕获延迟基准（管理员终端、游戏窗口已打开；只读不注入）
 python -m idv_agent.scripts.benchmark_capture --title "第五人格" --seconds 60
 
 # 5. 构建 VLA action chunks
-python -m idv_agent.scripts.build_vla_chunks data/vla_raw_sessions/<session_id>
+python -m idv_agent.scripts.build_vla_chunks data/new_vla_raw_sessions/<session_id>
 ```
 
 ## 合规边界

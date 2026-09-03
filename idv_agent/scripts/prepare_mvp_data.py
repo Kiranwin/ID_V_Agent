@@ -11,11 +11,26 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import shutil
 from collections import Counter
 from pathlib import Path
 
 KEEP = {"travel", "decipher"}
+V4_CHUNK_FILENAMES = ("vla_chunks_v4.jsonl", "train_vla_chunks_v4.jsonl")
+
+
+def _find_v4_chunks(session: Path) -> Path | None:
+    """Return the canonical v4 file, with a transitional filename fallback.
+
+    Some already-generated sessions used the early ``train_vla_chunks_v4``
+    name.  Raw-session compatibility is intentionally not broadened; this
+    narrow alias only prevents a valid, current-schema chunk file from being
+    silently omitted by the MVP collector.
+    """
+    for filename in V4_CHUNK_FILENAMES:
+        path = session / filename
+        if path.is_file():
+            return path
+    return None
 
 
 def _read(path: Path):
@@ -62,10 +77,14 @@ def _split(sessions: list[tuple[str, list[dict]]], val_ratio: float, seed: int,
         rng = random.Random(seed)
         shuffled = sessions[:]
         rng.shuffle(shuffled)
-        target = max(1, round(len(shuffled) * val_ratio))
+        # Keep at least one whole session in train.  For tiny datasets the
+        # intent-coverage seed below can otherwise consume every session.
+        target = min(len(shuffled) - 1, max(1, round(len(shuffled) * val_ratio)))
         # Start with one session for each intent, then fill to the target.
         val: list[tuple[str, list[dict]]] = []
         for intent in sorted(KEEP):
+            if len(val) >= target:
+                break
             candidate = next((item for item in shuffled if any(r["slow_label"].get("intent") == intent for r in item[1])
                               and item not in val), None)
             if candidate:
@@ -109,7 +128,11 @@ def prepare(root: Path, output: Path, *, val_ratio: float, seed: int,
             val_sessions: set[str] | None, travel_scope: str,
             max_session_chunks: int | None = None) -> dict:
     sessions = []
-    for path in sorted(root.glob("*/vla_chunks_v4.jsonl")):
+    for session_dir in sorted((path for path in root.iterdir() if path.is_dir()), key=lambda p: p.name) \
+            if root.is_dir() else []:
+        path = _find_v4_chunks(session_dir)
+        if path is None:
+            continue
         rows = _session_records(path, travel_scope)
         if max_session_chunks is not None and len(rows) > max_session_chunks:
             continue
@@ -155,7 +178,7 @@ def prepare(root: Path, output: Path, *, val_ratio: float, seed: int,
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--sessions-root", type=Path, default=Path("data/vla_raw_sessions"))
+    p.add_argument("--sessions-root", type=Path, default=Path("data/new_vla_raw_sessions"))
     p.add_argument("--output", type=Path, default=Path("data/mvp_vla"))
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=20260902)

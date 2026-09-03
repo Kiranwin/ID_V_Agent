@@ -220,7 +220,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="VLA 原始示范录制（不注入输入）")
     parser.add_argument("--window-title", default="第五人格")
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--output", type=Path, default=Path("data/vla_raw_sessions"))
+    parser.add_argument("--output", type=Path, default=Path("data/new_vla_raw_sessions"))
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--max-width", type=int, default=1334)

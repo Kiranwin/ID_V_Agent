@@ -41,7 +41,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"评估 checkpoint 必须是 M3_ACT，收到 {act_manifest['stage']}")
     for name in ("visual_projection", "condition_projection"):
         getattr(adapter, name).to(device=device, dtype=torch.float32)
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim).to(
+    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
+                             history_action_dim=72).to(
         device=device, dtype=torch.float32)
 
     first = next(iter(loader))
@@ -79,7 +80,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 # ground-truth intent/subgoal (teacher forcing ratio=0).
                 slow_pass = core(features, condition,
                                  valid_mask=model_batch["frame_valid_mask"],
-                                 time_deltas=model_batch["time_deltas"], run_slow=True)
+                                 history_actions=model_batch["history_actions"], run_slow=True)
                 if slow_pass.slow is None:
                     raise RuntimeError("slow pass 未产生 SlowVLAOutput")
                 next_condition = _scheduled_condition(
@@ -87,7 +88,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 fast_pass = core(features, next_condition,
                                  valid_mask=model_batch["frame_valid_mask"],
-                                 time_deltas=model_batch["time_deltas"], run_slow=False,
+                                 history_actions=model_batch["history_actions"], run_slow=False,
                                  detach_slow_condition=False)
                 output = type(slow_pass)(temporal_feature=fast_pass.temporal_feature,
                                          fast=fast_pass.fast, slow=slow_pass.slow)

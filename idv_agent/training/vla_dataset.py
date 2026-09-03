@@ -16,6 +16,8 @@ from idv_agent.vla.action_chunk import CAMERA_BUCKETS, INTENTS, validate_v4_reco
 
 CAMERA_TO_INDEX = {value: index for index, value in enumerate(CAMERA_BUCKETS)}
 SUBGOAL_SOURCE_WEIGHT = {"rule": 0.5, "human_override": 1.0, "unknown": 0.0}
+HISTORY_ACTION_WIDTH = 9  # move + camera dx/dy + six button states
+HISTORY_ACTION_STEPS = 8
 
 
 class VLASequenceDataset(Dataset):
@@ -72,14 +74,22 @@ class VLASequenceDataset(Dataset):
         slow = record["slow_label"]
         chunk = record["action_chunk"]
         slow_valid = bool(slow.get("valid"))
+        history = record["observations"].get("history_actions", [])
+        history_values = []
+        for action in history[-HISTORY_ACTION_STEPS:]:
+            history_values.extend([
+                float(action["move_dir"]), float(CAMERA_TO_INDEX[action["camera_dx"]]),
+                float(CAMERA_TO_INDEX[action["camera_dy"]]),
+                *[float(v) for v in action["buttons"]],
+            ])
+        history_values.extend([0.0] * (HISTORY_ACTION_STEPS * HISTORY_ACTION_WIDTH - len(history_values)))
         return {
             "episode_id": record["episode_id"],
             "anchor_frame": record["anchor_frame"],
             "frame_paths": [root / frame["path"] for frame in frames],
-            "frame_timestamps_ns": torch.tensor(
-                [int(frame["timestamp_ns"]) for frame in frames], dtype=torch.long),
             "task_instruction": record["task"]["instruction"],
             "mode_id": torch.tensor(GAME_MODE_CHOICES.index(record["mode"]), dtype=torch.long),
+            "history_actions": torch.tensor(history_values, dtype=torch.float32),
             "intent_target": torch.tensor(INTENTS.index(slow["intent"]) if slow_valid else -100,
                                           dtype=torch.long),
             "subgoal_target": torch.tensor(SUBGOAL_NAMES.index(slow["subgoal"]) if slow_valid else -100,
@@ -112,9 +122,7 @@ class VLASequenceCollator:
         if not samples:
             raise ValueError("samples 不能为空")
         batch = len(samples)
-        timestamps = torch.zeros((batch, self.max_frames), dtype=torch.long)
         valid_mask = torch.zeros((batch, self.max_frames), dtype=torch.bool)
-        time_deltas = torch.zeros((batch, self.max_frames), dtype=torch.float32)
         frame_paths: list[list[Path | None]] = []
         for row, sample in enumerate(samples):
             n_frames = len(sample["frame_paths"])
@@ -122,12 +130,9 @@ class VLASequenceCollator:
                 raise ValueError("样本帧数超过 max_frames")
             paths = list(sample["frame_paths"]) + [None] * (self.max_frames - n_frames)
             frame_paths.append(paths)
-            current = sample["frame_timestamps_ns"]
-            timestamps[row, :n_frames] = current
             valid_mask[row, :n_frames] = True
-            time_deltas[row, :n_frames] = (current - current[0]).to(torch.float32) / 1e9
         tensor_keys = (
-            "mode_id", "intent_target", "subgoal_target", "subgoal_weight",
+            "mode_id", "history_actions", "intent_target", "subgoal_target", "subgoal_weight",
             "move_target", "camera_dx_target", "camera_dy_target", "button_target",
             "duration_target", "slow_loss_mask", "fast_loss_mask",
         )
@@ -137,8 +142,6 @@ class VLASequenceCollator:
             "anchor_frame": torch.tensor([sample["anchor_frame"] for sample in samples], dtype=torch.long),
             "task_instruction": [sample["task_instruction"] for sample in samples],
             "frame_paths": frame_paths,
-            "frame_timestamps_ns": timestamps,
             "frame_valid_mask": valid_mask,
-            "time_deltas": time_deltas,
         })
         return batch_dict

@@ -36,6 +36,19 @@ class VLALossWeights:
     button_global_counts: Optional[torch.Tensor] = None
 
 
+def _move_class_weights(counts: torch.Tensor, *, move_stop_weight: float,
+                        balance: bool) -> torch.Tensor:
+    """Build movement CE weights while preserving the explicit stop policy."""
+    if counts.ndim != 1 or counts.numel() < 1:
+        raise ValueError("move counts 必须是一维非空 Tensor")
+    weights = torch.ones(counts.numel(), dtype=counts.dtype, device=counts.device)
+    if balance:
+        weights = counts.clamp_min(1.0).rsqrt()
+        weights = weights / weights.mean().clamp_min(1e-12)
+    weights[0] *= float(move_stop_weight)
+    return weights
+
+
 def _masked_mean(values: torch.Tensor, sample_mask: torch.Tensor) -> torch.Tensor:
     while sample_mask.ndim < values.ndim:
         sample_mask = sample_mask.unsqueeze(-1)
@@ -48,7 +61,6 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
     fast_mask = batch["fast_loss_mask"].to(fast.move_logits.device)
     move_class_weight = torch.ones(fast.move_logits.shape[-1], device=fast.move_logits.device,
                                    dtype=fast.move_logits.dtype)
-    move_class_weight[0] = weights.move_stop_weight
     if weights.move_direction_balance:
         # Inverse-square-root frequency weighting is less unstable than pure
         # inverse frequency while still preventing the dominant north class.
@@ -63,9 +75,11 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
             # histogram; training entry points always provide one when
             # move_direction_balance is enabled.
             counts = torch.bincount(batch["move_target"].reshape(-1), minlength=fast.move_logits.shape[-1]).to(move_class_weight.dtype)
-        counts = counts.clamp_min(1.0)
-        move_class_weight = counts.rsqrt()
-        move_class_weight = move_class_weight / move_class_weight.mean()
+        move_class_weight = _move_class_weights(
+            counts, move_stop_weight=weights.move_stop_weight, balance=True,
+        )
+    else:
+        move_class_weight[0] = weights.move_stop_weight
     move = F.cross_entropy(fast.move_logits.transpose(1, 2), batch["move_target"],
                            weight=move_class_weight, reduction="none")
     cam_dx = F.cross_entropy(fast.camera_dx_logits.transpose(1, 2), batch["camera_dx_target"], reduction="none")

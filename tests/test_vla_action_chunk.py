@@ -63,10 +63,20 @@ def test_build_vla_chunks(tmp_path: Path):
     frames.mkdir(parents=True)
     for i in range(60):
         (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
-    with (session / "per_frame_actions.csv").open("w", encoding="utf-8", newline="") as f:
-        f.write("frame_id,timestamp_ns,category_name,move_x,move_y,cam_dx,cam_dy\n")
-        for i in range(60):
-            f.write(f"{i},{i * 1000},MOVE,0,1,0.09,0\n")
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n0,key_down,key:w,1\n1000000000,key_up,key:w,0\n",
+        encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(60)),
+        encoding="utf-8")
+    # Raw Input dx/dy are relative pixels.  18 px/frame becomes 0.09 in the
+    # extractor (cam_pixel_scale=200), and six frames aggregate to a +1 bucket.
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},18,0\n" for i in range(60)),
+        encoding="utf-8")
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 60, "target_fps": 30}), encoding="utf-8")
     output = tmp_path / "vla.jsonl"
     count = build(session, output, stride=3, macro_frames=6, outcome="success")
     assert count == 10

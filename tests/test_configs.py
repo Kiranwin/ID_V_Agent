@@ -101,14 +101,14 @@ def test_build_vla_v4_adds_slow_labels_and_timestamp_mask(tmp_path):
     frames.mkdir(parents=True)
     for i in range(45):
         (frames / f"{i:08d}.jpg").write_bytes(b"jpeg")
-    with (session / "per_frame_actions.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("frame_idx", "timestamp_ns", "category_name",
-                                                    "move_x", "move_y", "cam_dx", "cam_dy", "held_keys"))
-        writer.writeheader()
-        for i in range(45):
-            writer.writerow({"frame_idx": i, "timestamp_ns": i * 100_000_000,
-                             "category_name": "MOVE", "move_x": 0, "move_y": 1,
-                             "cam_dx": 0, "cam_dy": 0, "held_keys": ""})
+    (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 100_000_000}\n" for i in range(45)),
+        encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text("timestamp_ns,dx,dy\n", encoding="utf-8")
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 45, "target_fps": 10}), encoding="utf-8")
     (session / "intent_segments.jsonl").write_text(
         json.dumps({"start_frame": 0, "end_frame": 44, "intent": "search"}) + "\n",
         encoding="utf-8")

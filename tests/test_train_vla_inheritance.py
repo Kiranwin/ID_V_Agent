@@ -51,6 +51,45 @@ def test_direction_balance_loss_is_finite():
                                            VLALossWeights(move_direction_balance=True))["total"])
 
 
+def test_direction_balance_preserves_stop_weight():
+    import torch
+    from idv_agent.training.vla_loss import _move_class_weights
+
+    counts = torch.tensor([100.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0])
+    weights = _move_class_weights(
+        counts, move_stop_weight=0.5, balance=True,
+    )
+    # Global inverse-sqrt balancing must still apply the configured stop
+    # multiplier; otherwise enabling balancing silently re-enables stop.
+    assert torch.isclose(weights[0] / weights[1], torch.tensor(0.1), atol=1e-6)
+
+
+def test_mvp_finds_transitional_v4_chunk_filename(tmp_path):
+    from idv_agent.scripts.prepare_mvp_data import _find_v4_chunks
+
+    session = tmp_path / "session"
+    session.mkdir()
+    alternate = session / "train_vla_chunks_v4.jsonl"
+    alternate.write_text("", encoding="utf-8")
+    assert _find_v4_chunks(session) == alternate
+    canonical = session / "vla_chunks_v4.jsonl"
+    canonical.write_text("", encoding="utf-8")
+    assert _find_v4_chunks(session) == canonical
+
+
+def test_mvp_split_keeps_train_nonempty_with_two_mixed_sessions():
+    from idv_agent.scripts.prepare_mvp_data import _split
+
+    def rows():
+        return [{"slow_label": {"intent": "travel"}},
+                {"slow_label": {"intent": "decipher"}}]
+
+    train, val = _split([("s1", rows()), ("s2", rows())], 0.2, 7, None)
+    assert len(train) == 1 and len(val) == 1
+    assert {r["slow_label"]["intent"] for r in train[0][1]} == {"travel", "decipher"}
+    assert {r["slow_label"]["intent"] for r in val[0][1]} == {"travel", "decipher"}
+
+
 def test_teacher_forcing_ratio_schedule_and_prediction_fallback():
     from argparse import Namespace
     import torch
@@ -83,6 +122,10 @@ def test_act_requires_m2_checkpoint(monkeypatch):
         data="missing.jsonl", model_path="base", init_checkpoint="",
         allow_base_init=False, device="cpu", batch_size=1, steps=1,
         max_samples=1, temporal_dim=16, lr=1e-3, checkpoint="tmp/x.pt",
+        seed=123,
     )
+    called = []
+    monkeypatch.setattr("idv_agent.scripts.train_vla.set_seed", lambda value: called.append(value))
     with pytest.raises(ValueError, match="init-checkpoint M2_VG"):
         train(args)
+    assert called == [123]

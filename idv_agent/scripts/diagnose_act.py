@@ -33,7 +33,8 @@ def _load(args):
         args.model_path, args.init_checkpoint,
         dtype=torch.float16 if amp else torch.float32, device=device)
     manifest = load_manifest(Path(args.checkpoint).parent / "manifest.json", require_artifacts=True)
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim).to(device=device, dtype=torch.float32)
+    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
+                             history_action_dim=72).to(device=device, dtype=torch.float32)
     for name in ("visual_projection", "condition_projection"):
         getattr(adapter, name).to(device=device, dtype=torch.float32)
     # Materialize lazy projection exactly as evaluation does.
@@ -74,10 +75,10 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
             condition.mode_id = mb["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
                 slow_pass = core(features, condition, valid_mask=mb["frame_valid_mask"],
-                                 time_deltas=mb["time_deltas"], run_slow=True)
+                                 history_actions=mb["history_actions"], run_slow=True)
                 next_condition = _scheduled_condition(core, slow_pass.slow, mb, teacher_forcing_ratio=0.0)
                 fast_pass = core(features, next_condition, valid_mask=mb["frame_valid_mask"],
-                                 time_deltas=mb["time_deltas"], run_slow=False,
+                                 history_actions=mb["history_actions"], run_slow=False,
                                  detach_slow_condition=False)
                 losses = compute_vla_loss(fast_pass.fast, slow_pass.slow, mb)
             intent_target = int(mb["intent_target"][0])

@@ -156,7 +156,7 @@ def create_server(root: Path, host: str = "127.0.0.1", port: int = 8765) -> Thre
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="启动本地 VLA 数据处理工作台")
-    parser.add_argument("--root", type=Path, default=Path("data/vla_raw_sessions"))
+    parser.add_argument("--root", type=Path, default=Path("data/new_vla_raw_sessions"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)

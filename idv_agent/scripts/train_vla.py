@@ -26,6 +26,7 @@ from idv_agent.model.qwen_backbone_adapter import Qwen3VLBackboneAdapter, load_q
 from idv_agent.training.checkpoint_manifest import build_manifest, load_manifest, sha256_file, write_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
 from idv_agent.training.vla_loss import compute_vla_loss
+from idv_agent.training.utils import set_seed
 
 
 def _freeze_qwen(adapter: torch.nn.Module) -> None:
@@ -275,7 +276,7 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
 def _model_inputs(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
     keys = ("mode_id", "intent_target", "subgoal_target", "subgoal_weight", "move_target",
             "camera_dx_target", "camera_dy_target", "button_target", "duration_target",
-            "slow_loss_mask", "fast_loss_mask", "frame_valid_mask", "time_deltas")
+            "slow_loss_mask", "fast_loss_mask", "frame_valid_mask", "history_actions")
     return {key: batch[key].to(device) for key in keys}
 
 
@@ -333,7 +334,7 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
         # First pass updates the slow state from the current visual window.
         slow_pass = core(frame_features, condition,
                          valid_mask=model_batch["frame_valid_mask"],
-                         time_deltas=model_batch["time_deltas"], run_slow=True)
+                         history_actions=model_batch["history_actions"], run_slow=True)
         if slow_pass.slow is None:  # defensive; run_slow=True above is required
             raise RuntimeError("slow pass 未产生 SlowVLAOutput")
         # Second pass is the actual fast decision.  During training the
@@ -345,7 +346,7 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
         )
         fast_pass = core(frame_features, next_condition,
                          valid_mask=model_batch["frame_valid_mask"],
-                         time_deltas=model_batch["time_deltas"], run_slow=False,
+                         history_actions=model_batch["history_actions"], run_slow=False,
                          detach_slow_condition=False)
         output = FastSlowVLAOutput(
             temporal_feature=fast_pass.temporal_feature,
@@ -369,6 +370,7 @@ def _mask_comparison(losses, adapter, core, batch, device, amp_enabled):
 
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
+    set_seed(int(getattr(args, "seed", 0)))
     device = torch.device(args.device)
     dtype, amp_enabled = _device_dtype(device)
     if not args.init_checkpoint and not args.allow_base_init:
@@ -411,7 +413,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     # gradients); autocast still executes their matmuls in FP16 on CUDA.
     for name in ("visual_projection", "condition_projection"):
         getattr(adapter, name).to(device=device, dtype=torch.float32)
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim).to(device=device, dtype=torch.float32)
+    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
+                             history_action_dim=72).to(device=device, dtype=torch.float32)
     from idv_agent.training.vla_loss import VLALossWeights
     global_counts = None
     button_global_counts = None
