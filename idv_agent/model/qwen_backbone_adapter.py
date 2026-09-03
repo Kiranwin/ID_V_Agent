@@ -201,6 +201,125 @@ class Qwen3VLBackboneAdapter(nn.Module):
         pooled = pooled.to(dtype=self.visual_projection.weight.dtype)
         return self.visual_projection(pooled)
 
+    def _raw_visual_forward_batch(self, inputs: list[dict[str, Any]]) -> torch.Tensor:
+        """Run the frozen image tower and canonical pooling without projection."""
+        if not inputs:
+            return torch.empty((0, self.hidden_size), device=self.device)
+        if not all("pixel_values" in item for item in inputs):
+            raise ValueError("批量视觉输入必须包含 pixel_values")
+        pixel_values = torch.cat([item["pixel_values"] for item in inputs], dim=0)
+        merged: dict[str, Any] = {"pixel_values": pixel_values}
+        if all("image_grid_thw" in item for item in inputs):
+            merged["image_grid_thw"] = torch.cat([item["image_grid_thw"] for item in inputs], dim=0)
+        image_features = getattr(self.model, "get_image_features", None)
+        if image_features is None and hasattr(self.model, "model"):
+            image_features = getattr(self.model.model, "get_image_features", None)
+        if image_features is None or "image_grid_thw" not in merged:
+            # Generic visual towers normally accept a conventional [B,C,H,W].
+            rows = []
+            for item in inputs:
+                visual = getattr(self.model, "visual", None)
+                if visual is None and hasattr(self.model, "model"):
+                    visual = getattr(self.model.model, "visual", None)
+                if visual is None:
+                    raise RuntimeError("Qwen 模型未暴露 visual 视觉塔")
+                kwargs = ({"hidden_states": item["pixel_values"], "grid_thw": item["image_grid_thw"]}
+                          if "image_grid_thw" in item else {"pixel_values": item["pixel_values"]})
+                try:
+                    out = visual(**kwargs)
+                except TypeError:
+                    out = visual(pixel_values=item.get("pixel_values"),
+                                 image_grid_thw=item.get("image_grid_thw"))
+                if hasattr(out, "last_hidden_state"):
+                    out = out.last_hidden_state
+                elif isinstance(out, (tuple, list)):
+                    out = next(x for x in out if isinstance(x, torch.Tensor))
+                if out.ndim == 2:
+                    out = out.unsqueeze(0)
+                rows.append(out.mean(dim=1))
+            return torch.cat(rows, dim=0)
+        out = image_features(pixel_values=merged["pixel_values"],
+                             image_grid_thw=merged["image_grid_thw"])
+        if hasattr(out, "last_hidden_state"):
+            out = out.last_hidden_state
+        elif isinstance(out, (tuple, list)):
+            out = next(x for x in out if isinstance(x, torch.Tensor))
+        if out.ndim == 3 and out.shape[0] == len(inputs):
+            pooled = out.mean(dim=1)
+        elif out.ndim == 2 and out.shape[0] == len(inputs):
+            pooled = out
+        elif out.ndim == 2:
+            grids = merged["image_grid_thw"].tolist()
+            vision_config = getattr(getattr(self.model, "config", None), "vision_config", None)
+            merge_size = int(getattr(vision_config, "spatial_merge_size", 2))
+            counts = [max(1, int(t * h * w // (merge_size * merge_size))) for t, h, w in grids]
+            if sum(counts) != out.shape[0]:
+                raise ValueError("无法按 image_grid_thw 拆分批量视觉输出")
+            pooled = torch.stack([chunk.mean(dim=0) for chunk in out.split(counts, dim=0)])
+        else:
+            raise ValueError("Qwen 批量视觉输出必须为 [B,L,D] 或 [总token,D]")
+
+        return pooled
+
+    def _visual_forward_batch(self, inputs: list[dict[str, Any]]) -> torch.Tensor:
+        """Run the image tower once for several independently processed images."""
+        pooled = self._raw_visual_forward_batch(inputs)
+        self.visual_projection.to(device=pooled.device)
+        pooled = pooled.to(dtype=self.visual_projection.weight.dtype)
+        return self.visual_projection(pooled)
+
+    def encode_raw_frames(self, images: list[Any], *, micro_batch_size: int | None = None) -> torch.Tensor:
+        """Return deterministic frozen-tower pooled features for ``images``."""
+        if not images:
+            return torch.empty((0, self.hidden_size), device=self.device)
+        limit = len(images) if micro_batch_size is None else max(1, int(micro_batch_size))
+        was_training = self.training
+        self.eval()
+        try:
+            with torch.inference_mode():
+                outputs = []
+                for start in range(0, len(images), limit):
+                    prepared = [self._prepare_image(image) for image in images[start:start + limit]]
+                    outputs.append(self._raw_visual_forward_batch(prepared))
+                return torch.cat(outputs, dim=0)
+        finally:
+            self.train(was_training)
+
+    def project_raw_features(self, raw_features: torch.Tensor,
+                             task_cache: TaskConditionCache) -> torch.Tensor:
+        """Apply current trainable visual/task projections to raw features."""
+        if raw_features.ndim != 2:
+            raise ValueError("raw_features 必须是 [N,D_raw]")
+        self.visual_projection.to(device=raw_features.device)
+        # ``encode_raw_frames`` returns inference tensors; clone to re-enter an
+        # autograd-compatible graph for the trainable projection layers.
+        visual = self.visual_projection(raw_features.clone().to(self.visual_projection.weight.dtype))
+        ins = task_cache.instruction_embedding.to(visual).reshape(-1)
+        mode = task_cache.mode_embedding.to(visual).reshape(-1)
+        if ins.numel() != self.hidden_size or mode.numel() != self.hidden_size:
+            raise ValueError("task embedding 维度必须等于 Qwen text hidden_size")
+        self.condition_projection.to(device=visual.device)
+        cond_input = torch.cat((ins, mode)).unsqueeze(0).expand(visual.shape[0], -1)
+        condition = self.condition_projection(
+            cond_input.to(self.condition_projection.weight.dtype)
+        ).to(visual.dtype)
+        return visual + condition
+
+    def encode_frames(self, images: list[Any], task_cache: TaskConditionCache | None = None,
+                      *, micro_batch_size: int | None = None) -> torch.Tensor:
+        """Encode multiple images with one visual-tower call per micro-batch."""
+        if task_cache is None:
+            raise ValueError("必须提供 task_cache")
+        if not images:
+            return torch.empty((0, self.hidden_size), device=self.device)
+        limit = len(images) if micro_batch_size is None else max(1, int(micro_batch_size))
+        outputs = []
+        for start in range(0, len(images), limit):
+            prepared = [self._prepare_image(image) for image in images[start:start + limit]]
+            raw = self._raw_visual_forward_batch(prepared)
+            outputs.append(self.project_raw_features(raw, task_cache))
+        return torch.cat(outputs, dim=0)
+
     def encode_frame(self, image: Any, task_cache: TaskConditionCache | None = None,
                      *, instruction_embedding: torch.Tensor | None = None,
                      mode_embedding: torch.Tensor | None = None) -> torch.Tensor:
@@ -211,6 +330,9 @@ class Qwen3VLBackboneAdapter(nn.Module):
         if instruction_embedding is None or mode_embedding is None:
             raise ValueError("必须提供 task_cache 或 instruction/mode embedding")
         visual = self._visual_forward(self._prepare_image(image))
+        if task_cache is not None:
+            instruction_embedding = task_cache.instruction_embedding
+            mode_embedding = task_cache.mode_embedding
         ins = instruction_embedding.to(visual).reshape(-1)
         mode = mode_embedding.to(visual).reshape(-1)
         if ins.numel() != self.hidden_size or mode.numel() != self.hidden_size:

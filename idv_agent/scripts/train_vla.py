@@ -215,8 +215,10 @@ def _stratified_subset(dataset, limit: int, *, seed: int = 0,
 
 def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: torch.device,
                  frame_cache: dict[tuple[str, int, str], torch.Tensor] | None = None,
-                 frame_stats: dict[str, int] | None = None) -> torch.Tensor:
-    """Encode real images one frame at a time and return ``[B, L, D]`` features.
+                 frame_stats: dict[str, int] | None = None,
+                 vision_micro_batch_size: int = 8,
+                 raw_feature_cache: Any | None = None) -> torch.Tensor:
+    """Encode real images in vision micro-batches and return ``[B, L, D]`` features.
 
     ``frame_cache`` deduplicates vision-tower forwards across calls by task and
     frame path.  Cache entries are ``detach().cpu()`` snapshots, so a cache may only
@@ -230,6 +232,8 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
     contain ``hits``/``encoded`` counters (pad slots are not counted); both
     are accumulated in place.
     """
+    if vision_micro_batch_size < 1:
+        raise ValueError("vision_micro_batch_size 必须为正数")
     features = []
     cache_by_task: dict[tuple[str, int], Any] = {}
     # Per-batch cache deliberately keeps graph-connected tensors.  This is
@@ -237,41 +241,81 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
     # frame/task pairs occur within one batch; persistent ``frame_cache``
     # remains detached and is therefore restricted to inference.
     batch_frame_cache: dict[tuple[str, int, str], torch.Tensor] = {}
-    for paths, instruction, mode_id in zip(
+    pending: dict[tuple[str, int], list[tuple[int, int, Any, Any, tuple[str, int, str]]]] = defaultdict(list)
+    pending_refs: dict[tuple[str, int, str], list[tuple[int, int]]] = defaultdict(list)
+    for row_index, (paths, instruction, mode_id) in enumerate(zip(
         batch["frame_paths"], batch["task_instruction"], batch["mode_id"].tolist()
-    ):
+    )):
         task_key = (instruction, int(mode_id))
         # Dataset stores the canonical mode id; model cache needs its token.
         mode = ("standard", "joint_hunt", "blackjack")[int(mode_id)]
         if task_key not in cache_by_task:
             cache_by_task[task_key] = adapter.encode_task_once(instruction, mode, task_id=f"{instruction}:{mode}")
         cache = cache_by_task[task_key]
-        row = []
-        for path, image in zip(paths, _load_images(paths)):
+        row = [None] * len(paths)
+        images = []
+        load_paths = []
+        for path in paths:
+            path_key = (instruction, int(mode_id), str(path) if path is not None else "<pad>")
+            if path is None or path_key in batch_frame_cache or (frame_cache is not None and path_key in frame_cache) or (raw_feature_cache is not None and path in raw_feature_cache):
+                images.append(None)
+            else:
+                images.append("__LOAD__")
+                load_paths.append(path)
+        loaded = iter(_load_images(load_paths))
+        images = [next(loaded) if image == "__LOAD__" else image for image in images]
+        for col_index, (path, image) in enumerate(zip(paths, images)):
             cache_key = (instruction, int(mode_id),
                          str(path) if path is not None else "<pad>")
             if path is not None and cache_key in batch_frame_cache:
-                row.append(batch_frame_cache[cache_key])
+                row[col_index] = batch_frame_cache[cache_key]
                 if frame_stats is not None:
                     frame_stats["hits"] += 1
                 continue
             if path is not None and frame_cache is not None and cache_key in frame_cache:
-                row.append(frame_cache[cache_key].to(device=device))
+                row[col_index] = frame_cache[cache_key].to(device=device)
                 if frame_stats is not None:
                     frame_stats["hits"] += 1
                 continue
+            if path is not None and raw_feature_cache is not None and path in raw_feature_cache:
+                project = getattr(adapter, "project_raw_features", None)
+                if project is None:
+                    raise TypeError("raw_feature_cache 需要 adapter.project_raw_features")
+                feature = project(raw_feature_cache.get(path).to(device=device).reshape(1, -1), cache)[0]
+                batch_frame_cache[cache_key] = feature
+                row[col_index] = feature
+                if frame_stats is not None:
+                    frame_stats["raw_cache_hits"] = frame_stats.get("raw_cache_hits", 0) + 1
+                continue
             if image is None:
-                row.append(torch.zeros(adapter.hidden_size, device=device, dtype=next(adapter.parameters()).dtype))
+                row[col_index] = torch.zeros(adapter.hidden_size, device=device, dtype=next(adapter.parameters()).dtype)
             else:
-                feature = adapter.encode_frame(image, cache)
-                if path is not None:
-                    batch_frame_cache[cache_key] = feature
-                if path is not None and frame_cache is not None:
+                pending_refs[cache_key].append((row_index, col_index))
+                if not any(entry[4] == cache_key for entry in pending[task_key]):
+                    pending[task_key].append((row_index, col_index, path, image, cache_key))
+        features.append(row)
+    for task_key, entries in pending.items():
+        cache = cache_by_task[task_key]
+        for start in range(0, len(entries), vision_micro_batch_size):
+            chunk = entries[start:start + vision_micro_batch_size]
+            images = [entry[3] for entry in chunk]
+            encode_frames = getattr(adapter, "encode_frames", None)
+            if encode_frames is not None:
+                encoded = encode_frames(images, cache, micro_batch_size=vision_micro_batch_size)
+            else:
+                encoded = torch.stack([adapter.encode_frame(image, cache) for image in images])
+            if encoded.ndim != 2 or encoded.shape[0] != len(chunk):
+                raise ValueError("encode_frames 必须返回 [N,D] Tensor")
+            for entry, feature in zip(chunk, encoded):
+                row_index, col_index, path, _image, cache_key = entry
+                for row_index, col_index in pending_refs[cache_key]:
+                    features[row_index][col_index] = feature
+                batch_frame_cache[cache_key] = feature
+                if frame_cache is not None:
                     frame_cache[cache_key] = feature.detach().cpu()
                 if frame_stats is not None:
                     frame_stats["encoded"] += 1
-                row.append(feature)
-        features.append(torch.stack(row))
+    features = [torch.stack(row) for row in features]
     return torch.stack(features).to(device)
 
 
@@ -332,7 +376,9 @@ def _interact_stage_counts(button_logits: torch.Tensor, button_target: torch.Ten
 
 def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weights=None,
                  teacher_forcing_ratio: float = 0.0,
-                 frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None):
+                 frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None,
+                 vision_micro_batch_size: int = 8,
+                 raw_feature_cache: Any | None = None):
     """Forward + loss for one batch.
 
     ``frame_cache``/``frame_stats`` are passed through to ``encode_batch``.
@@ -344,7 +390,9 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
     """
     model_batch = _model_inputs(batch, device)
     frame_features = encode_batch(adapter, batch, device=device,
-                                  frame_cache=frame_cache, frame_stats=frame_stats)
+                                  frame_cache=frame_cache, frame_stats=frame_stats,
+                                  vision_micro_batch_size=vision_micro_batch_size,
+                                  raw_feature_cache=raw_feature_cache)
     condition = core.initial_condition(frame_features.shape[0], device=device,
                                        mode_id=0)
     # Keep the per-record mode conditioning from v4 (normally all rows in the
@@ -406,6 +454,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     # Do not silently cap the requested batch.  The caller is responsible for
     # selecting a size that fits the available GPU memory.
     batch_size = max(1, int(args.batch_size))
+    vision_micro_batch_size = max(1, int(getattr(args, "vision_micro_batch_size", 8)))
+    raw_feature_cache = None
+    if getattr(args, "raw_feature_cache", ""):
+        from idv_agent.training.raw_feature_cache import RawFeatureCache
+        raw_feature_cache = RawFeatureCache(args.raw_feature_cache)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                         collate_fn=VLASequenceCollator(max_frames=8))
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
@@ -468,6 +521,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     baseline_losses, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=amp_enabled,
+                                      vision_micro_batch_size=vision_micro_batch_size,
+                                      raw_feature_cache=raw_feature_cache,
                                       loss_weights=loss_weights,
                                       teacher_forcing_ratio=_teacher_forcing_ratio(args, 0))
     baseline = float(baseline_losses["total"].detach().cpu())
@@ -486,6 +541,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             batch["slow_loss_mask"] = torch.ones_like(batch["slow_loss_mask"])
         optimizer.zero_grad(set_to_none=True)
         losses, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
+                                      vision_micro_batch_size=vision_micro_batch_size,
+                                      raw_feature_cache=raw_feature_cache,
                                       loss_weights=loss_weights,
                                       teacher_forcing_ratio=_teacher_forcing_ratio(args, step - 1))
         total = losses["total"]
@@ -560,7 +617,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         counts={"train": len(dataset), "val": len(val_dataset) if val_dataset is not None else 0},
         precision="fp16+GradScaler" if amp_enabled else "fp32",
         training={"method": "action_chunk_sft", "steps": args.steps, "learning_rate": args.lr,
-                  "batch_size": batch_size, "temporal_dim": args.temporal_dim,
+                  "batch_size": batch_size, "vision_micro_batch_size": vision_micro_batch_size,
+                  "temporal_dim": args.temporal_dim,
                   "max_samples": args.max_samples, "sampling": sampling,
                   "seed": int(getattr(args, "seed", 0)), "move_stop_weight": args.move_stop_weight,
                   "button_positive_weight": args.button_positive_weight,
@@ -589,8 +647,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "peak_memory_mb": peak_memory / (1024 * 1024), "elapsed_sec": elapsed,
             "manifest": str(manifest_path.resolve()),
             "checkpoint_manifest_embedded": True,
-            "slow_accuracy": _slow_accuracy(adapter, core, eval_loader, device, amp_enabled),
-            "val": (_evaluate(adapter, core, val_loader, device, amp_enabled)
+            "slow_accuracy": _slow_accuracy(adapter, core, eval_loader, device, amp_enabled,
+                                             raw_feature_cache=raw_feature_cache),
+            "val": (_evaluate(adapter, core, val_loader, device, amp_enabled,
+                              raw_feature_cache=raw_feature_cache)
                     if val_loader is not None else None)}
     (checkpoint.parent / "metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -598,7 +658,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _slow_accuracy(adapter, core, loader, device, amp_enabled, *, max_samples: int | None = None,
-                   frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None):
+                   frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None,
+                   raw_feature_cache: Any | None = None):
     """Compute slow intent accuracy over every sample in the training subset.
 
     Runs under ``eval()`` + ``torch.no_grad()``, so a frame cache is safe;
@@ -614,7 +675,8 @@ def _slow_accuracy(adapter, core, loader, device, amp_enabled, *, max_samples: i
             if max_samples is not None and total >= max_samples:
                 break
             _, out = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
-                                  frame_cache=cache, frame_stats=frame_stats)
+                                  frame_cache=cache, frame_stats=frame_stats,
+                                  raw_feature_cache=raw_feature_cache)
             target = batch["intent_target"]
             valid = target != -100
             if bool(valid.any()):
@@ -624,7 +686,7 @@ def _slow_accuracy(adapter, core, loader, device, amp_enabled, *, max_samples: i
     return (float(correct / total) if total else None)
 
 
-def _evaluate(adapter, core, loader, device, amp_enabled):
+def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: Any | None = None):
     """Evaluate a bounded validation loader without updating model parameters."""
     if loader is None:
         return None
@@ -647,7 +709,8 @@ def _evaluate(adapter, core, loader, device, amp_enabled):
     with torch.no_grad():
         for batch in loader:
             values, output = forward_loss(adapter, core, batch, device=device, amp_enabled=amp_enabled,
-                                          frame_cache=frame_cache, frame_stats=frame_stats)
+                                          frame_cache=frame_cache, frame_stats=frame_stats,
+                                          raw_feature_cache=raw_feature_cache)
             losses.append(float(values["total"].detach().cpu()))
             mask = batch["fast_loss_mask"].to(output.fast.move_logits.device).bool()
             for value in output.fast.move_logits.argmax(-1)[mask].detach().cpu().reshape(-1).tolist():
@@ -679,7 +742,8 @@ def _evaluate(adapter, core, loader, device, amp_enabled):
     # roughly twice the unique frames, so hit_rate near 0.5 or higher means
     # the second traversal was almost fully served from cache.
     slow_acc = _slow_accuracy(adapter, core, loader, device, amp_enabled,
-                              frame_cache=frame_cache, frame_stats=frame_stats)
+                              frame_cache=frame_cache, frame_stats=frame_stats,
+                              raw_feature_cache=raw_feature_cache)
     hits = frame_stats["hits"]
     total = frame_stats["encoded"] + hits
     return {"loss": (sum(losses) / len(losses) if losses else None),
@@ -719,6 +783,10 @@ def main(argv=None) -> int:
     parser.add_argument("--allow-base-init", action="store_true", help="仅兼容测试：允许从原始 Qwen 初始化")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--vision-micro-batch-size", type=int, default=8,
+                        help="每次送入视觉塔的图像数；2080 Ti 建议从 4/8 试起")
+    parser.add_argument("--raw-feature-cache", default="",
+                        help="增量预编码的冻结视觉特征目录；启用后训练查表")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--max-samples", type=int, default=32)
     parser.add_argument("--temporal-dim", type=int, default=256)
