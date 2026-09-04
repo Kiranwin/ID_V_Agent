@@ -18,8 +18,8 @@ from idv_agent.vla.action_chunk import (
 def build_train(session: Path, output: Path, *, stride: int = 3,
                 anchor_stride: int = 12, history_stride: int = 3, history: int = 8,
                 slow_period_s: float = 1.0) -> dict:
-    if not 3 <= history <= 8:
-        raise ValueError("v5 history 必须在 3..8")
+    if history != 8:
+        raise ValueError("v5 history 必须固定为 8")
     build(session, output, stride=stride, anchor_stride=anchor_stride,
           history_stride=history_stride, history=history,
           schema_version=VLA_SCHEMA_VERSION_V5, slow_period_s=slow_period_s)

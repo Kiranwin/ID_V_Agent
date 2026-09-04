@@ -253,10 +253,14 @@ def _validate_fast_slow_record(record: Mapping[str, Any], *, schema_version: str
 
     obs = record["observations"]
     frames = obs["frames"]
-    if strict_lengths and not 3 <= len(frames) <= 8:
+    if schema_version == VLA_SCHEMA_VERSION_V5 and strict_lengths and len(frames) != 8:
+        raise _err("observations.frames", "v5 必须包含正好 8 帧")
+    if schema_version != VLA_SCHEMA_VERSION_V5 and strict_lengths and not 3 <= len(frames) <= 8:
         raise _err("observations.frames", f"{schema_version.rsplit('.', 1)[-1]} 必须包含 3..8 帧")
     history = obs.get("history_actions", [])
-    if strict_lengths and len(history) > 8:
+    if schema_version == VLA_SCHEMA_VERSION_V5 and strict_lengths and len(history) != 8:
+        raise _err("observations.history_actions", "v5 必须包含正好 8 个宏动作 history")
+    if schema_version != VLA_SCHEMA_VERSION_V5 and strict_lengths and len(history) > 8:
         raise _err("observations.history_actions", f"{schema_version.rsplit('.', 1)[-1]} 最多 8 个历史动作")
     if camera_pixels_required:
         for i, action in enumerate(history):
@@ -270,6 +274,9 @@ def _validate_fast_slow_record(record: Mapping[str, Any], *, schema_version: str
     if camera_pixels_required:
         for i, action in enumerate(record["action_chunk"]):
             _validate_action(action, f"action_chunk[{i}]", camera_pixels_required=True)
+            if schema_version == VLA_SCHEMA_VERSION_V5 and action["duration_frames"] != MACRO_FRAMES:
+                raise _err(f"action_chunk[{i}].duration_frames",
+                           f"v5 必须固定为 {MACRO_FRAMES} 帧")
 
     if "slow_label" not in record:
         raise _err("slow_label", "缺少字段")

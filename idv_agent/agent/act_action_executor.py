@@ -12,7 +12,7 @@ import torch
 from idv_agent.agent.action_decoder import Command
 from idv_agent.configs.keymap import DEFAULT_SURVIVOR_KEYMAP, SurvivorKeymap
 from idv_agent.vla.action_chunk import (
-    BUTTON_NAMES, CAMERA_BUCKETS, MOVE_DIRECTIONS, camera_command_pixels,
+    BUTTON_NAMES, CAMERA_BUCKETS, MACRO_FRAMES, MOVE_DIRECTIONS, camera_command_pixels,
 )
 
 
@@ -43,8 +43,10 @@ class ACTActionChunkExecutor:
                  keymap: SurvivorKeymap = DEFAULT_SURVIVOR_KEYMAP,
                  capture_fps: float = 30.0, tick_hz: float = 15.0,
                  dry_run: bool = True):
-        if capture_fps <= 0 or tick_hz <= 0:
-            raise ValueError("capture_fps/tick_hz 必须为正数")
+        if float(capture_fps) != 30.0:
+            raise ValueError("v5 ACT 必须使用 capture_fps=30")
+        if tick_hz <= 0:
+            raise ValueError("tick_hz 必须为正数")
         self.send = send
         self.keymap = keymap
         self.capture_fps = float(capture_fps)
@@ -69,8 +71,8 @@ class ACTActionChunkExecutor:
         for step in incoming:
             duration = int(getattr(step, "duration_frames", 0))
             move = int(getattr(step, "move_dir", -1))
-            if not 1 <= duration <= 30:
-                raise ValueError("duration_frames 必须在 1..30")
+            if duration != MACRO_FRAMES:
+                raise ValueError(f"v5 duration_frames 必须固定为 {MACRO_FRAMES}")
             if not 0 <= move < len(MOVE_DIRECTIONS):
                 raise ValueError("move_dir 超出 v5 范围")
             buttons = tuple(getattr(step, "buttons", ()))

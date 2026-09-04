@@ -44,11 +44,13 @@ def make_valid_session(path: Path, *, frame_count: int = 3) -> Path:
 
 
 def make_v4_ready_session(path: Path) -> Path:
-    make_valid_session(path, frame_count=60)
+    # v5 needs 48 past frames for eight 6-frame macro-history actions and
+    # 24 future frames for its four labels; 80 leaves a non-empty sample set.
+    make_valid_session(path, frame_count=80)
     write_csv(
         path / "intent_segments.csv",
         ("segment_id", "start_frame", "end_frame", "intent", "candidate_reason", "notes"),
-        [{"segment_id": "seg_000", "start_frame": 0, "end_frame": 59,
+        [{"segment_id": "seg_000", "start_frame": 0, "end_frame": 79,
           "intent": "travel", "candidate_reason": "test", "notes": ""}],
     )
     return path

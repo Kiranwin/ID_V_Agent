@@ -95,26 +95,26 @@ def test_build_v5_buckets_camera_from_raw_pixel_displacement(tmp_path: Path):
     session = tmp_path / "ep"
     frames = session / "frames"
     frames.mkdir(parents=True)
-    for i in range(60):
+    for i in range(80):
         (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
     (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
     (session / "frame_timestamps.csv").write_text(
-        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(60)),
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(80)),
         encoding="utf-8",
     )
     (session / "mouse_deltas.csv").write_text(
-        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},3,0\n" for i in range(60)),
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},3,0\n" for i in range(80)),
         encoding="utf-8",
     )
     (session / "intent_segments.csv").write_text(
-        "segment_id,start_frame,end_frame,intent\nseg_000,0,59,travel\n", encoding="utf-8"
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,79,travel\n", encoding="utf-8"
     )
     (session / "meta.json").write_text(
         json.dumps({"recording_type": "vla_raw", "mode": "standard",
-                    "num_frames": 60, "target_fps": 30}), encoding="utf-8")
+                    "num_frames": 80, "target_fps": 30}), encoding="utf-8")
 
     output = tmp_path / "vla_v5.jsonl"
-    build(session, output, stride=3, history=3, macro_frames=6,
+    build(session, output, stride=3, history=8, macro_frames=6,
           schema_version=VLA_SCHEMA_VERSION_V5)
 
     record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
@@ -127,38 +127,125 @@ def test_v5_separates_anchor_sampling_from_history_sampling(tmp_path: Path):
     session = tmp_path / "ep"
     frames = session / "frames"
     frames.mkdir(parents=True)
-    for i in range(80):
+    for i in range(140):
         (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
     (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
     (session / "frame_timestamps.csv").write_text(
-        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(80)),
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(140)),
         encoding="utf-8",
     )
     (session / "mouse_deltas.csv").write_text(
-        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(80)),
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(140)),
         encoding="utf-8",
     )
     (session / "intent_segments.csv").write_text(
-        "segment_id,start_frame,end_frame,intent\nseg_000,0,79,travel\n",
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,139,travel\n",
         encoding="utf-8",
     )
     (session / "meta.json").write_text(
         json.dumps({"recording_type": "vla_raw", "mode": "standard",
-                    "num_frames": 80, "target_fps": 30}), encoding="utf-8")
+                    "num_frames": 140, "target_fps": 30}), encoding="utf-8")
     output = tmp_path / "vla_v5.jsonl"
 
-    build(session, output, anchor_stride=12, history_stride=3, history=3,
+    build(session, output, anchor_stride=12, history_stride=3, history=8,
           macro_frames=6, schema_version=VLA_SCHEMA_VERSION_V5)
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
 
-    assert [row["anchor_frame"] for row in records] == [6, 18, 30, 42, 54]
-    assert [frame["frame_index"] for frame in records[0]["observations"]["frames"]] == [0, 3, 6]
-    assert [frame["frame_index"] for frame in records[1]["observations"]["frames"]] == [12, 15, 18]
+    assert [row["anchor_frame"] for row in records] == [47, 59, 71, 83, 95, 107]
+    assert [frame["frame_index"] for frame in records[0]["observations"]["frames"]] == [26, 29, 32, 35, 38, 41, 44, 47]
+    assert [frame["frame_index"] for frame in records[1]["observations"]["frames"]] == [38, 41, 44, 47, 50, 53, 56, 59]
+    assert len(records[0]["observations"]["history_actions"]) == 8
+    assert all("duration_frames" not in action
+               for action in records[0]["observations"]["history_actions"])
+
+
+def test_v5_history_actions_are_six_frame_macro_summaries(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(140):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(140)),
+        encoding="utf-8",
+    )
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},3,0\n" for i in range(80)),
+        encoding="utf-8",
+    )
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,139,travel\n",
+        encoding="utf-8",
+    )
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 140, "target_fps": 30}), encoding="utf-8")
+    output = tmp_path / "vla_v5.jsonl"
+
+    build(session, output, anchor_stride=12, history_stride=3, history=8,
+          macro_frames=6, schema_version=VLA_SCHEMA_VERSION_V5)
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    history = record["observations"]["history_actions"]
+    assert record["anchor_frame"] == 47
+    assert [action["camera_dx_px"] for action in history] == [18.0] * 8
+    assert [action["camera_dx"] for action in history] == [1] * 8
+
+
+def test_v5_rejects_non_six_duration():
+    from idv_agent.vla.action_chunk import validate_v5_record
+
+    slow_label = {"valid": True, "segment_id": "seg_000", "intent": "travel",
+                  "subgoal": "move_to_target", "subgoal_source": "rule",
+                  "subgoal_rule_version": "subgoal.v1"}
+    action = {"move_dir": 0, "camera_dx": 0, "camera_dy": 0,
+              "camera_dx_px": 0.0, "camera_dy_px": 0.0,
+              "buttons": [0, 0, 0, 0, 0, 0], "duration_frames": 5}
+    history_action = {key: value for key, value in action.items()
+                      if key != "duration_frames"}
+    row = _record()
+    row.update({
+        "schema_version": VLA_SCHEMA_VERSION_V5,
+        "anchor_frame": 23,
+        "slow_label": slow_label,
+        "loss_mask": {"slow": 1, "fast": 1},
+        "action_chunk": [action.copy() for _ in range(ACTION_CHUNK_HORIZON)],
+    })
+    row.pop("intent")
+    row["observations"]["frames"] = [
+        {"path": f"frames/{i:08d}.jpg", "frame_index": i,
+         "timestamp_ns": i * 1000, "slow_label": slow_label}
+        for i in range(16, 24)
+    ]
+    row["observations"]["history_actions"] = [history_action.copy() for _ in range(8)]
+    row["alignment"].update({
+        "observation_end_frame": 23,
+        "action_start_frame": 25,
+        "action_end_frame": 44,
+        "observation_end_timestamp_ns": 23000,
+        "action_start_timestamp_ns": 25000,
+        "action_end_timestamp_ns": 44000,
+    })
+    try:
+        validate_v5_record(row)
+    except ValueError as exc:
+        assert "duration_frames" in str(exc)
+    else:
+        raise AssertionError("v5 duration must remain fixed at six frames")
 
 
 def test_build_rejects_nonpositive_sampling_steps(tmp_path: Path):
     with pytest.raises(ValueError, match="stride"):
         build(tmp_path / "missing", tmp_path / "vla.jsonl", anchor_stride=0)
+
+
+def test_v5_builder_rejects_noncanonical_temporal_protocol(tmp_path: Path):
+    with pytest.raises(ValueError, match="history_stride"):
+        build(tmp_path / "missing", tmp_path / "vla.jsonl", history=8,
+              history_stride=2, schema_version=VLA_SCHEMA_VERSION_V5)
+    with pytest.raises(ValueError, match="macro_frames"):
+        build(tmp_path / "missing", tmp_path / "vla.jsonl", history=8,
+              macro_frames=5, schema_version=VLA_SCHEMA_VERSION_V5)
 
 
 def test_build_rejects_missing_per_frame_action_after_extraction(tmp_path: Path, monkeypatch):
