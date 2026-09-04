@@ -136,15 +136,44 @@ class SpatialGridEncoder(nn.Module):
         merged = {"pixel_values": pixel}
         if all("image_grid_thw" in p for p in prepared):
             merged["image_grid_thw"] = torch.cat([p["image_grid_thw"] for p in prepared], dim=0)
+        else:
+            raise ValueError("spatial 编码必须提供 image_grid_thw")
         # 取冻结视觉塔的公共 per-token 辅助：在 Qwen3VL(ForConditionalGeneration)
         # 上为 get_image_features；必要时沿 model.model 再试一层。
         image_features = getattr(self.adapter.model, "get_image_features", None)
         if image_features is None and hasattr(self.adapter.model, "model"):
             image_features = getattr(self.adapter.model.model, "get_image_features", None)
         if image_features is None:
-            raise RuntimeError("adapter 无 get_image_features，无法取 per-token 输出")
-        out = image_features(pixel_values=merged["pixel_values"],
-                             image_grid_thw=merged["image_grid_thw"])
+            visual = getattr(self.adapter.model, "visual", None)
+            if visual is None and hasattr(self.adapter.model, "model"):
+                visual = getattr(self.adapter.model.model, "visual", None)
+            if visual is None:
+                raise RuntimeError("adapter 无 per-token visual 输出")
+            parts = []
+            for item in prepared:
+                kwargs = {"hidden_states": item["pixel_values"],
+                          "grid_thw": item["image_grid_thw"]}
+                try:
+                    part = visual(**kwargs)
+                except TypeError:
+                    part = visual(pixel_values=item["pixel_values"],
+                                  image_grid_thw=item["image_grid_thw"])
+                if hasattr(part, "last_hidden_state"):
+                    part = part.last_hidden_state
+                elif isinstance(part, (tuple, list)):
+                    part = next(x for x in part if isinstance(x, torch.Tensor))
+                if part.ndim == 2:
+                    part = part.unsqueeze(0)
+                if part.ndim != 3:
+                    raise ValueError("visual 输出必须为 [B,L,D]")
+                parts.append(part)
+            if len({part.shape[1] for part in parts}) == 1:
+                out = torch.cat(parts, dim=0)
+            else:
+                out = torch.cat([part.reshape(-1, part.shape[-1]) for part in parts], dim=0)
+        else:
+            out = image_features(pixel_values=merged["pixel_values"],
+                                 image_grid_thw=merged["image_grid_thw"])
         if hasattr(out, "last_hidden_state"):
             out = out.last_hidden_state
         elif isinstance(out, (tuple, list)):
@@ -159,13 +188,15 @@ class SpatialGridEncoder(nn.Module):
         raise ValueError(f"spatial 要求 [B,L,D] 或 [总token,D]，收到 {tuple(out.shape)}")
 
     def _from_batched(self, out, grids, dev):
-        # out: [B, Lx, D]
-        row_all, geo_all = per_image_rows_and_geo(grids, self.merge_size,
-                                                  out.shape[0] * out.shape[1])
+        # out: [B, Lx, D].  Resolve each image independently because a batch
+        # may contain different image_grid_thw resolutions.
         outs = []
         for i in range(out.shape[0]):
             vec = out[i]
-            outs.append(grid_spatial_pool(vec, row_all[i], *geo_all[i], self.k))
+            row_list, geo_list = per_image_rows_and_geo(
+                [grids[i]], self.merge_size, vec.shape[0]
+            )
+            outs.append(grid_spatial_pool(vec, row_list[0], *geo_list[0], self.k))
         return torch.stack(outs, 0).to(dev)
 
     def _from_flattened(self, tok, grids, dev):

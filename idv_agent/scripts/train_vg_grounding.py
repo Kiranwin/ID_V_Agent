@@ -21,6 +21,8 @@ from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from idv_agent.model.spatial_agg import SpatialAgg
+from idv_agent.model.spatial_grid_feature import grid_spatial_pool, per_image_rows_and_geo
 from idv_agent.training.checkpoint_manifest import (
     build_manifest, load_manifest, sha256_file, write_manifest,
 )
@@ -135,10 +137,11 @@ def _question_embedding(model: nn.Module, processor: Any, question: str, device:
         return model.get_input_embeddings()(ids).mean(dim=1).squeeze(0).float()
 
 
-def _visual_embedding(model: nn.Module, processor: Any, image: Image.Image, device: torch.device) -> torch.Tensor:
+def _visual_embedding(model: nn.Module, processor: Any, image: Image.Image, device: torch.device,
+                      agg: SpatialAgg, k: int = 8) -> torch.Tensor:
     image_processor = getattr(processor, "image_processor", processor)
-    inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-              for k, v in dict(image_processor(images=image, return_tensors="pt")).items()}
+    inputs = {kd: (v.to(device) if isinstance(v, torch.Tensor) else v)
+              for kd, v in dict(image_processor(images=image, return_tensors="pt")).items()}
     image_features = getattr(model, "get_image_features", None)
     if image_features is None and hasattr(model, "base_model"):
         image_features = getattr(model.base_model, "get_image_features", None)
@@ -152,11 +155,18 @@ def _visual_embedding(model: nn.Module, processor: Any, image: Image.Image, devi
             out = next(x for x in out if isinstance(x, torch.Tensor))
         if out.ndim == 2:
             out = out.unsqueeze(0)
-        pooled = out.mean(dim=1)
-    # The image processor is called with one image; normalize the returned
-    # pooled feature to a single-sample vector so it can be concatenated with
-    # the similarly squeezed question embedding.
-    return pooled.float().squeeze(0)
+    # 保留 k×k 保胞位置后再用可训 agg 压回单向量。
+    grid_thw = inputs["image_grid_thw"]
+    grids = [tuple(int(x) for x in grid_thw[0].tolist())]        # (t,h,w)
+    L = out.shape[1]
+    vision_config = getattr(getattr(model, "config", None), "vision_config", None)
+    merge_size = int(getattr(vision_config, "spatial_merge_size", 2))
+    rows_per, geo = per_image_rows_and_geo(grids, merge_size, L)
+    rows, (gh, gw) = rows_per[0], geo[0]
+    tok = out[0]                                             # [L,D]
+    cells = grid_spatial_pool(tok.float(), rows, gh, gw, k)  # [k*k, D]
+    # cells 由冻结视觉塔 no_grad 产出；agg 是可训（train 模式走出 no_grad 段）。
+    return agg(cells.unsqueeze(0)).squeeze(0)
 
 
 def _split_rows(rows: list[dict[str, Any]], fraction: float, seed: int):
@@ -193,17 +203,30 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     model, processor, parent, base_model = _load_parent(Path(args.init_checkpoint), args.model_path or None, device, dtype)
     # Raw Qwen vision features are projected by a small trainable layer; the
     # parent WK language adapter and Qwen vision tower remain frozen.
-    first_raw = _visual_embedding(model, processor, train_rows[0]["image"], device)
+    spatial_k = int(getattr(args, "spatial_k", 8))
+    if spatial_k < 1:
+        raise ValueError("spatial-k 必须为正数")
+    # 阶段二空间保胞通道：k×k 保胞(SpatialGrid 折叠) + 可训 SpatialAgg 压回单向量
+    agg = SpatialAgg(dim=1024, n_query=1, k=spatial_k).to(device=device, dtype=torch.float32)
+    # Raw Qwen vision features are projected by a small trainable layer; the
+    # parent WK language adapter and Qwen vision tower remain frozen.
+    first_raw = _visual_embedding(model, processor, train_rows[0]["image"], device, agg=agg, k=spatial_k)
     visual_projection = nn.Linear(first_raw.numel(), 2560, bias=False).to(device=device, dtype=torch.float32)
     head = GroundingHead(2560).to(device=device, dtype=torch.float32)
-    optimizer = torch.optim.AdamW(list(visual_projection.parameters()) + list(head.parameters()), lr=args.lr)
+    params = list(visual_projection.parameters()) + list(head.parameters())
+    if agg is not None:
+        params += list(agg.parameters())
+    optimizer = torch.optim.AdamW(params, lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     loader = DataLoader(GroundingDataset(train_rows), batch_size=max(1, args.batch_size), shuffle=True, collate_fn=_collate)
     val_loader = DataLoader(GroundingDataset(val_rows), batch_size=max(1, args.batch_size), shuffle=False, collate_fn=_collate) if val_rows else None
     history: list[float] = []; iterator = iter(loader); started = time.perf_counter()
     model.eval(); visual_projection.train(); head.train()
+    agg.train()
     def run_batch(batch: dict[str, Any]):
-        visual = torch.stack([visual_projection(_visual_embedding(model, processor, image, device)) for image in batch["images"]])
+        visual = torch.stack([visual_projection(
+            _visual_embedding(model, processor, image, device, agg=agg, k=spatial_k))
+            for image in batch["images"]])
         question = torch.stack([_question_embedding(model, processor, q, device) for q in batch["questions"]])
         logits, boxes = head(visual, question)
         cls = batch["class_target"].to(device); target_box = batch["box_target"].to(device); positive = batch["positive"].to(device)
@@ -218,25 +241,34 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             loss, _, _ = run_batch(batch)
         if use_amp:
-            scaler.scale(loss).backward(); scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(list(visual_projection.parameters()) + list(head.parameters()), 1.0); scaler.step(optimizer); scaler.update()
+            scaler.scale(loss).backward(); scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(params, 1.0); scaler.step(optimizer); scaler.update()
         else:
-            loss.backward(); torch.nn.utils.clip_grad_norm_(list(visual_projection.parameters()) + list(head.parameters()), 1.0); optimizer.step()
+            loss.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); optimizer.step()
         history.append(float(loss.detach().cpu()))
     val_loss = None
     if val_loader:
-        visual_projection.eval(); head.eval(); values = []
+        visual_projection.eval(); head.eval()
+        if agg is not None:
+            agg.eval()
+        values = []
         with torch.no_grad():
             for batch in val_loader:
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp): values.append(float(run_batch(batch)[0].cpu()))
         val_loss = sum(values) / len(values) if values else None
     output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({"visual_projection": visual_projection.state_dict(), "grounding_head": head.state_dict()}, output_dir / "grounding_head.pt")
+    state = {"visual_projection": visual_projection.state_dict(), "grounding_head": head.state_dict()}
+    if agg is not None:
+        state["spatial_agg"] = agg.state_dict()
+    torch.save(state, output_dir / "grounding_head.pt")
     processor.save_pretrained(output_dir / "processor")
+    trainable = ["visual_projection", "grounding_head"]
+    if agg is not None:
+        trainable.append("spatial_agg")
     manifest = build_manifest(stage="M2_VG", parent=str(Path(args.init_checkpoint).resolve()), base_model=base_model,
-        adapters=["lora_wk", "grounding_head"], frozen=["qwen_vision_tower", "lora_wk"],
-        trainable=["visual_projection", "grounding_head"], data={"vg": str(data).replace("\\", "/"), "vg_sha256": sha256_file(data)},
+        adapters=["lora_wk", "grounding_head", "spatial_agg"], frozen=["qwen_vision_tower", "lora_wk"],
+        trainable=trainable, data={"vg": str(data).replace("\\", "/"), "vg_sha256": sha256_file(data)},
         counts={"train": len(train_rows), "val": len(val_rows)}, precision="fp16+GradScaler" if use_amp else "fp32",
-        training={"method": "grounding_sft", "steps": args.steps, "learning_rate": args.lr, "batch_size": args.batch_size, "box_weight": args.box_weight},
+        training={"method": "grounding_sft", "steps": args.steps, "learning_rate": args.lr, "batch_size": args.batch_size, "box_weight": args.box_weight, "spatial_k": spatial_k},
         schema_versions=["vg.grounding.v2"], artifacts={"grounding_head": "grounding_head.pt", "processor": "processor"})
     write_manifest(output_dir / "manifest.json", manifest)
     result = {"stage": "M2_VG", "train_records": len(train_rows), "val_records": len(val_rows), "steps": args.steps,
@@ -254,6 +286,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--val-fraction", type=float, default=0.1); parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=100); parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--box-weight", type=float, default=2.0); parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--spatial-k", type=int, default=8,
+                        help="k×k 保胞数；默认 8。")
     parser.add_argument("--device", default="cuda"); parser.add_argument("--seed", type=int, default=42); parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv); torch.manual_seed(args.seed)
     try: result = train(args)

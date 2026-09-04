@@ -225,7 +225,9 @@ def test_qwen_batch_splits_unmerged_flattened_visual_tokens():
     task = TaskConditionCache(torch.zeros(2), torch.zeros(2), task_id="t")
     result = adapter.encode_frames([[[1.0, 2.0]], [[3.0, 4.0]]], task)
     assert result.shape == (2, 2)
-    assert torch.equal(result[:, 0], torch.tensor([3.0, 11.0]))
+    raw = adapter.encode_raw_frames([[[1.0, 2.0]], [[3.0, 4.0]]])
+    assert raw.shape == (2, 64, 2)
+    assert torch.equal(result, adapter.project_raw_features(raw, task))
 
 
 def test_raw_feature_projection_matches_encode_frames_exactly():

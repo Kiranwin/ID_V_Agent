@@ -143,6 +143,9 @@ def _load_model(args: argparse.Namespace, device: torch.device):
         raise ValueError("ACT checkpoint 缺少 adapter/core")
     adapter.visual_projection.load_state_dict(checkpoint["adapter"]["visual_projection"])
     adapter.condition_projection.load_state_dict(checkpoint["adapter"]["condition_projection"])
+    if "spatial_agg" in checkpoint["adapter"]:
+        agg_state = checkpoint["adapter"]["spatial_agg"]
+        adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
     temporal_dim = int(checkpoint.get("manifest", {}).get("training", {}).get("temporal_dim", args.temporal_dim))
     core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)

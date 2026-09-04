@@ -1,7 +1,7 @@
 """对照：k×k 空间 token 画面可分性 vs 现役 mean-pool（阶段一验收对照）。
 
 加载同一 adapter（冻结 Qwen 视觉塔），对同一批差异大截图，分别获得：
-  - 现役 pooled:  encode_raw_frames(...) → [N, 1024]（全图 mean）
+  - diagnostic pooled: encode_raw_frames(...).mean(dim=1) → [N, 1024]
   - spatial k×k:  build_spatial_grid_encoder(...)   → [N, k*k, 1024]（保胞位）
 比较两者画面两两余弦/L2 与“画面归一信号能量”，给出空间保留是否显著带回
 画面可分性的量化结论，供决定阶段二(接投影/时序)是否值得。
@@ -65,7 +65,8 @@ def main(argv=None):
     adapter, _, _ = _load_act_backbone(base_model, init_ckpt, dtype=dtype, device=dev)
     adapter.eval()
 
-    pooled = adapter.encode_raw_frames(probe_images, micro_batch_size=len(args.frames))  # [N,1024]
+    raw_cells = adapter.encode_raw_frames(probe_images, micro_batch_size=len(args.frames))  # [N,k*k,1024]
+    pooled = raw_cells.mean(dim=1)  # diagnostic only; production never consumes this path
     s_p = _signal(pooled)
 
     spatial_by_k = {}

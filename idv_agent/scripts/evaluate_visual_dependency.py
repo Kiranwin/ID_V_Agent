@@ -209,6 +209,9 @@ def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dic
         raise ValueError(f"ACT checkpoint 缺少 adapter/core: {checkpoint}")
     adapter.visual_projection.load_state_dict(saved["adapter"]["visual_projection"])
     adapter.condition_projection.load_state_dict(saved["adapter"]["condition_projection"])
+    if "spatial_agg" in saved["adapter"]:
+        agg_state = saved["adapter"]["spatial_agg"]
+        adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
     core.load_state_dict(saved["core"])
     adapter.eval()
     core.eval()

@@ -12,6 +12,7 @@ import torch
 
 
 POOLING_VERSION = "mean_dim1_v1"
+SPATIAL_POOLING_VERSION = "spatial_grid_k{spatial_k}_v1"
 
 
 def normalize_frame_path(path: str | Path) -> str:
@@ -19,14 +20,22 @@ def normalize_frame_path(path: str | Path) -> str:
 
 
 class RawFeatureCache:
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, spatial_k: int | None = None):
         self.root = Path(root)
+        self.spatial_k = None if spatial_k is None else int(spatial_k)
         self.index_path = self.root / "index.json"
         self._shard_cache: dict[str, torch.Tensor] = {}
         self.index = json.loads(self.index_path.read_text(encoding="utf-8")) if self.index_path.is_file() else {
-            "schema": "vla.raw_feature_cache.v1", "pooling": POOLING_VERSION,
+            "schema": "vla.raw_feature_cache.v2",
+            "pooling": (SPATIAL_POOLING_VERSION.format(spatial_k=self.spatial_k)
+                        if self.spatial_k is not None else POOLING_VERSION),
+            "spatial_k": self.spatial_k,
             "features": {}, "shards": {}, "raw_dim": None, "dtype": None,
         }
+        if self.spatial_k is not None:
+            expected = SPATIAL_POOLING_VERSION.format(spatial_k=self.spatial_k)
+            if self.index.get("pooling") != expected or self.index.get("spatial_k") != self.spatial_k:
+                raise ValueError(f"cache pooling={self.index.get('pooling')} 与 spatial_k={self.spatial_k} 不匹配")
 
     def __contains__(self, path: str | Path) -> bool:
         return normalize_frame_path(path) in self.index["features"]
@@ -43,8 +52,13 @@ class RawFeatureCache:
 
     def add_shard(self, session_id: str, paths: Iterable[str | Path], features: torch.Tensor) -> int:
         paths = [normalize_frame_path(p) for p in paths]
-        if features.ndim != 2 or len(paths) != features.shape[0]:
-            raise ValueError("paths/features shape 不匹配")
+        if self.spatial_k is None:
+            valid_shape = features.ndim == 2
+        else:
+            valid_shape = features.ndim == 3 and features.shape[1] == self.spatial_k ** 2
+        if not valid_shape or len(paths) != features.shape[0]:
+            expected = f"[N,{self.spatial_k ** 2},D]" if self.spatial_k is not None else "[N,D]"
+            raise ValueError(f"paths/features shape 不匹配，需 {expected}")
         new = [(p, i) for i, p in enumerate(paths) if p not in self.index["features"]]
         if not new:
             return 0
@@ -58,7 +72,8 @@ class RawFeatureCache:
         for offset, (path, _i) in enumerate(new):
             self.index["features"][path] = {"shard": shard_name, "offset": offset}
         self.index["shards"][shard_name] = {"session_id": session_id, "count": len(new)}
-        self.index["raw_dim"] = int(features.shape[1])
+        self.index["raw_dim"] = int(features.shape[-1])
+        self.index["feature_shape"] = list(features.shape[1:])
         self.index["dtype"] = str(features.dtype)
         return len(new)
 

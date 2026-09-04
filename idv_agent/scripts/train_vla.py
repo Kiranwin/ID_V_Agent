@@ -76,7 +76,9 @@ def _load_act_backbone(model_path: str | Path, init_checkpoint: str | Path,
     # 的可训 spatial_agg 一并载入并开启 spatial 编码通道；旧 M2_VG(mean) 保持现役。
     if "spatial_agg" in saved:
         sp_k = int(parent_manifest.get("training", {}).get("spatial_k", 8))
-        adapter.enable_spatial_agg(k=sp_k, state=saved["spatial_agg"], dim=1024)
+        agg_state = saved["spatial_agg"]
+        agg_dim = int(agg_state["position"].shape[-1])
+        adapter.enable_spatial_agg(k=sp_k, state=agg_state, dim=agg_dim)
         print(f"[_load_act_backbone] 已启用 spatial k={sp_k} (从 {init_dir.name} 载入 aggregate)", flush=True)
     return adapter, processor, parent_manifest
 
@@ -340,7 +342,18 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
                 project = getattr(adapter, "project_raw_features", None)
                 if project is None:
                     raise TypeError("raw_feature_cache 需要 adapter.project_raw_features")
-                feature = project(raw_feature_cache.get(path).to(device=device).reshape(1, -1), cache)[0]
+                raw = raw_feature_cache.get(path).to(device=device)
+                spatial_k = getattr(adapter, "spatial_k", None)
+                if spatial_k is not None:
+                    expected = f"spatial_grid_k{int(spatial_k)}_v1"
+                    if getattr(raw_feature_cache, "index", {}).get("pooling") != expected:
+                        raise ValueError(f"spatial ACT 需要 {expected} cache")
+                    if raw.ndim != 2 or raw.shape[0] != int(spatial_k) ** 2:
+                        raise ValueError("spatial ACT 只能加载 [k*k,D] grid cache")
+                    raw = raw.unsqueeze(0)
+                else:
+                    raw = raw.reshape(1, -1)
+                feature = project(raw, cache)[0]
                 batch_frame_cache[cache_key] = feature
                 row[col_index] = feature
                 if frame_stats is not None:
@@ -546,7 +559,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     raw_feature_cache = None
     if getattr(args, "raw_feature_cache", ""):
         from idv_agent.training.raw_feature_cache import RawFeatureCache
-        raw_feature_cache = RawFeatureCache(args.raw_feature_cache)
+        raw_feature_cache = RawFeatureCache(args.raw_feature_cache, spatial_k=8)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                         collate_fn=VLASequenceCollator(max_frames=8))
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
@@ -571,6 +584,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     else:
         raise ValueError("ACT 训练必须提供 --init-checkpoint M2_VG；仅兼容测试可加 --allow-base-init")
     _freeze_qwen(adapter)
+    if raw_feature_cache is not None and getattr(adapter, "spatial_k", None) is not None:
+        expected = f"spatial_grid_k{int(adapter.spatial_k)}_v1"
+        if raw_feature_cache.index.get("pooling") != expected:
+            raise ValueError(f"spatial ACT 需要 {expected} cache，收到 {raw_feature_cache.index.get('pooling')}")
     # Keep newly-trained layers in FP32 (GradScaler cannot unscale FP16
     # gradients); autocast still executes their matmuls in FP16 on CUDA.
     for name in ("visual_projection", "condition_projection"):
@@ -685,9 +702,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     mask = _mask_comparison(history, adapter, core, first_batch, device, amp_enabled)
     checkpoint = Path(args.checkpoint)
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"checkpoint_schema_version": "m3_act.internal.v1",
-                "adapter": {"visual_projection": adapter.visual_projection.state_dict(),
-                             "condition_projection": adapter.condition_projection.state_dict()},
+    adapter_state = {"visual_projection": adapter.visual_projection.state_dict(),
+                     "condition_projection": adapter.condition_projection.state_dict()}
+    if getattr(adapter, "spatial_agg", None) is not None:
+        adapter_state["spatial_agg"] = adapter.spatial_agg.state_dict()
+    torch.save({"checkpoint_schema_version": "m3_act.internal.v2",
+                "adapter": adapter_state,
                 "core": core.state_dict(),
                 "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
                 "step": args.steps, "baseline_loss": baseline}, checkpoint)
@@ -697,14 +717,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     saved = torch.load(checkpoint, map_location=device, weights_only=False)
     adapter.visual_projection.load_state_dict(saved["adapter"]["visual_projection"])
     adapter.condition_projection.load_state_dict(saved["adapter"]["condition_projection"])
+    if "spatial_agg" in saved["adapter"]:
+        agg_state = saved["adapter"]["spatial_agg"]
+        adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
     core.load_state_dict(saved["core"])
     after, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=False)
     elapsed = time.perf_counter() - started
     manifest = build_manifest(
         stage="M3_ACT", parent=str(Path(args.init_checkpoint).resolve()) if args.init_checkpoint else None,
-        base_model=args.model_path, adapters=["lora_wk", "visual_projection", "act_heads"],
+        base_model=args.model_path, adapters=["lora_wk", "visual_projection", "spatial_agg", "act_heads"],
         frozen=["qwen_vision_tower", "lora_wk"],
-        trainable=["visual_projection", "condition_projection", "shared_temporal_encoder", "slow_head", "fast_head"],
+        trainable=["visual_projection", "condition_projection", "spatial_agg",
+                   "shared_temporal_encoder", "slow_head", "fast_head"],
         data={"act": str(Path(args.data)).replace("\\", "/"), "act_glob": VLA_SCHEMA_VERSION_V5},
         counts={"train": len(dataset), "val": len(val_dataset) if val_dataset is not None else 0},
         precision="fp16+GradScaler" if amp_enabled else "fp32",
