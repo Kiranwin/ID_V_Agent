@@ -15,7 +15,7 @@ import random
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from PIL import Image
@@ -108,7 +108,8 @@ def _augment_image(image: Image.Image, params: tuple[float, float, float, float,
     return image
 
 
-def _load_images(paths: list[Path | None], *, augmentation_params=None) -> list[Image.Image | None]:
+def _load_images(paths: list[Path | None], *, augmentation_params=None,
+                 image_transform: Callable[[Image.Image], Image.Image] | None = None) -> list[Image.Image | None]:
     images: list[Image.Image | None] = []
     for path in paths:
         if path is None:
@@ -116,6 +117,8 @@ def _load_images(paths: list[Path | None], *, augmentation_params=None) -> list[
         else:
             with Image.open(path) as image:
                 loaded = image.convert("RGB")
+                if image_transform is not None:
+                    loaded = image_transform(loaded)
                 images.append(_augment_image(loaded, augmentation_params)
                               if augmentation_params is not None else loaded)
     return images
@@ -254,7 +257,8 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
                  frame_stats: dict[str, int] | None = None,
                  vision_micro_batch_size: int = 8,
                  raw_feature_cache: Any | None = None,
-                 augment_images: bool = False) -> torch.Tensor:
+                 augment_images: bool = False,
+                 image_transform: Callable[[Image.Image], Image.Image] | None = None) -> torch.Tensor:
     """Encode real images in vision micro-batches and return ``[B, L, D]`` features.
 
     ``frame_cache`` deduplicates vision-tower forwards across calls by task and
@@ -306,7 +310,8 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
                 images.append("__LOAD__")
                 load_paths.append(path)
         try:
-            loaded_images = _load_images(load_paths, augmentation_params=augmentation_params)
+            loaded_images = _load_images(load_paths, augmentation_params=augmentation_params,
+                                         image_transform=image_transform)
         except TypeError as exc:
             # Keep lightweight third-party/test loaders that implement the
             # old one-argument hook working when augmentation is disabled.
