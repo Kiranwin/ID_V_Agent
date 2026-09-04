@@ -8,7 +8,9 @@ from idv_agent.vla.action_chunk import (
     ACTION_CHUNK_HORIZON,
     HISTORY_FRAMES,
     VLA_SCHEMA_VERSION,
+    VLA_SCHEMA_VERSION_V5,
     validate_record,
+    validate_v5_record,
 )
 
 
@@ -87,6 +89,100 @@ def test_build_vla_chunks(tmp_path: Path):
     # averaged back into the neutral camera bucket.
     assert rec["action_chunk"][0]["camera_dx"] == 1
     assert rec["alignment"]["action_start_frame"] == 8
+
+
+def test_build_v5_buckets_camera_from_raw_pixel_displacement(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(60):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(60)),
+        encoding="utf-8",
+    )
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},3,0\n" for i in range(60)),
+        encoding="utf-8",
+    )
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,59,travel\n", encoding="utf-8"
+    )
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 60, "target_fps": 30}), encoding="utf-8")
+
+    output = tmp_path / "vla_v5.jsonl"
+    build(session, output, stride=3, history=3, macro_frames=6,
+          schema_version=VLA_SCHEMA_VERSION_V5)
+
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    validate_v5_record(record)
+    assert record["action_chunk"][0]["camera_dx_px"] == 18.0
+    assert record["action_chunk"][0]["camera_dx"] == 1
+
+
+def test_build_rejects_missing_per_frame_action_after_extraction(tmp_path: Path, monkeypatch):
+    """A missing source action must not be converted to a synthetic stop label."""
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(40):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text("timestamp_ns,dx,dy\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(40)),
+        encoding="utf-8",
+    )
+    (session / "meta.json").write_text(json.dumps({
+        "recording_type": "vla_raw", "mode": "standard", "num_frames": 40,
+        "target_fps": 30,
+    }), encoding="utf-8")
+
+    def write_incomplete_actions(path):
+        (path / "per_frame_actions.csv").write_text(
+            "frame_idx,timestamp_ns,move_x,move_y,cam_dx,cam_dy,category_name,held_keys\n"
+            + "".join(f"{i},{i * 1000},0,1,0,0,MOVE,key:w\n" for i in range(39)),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr("idv_agent.scripts.build_vla_chunks.extract_session", write_incomplete_actions)
+    with pytest.raises(ValueError, match="覆盖|缺少"):
+        build(session, tmp_path / "vla.jsonl", history=3)
+
+
+def test_build_rejects_nonfinite_per_frame_action(tmp_path: Path, monkeypatch):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(40):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text("timestamp_ns,dx,dy\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(40)),
+        encoding="utf-8",
+    )
+    (session / "meta.json").write_text(json.dumps({
+        "recording_type": "vla_raw", "mode": "standard", "num_frames": 40,
+        "target_fps": 30,
+    }), encoding="utf-8")
+
+    def write_nonfinite_actions(path):
+        rows = "".join(
+            f"{i},{i * 1000},{'nan' if i == 5 else 0},1,0,0,MOVE,key:w\n"
+            for i in range(40)
+        )
+        (path / "per_frame_actions.csv").write_text(
+            "frame_idx,timestamp_ns,move_x,move_y,cam_dx,cam_dy,category_name,held_keys\n" + rows,
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr("idv_agent.scripts.build_vla_chunks.extract_session", write_nonfinite_actions)
+    with pytest.raises(ValueError, match="有限|move_x"):
+        build(session, tmp_path / "vla.jsonl", history=3)
 
 
 def test_mode_token_is_required_and_canonical():

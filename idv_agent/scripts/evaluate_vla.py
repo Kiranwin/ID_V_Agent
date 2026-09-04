@@ -176,7 +176,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", required=True, help="一个或多个 vla_chunks_v4.jsonl（逗号/分号分隔）")
+    parser.add_argument("--data", required=True, help="一个或多个 vla_chunks_v5.jsonl（逗号/分号分隔）")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--init-checkpoint", required=True, help="M2_VG 目录")
     parser.add_argument("--checkpoint", required=True, help="M3_ACT act_*.pt")

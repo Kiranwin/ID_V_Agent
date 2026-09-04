@@ -36,7 +36,7 @@ function renderSessions(sessions) {
     button.className = `session-item ${state.selected === session.name ? "active" : ""}`;
     button.dataset.session = session.name;
     const status = session.raw_valid ? "valid" : "warning";
-    button.innerHTML = `<span class="session-icon">${session.raw_valid ? "●" : "!"}</span><span class="session-copy"><strong></strong><small>${session.frame_count} frames · ${session.duration_s.toFixed(1)}s</small></span><span class="file-status"><i class="${session.has_actions ? "on" : ""}">A</i><i class="${session.has_intents ? "on" : ""}">I</i><i class="${session.has_v4_chunks ? "on" : ""}">V4</i></span>`;
+    button.innerHTML = `<span class="session-icon">${session.raw_valid ? "●" : "!"}</span><span class="session-copy"><strong></strong><small>${session.frame_count} frames · ${session.duration_s.toFixed(1)}s</small></span><span class="file-status"><i class="${session.has_actions ? "on" : ""}">A</i><i class="${session.has_intents ? "on" : ""}">I</i><i class="${session.has_v5_chunks ? "on" : ""}">V5</i></span>`;
     button.querySelector("strong").textContent = session.name;
     button.querySelector(".session-icon").classList.add(status);
     button.addEventListener("click", () => selectSession(session.name));
@@ -211,9 +211,9 @@ function renderSummary(summary) {
   $("metric-fps").textContent = `${Number(summary.fps || 0).toFixed(1)} FPS`;
   $("metric-raw").textContent = summary.raw_errors.length ? "Needs review" : "Valid";
   $("metric-raw").className = summary.raw_errors.length ? "bad" : "good";
-  $("metric-outputs").textContent = `${summary.has_actions ? "A" : "–"} / ${summary.has_intents ? "I" : "–"} / ${summary.v4_chunks?.exists ? "V4" : "–"} / ${summary.v4_chunks?.audit_exists ? "✓" : "–"}`;
-  const auditText = !summary.v4_chunks?.audit_exists ? "audit missing" : summary.v4_chunks.audit_gate_pass ? "audit gate passed" : `audit gate blocked (${summary.v4_chunks.audit_conflicts || 0} conflicts)`;
-  $("metric-output-detail").textContent = summary.v4_chunks?.exists ? `${summary.v4_chunks.count} vla_chunks_v4 records · ${auditText}` : "actions / intents / v4 chunks / audit";
+  $("metric-outputs").textContent = `${summary.has_actions ? "A" : "–"} / ${summary.has_intents ? "I" : "–"} / ${summary.v5_chunks?.exists ? "V5" : "–"} / ${summary.v5_chunks?.audit_exists ? "✓" : "–"}`;
+  const auditText = !summary.v5_chunks?.audit_exists ? "audit missing" : summary.v5_chunks.audit_gate_pass ? "audit gate passed" : `audit gate blocked (${summary.v5_chunks.audit_conflicts || 0} conflicts)`;
+  $("metric-output-detail").textContent = summary.v5_chunks?.exists ? `${summary.v5_chunks.count} vla_chunks_v5 records · ${auditText}` : "actions / intents / v5 chunks / audit";
   $("move-frames").textContent = `${summary.movement_frames} / ${summary.frame_count}`;
   $("camera-frames").textContent = `${summary.camera_frames} / ${summary.frame_count}`;
   $("event-total").textContent = summary.event_count || 0;
@@ -254,7 +254,7 @@ $("extract-actions").addEventListener("click", (event) => runOperation(event.cur
 $("init-intents").addEventListener("click", (event) => runOperation(event.currentTarget, "/intents/init"));
 $("build-chunks").addEventListener("click", async (event) => {
   const button = event.currentTarget;
-  button.disabled = true; clearError(); setStatus("Building vla_chunks_v4 and audit...");
+  button.disabled = true; clearError(); setStatus("Building vla_chunks_v5 and audit...");
   try {
     const result = await api(`/api/sessions/${encodeURIComponent(state.selected)}/chunks/build`, { method: "POST", body: JSON.stringify({}) });
     await selectSession(state.selected);

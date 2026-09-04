@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from idv_agent.labels.extract import extract_session
 from idv_agent.scripts.init_intent_segments import init as init_intent_segments
-from idv_agent.scripts.train_vla_chunks_v4 import build_train
+from idv_agent.scripts.train_vla_chunks_v5 import build_train
 from idv_agent.scripts.validate_intent_segments import validate as validate_intents
 from idv_agent.scripts.validate_vla_raw import validate as validate_raw
 
@@ -12,7 +12,7 @@ from .session_store import SessionStore
 
 
 class DataWorkbench:
-    CHUNKS_FILENAME = "vla_chunks_v4.jsonl"
+    CHUNKS_FILENAME = "vla_chunks_v5.jsonl"
 
     def __init__(self, store: SessionStore):
         self.store = store
@@ -38,8 +38,8 @@ class DataWorkbench:
             raise FileExistsError(str(existing))
         return init_intent_segments(session, output, overwrite=overwrite)
 
-    def build_vla_chunks_v4(self, name: str) -> dict:
-        """Build and audit the canonical v4 training file."""
+    def build_vla_chunks_v5(self, name: str) -> dict:
+        """Build and audit the canonical v5 training file."""
         session = self.store.resolve_session(name)
         errors = validate_raw(session)
         if errors:
@@ -74,4 +74,5 @@ class DataWorkbench:
             "gate_pass": report["gate_pass"],
         }
 
-    build_train_vla_chunks = build_vla_chunks_v4
+    build_vla_chunks_v4 = build_vla_chunks_v5
+    build_train_vla_chunks = build_vla_chunks_v5

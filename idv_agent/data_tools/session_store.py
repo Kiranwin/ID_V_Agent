@@ -171,7 +171,7 @@ class SessionStore:
             "raw_valid": not raw_errors,
             "has_actions": (session / "per_frame_actions.csv").is_file(),
             "has_intents": (session / "intent_segments.csv").is_file() or (session / "intent_segments.jsonl").is_file(),
-            "has_v4_chunks": (session / "vla_chunks_v4.jsonl").is_file(),
+            "has_v5_chunks": (session / "vla_chunks_v5.jsonl").is_file(),
             "event_count": len(events),
             "key_event_count": sum(1 for row in events if str(row.get("kind", "")).startswith("key_")),
         }
@@ -247,14 +247,14 @@ class SessionStore:
             "mean_abs": {field: round(_mean_abs(action_rows, field), 5) for field in ACTION_NUMERIC_FIELDS},
             "intent_rows": intent_rows,
             "previews": previews,
-            "v4_chunks": {
-                "filename": "vla_chunks_v4.jsonl",
-                "audit_filename": "vla_chunks_v4.audit.json",
-                "exists": (session / "vla_chunks_v4.jsonl").is_file(),
-                "count": self._jsonl_count(session / "vla_chunks_v4.jsonl"),
-                "audit_exists": (session / "vla_chunks_v4.audit.json").is_file(),
-                "audit_gate_pass": _json_object(session / "vla_chunks_v4.audit.json").get("gate_pass"),
-                "audit_conflicts": _json_object(session / "vla_chunks_v4.audit.json").get("slow_label_conflict_count", 0),
+            "v5_chunks": {
+                "filename": "vla_chunks_v5.jsonl",
+                "audit_filename": "vla_chunks_v5.audit.json",
+                "exists": (session / "vla_chunks_v5.jsonl").is_file(),
+                "count": self._jsonl_count(session / "vla_chunks_v5.jsonl"),
+                "audit_exists": (session / "vla_chunks_v5.audit.json").is_file(),
+                "audit_gate_pass": _json_object(session / "vla_chunks_v5.audit.json").get("gate_pass"),
+                "audit_conflicts": _json_object(session / "vla_chunks_v5.audit.json").get("slow_label_conflict_count", 0),
             },
         }
 

@@ -1,4 +1,4 @@
-"""Execute VLA-v4 macro action chunks with duration-aware key state."""
+"""Execute VLA-v5 macro action chunks with duration-aware key state."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ import torch
 
 from idv_agent.agent.action_decoder import Command
 from idv_agent.configs.keymap import DEFAULT_SURVIVOR_KEYMAP, SurvivorKeymap
-from idv_agent.vla.action_chunk import BUTTON_NAMES, CAMERA_BUCKETS, MOVE_DIRECTIONS
+from idv_agent.vla.action_chunk import (
+    BUTTON_NAMES, CAMERA_BUCKETS, MOVE_DIRECTIONS, camera_command_pixels,
+)
 
 
 _MOVE_KEYS = {
@@ -30,7 +32,7 @@ class _ActiveStep:
 
 
 class ACTActionChunkExecutor:
-    """Stateful executor for v4 chunks.
+    """Stateful executor for v5 chunks.
 
     ``send`` receives a list of :class:`Command` objects.  The default
     callback is intentionally absent: callers must wire an ActionExecutor and
@@ -40,14 +42,13 @@ class ACTActionChunkExecutor:
     def __init__(self, send: Callable[[Iterable[Command]], None], *,
                  keymap: SurvivorKeymap = DEFAULT_SURVIVOR_KEYMAP,
                  capture_fps: float = 30.0, tick_hz: float = 15.0,
-                 dry_run: bool = True, cam_pixel_scale: float = 120.0):
-        if capture_fps <= 0 or tick_hz <= 0 or cam_pixel_scale <= 0:
-            raise ValueError("capture_fps/tick_hz/cam_pixel_scale 必须为正数")
+                 dry_run: bool = True):
+        if capture_fps <= 0 or tick_hz <= 0:
+            raise ValueError("capture_fps/tick_hz 必须为正数")
         self.send = send
         self.keymap = keymap
         self.capture_fps = float(capture_fps)
         self.tick_period = 1.0 / float(tick_hz)
-        self.cam_pixel_scale = float(cam_pixel_scale)
         self.dry_run = bool(dry_run)
         self._queue: list[object] = []
         self._active: _ActiveStep | None = None
@@ -71,7 +72,7 @@ class ACTActionChunkExecutor:
             if not 1 <= duration <= 30:
                 raise ValueError("duration_frames 必须在 1..30")
             if not 0 <= move < len(MOVE_DIRECTIONS):
-                raise ValueError("move_dir 超出 v4 范围")
+                raise ValueError("move_dir 超出 v5 范围")
             buttons = tuple(getattr(step, "buttons", ()))
             if len(buttons) != len(BUTTON_NAMES) or any(v not in (0, 1) for v in buttons):
                 raise ValueError("buttons 必须是六个 0/1 值")
@@ -86,8 +87,8 @@ class ACTActionChunkExecutor:
                 value = getattr(self.keymap, attr, None)
                 if value:
                     keys.add(value)
-        dx = float(step.camera_dx) * self.cam_pixel_scale
-        dy = float(step.camera_dy) * self.cam_pixel_scale
+        dx = camera_command_pixels(int(step.camera_dx))
+        dy = camera_command_pixels(int(step.camera_dy))
         return keys, dx, dy
 
     def _apply(self, step: object) -> None:
@@ -107,7 +108,7 @@ class ACTActionChunkExecutor:
         return tuple(self._history)
 
     def history_tensor(self, *, device: torch.device | str = "cpu") -> torch.Tensor:
-        """Encode executed history using the v4 9-field action representation."""
+        """Encode executed history using the v5 9-field action representation."""
         values: list[float] = []
         for step in self._history:
             values.extend((float(step.move_dir), float(CAMERA_BUCKETS.index(step.camera_dx)),

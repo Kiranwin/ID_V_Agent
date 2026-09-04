@@ -165,7 +165,12 @@ def build_frame_grid(
             "timestamp_ns": ts,
             "category_id": cat_id,
             "category_name": ActionCategory(cat_id).name,
-            "move_x": nx, "move_y": ny, "cam_dx": cam_dx, "cam_dy": cam_dy,
+            "move_x": nx, "move_y": ny,
+            # v5 action chunks use these unscaled Raw Input sums directly.
+            "cam_dx_px": float(frame.mouse_dx), "cam_dy_px": float(frame.mouse_dy),
+            # Retained for historical v3/v4 conversion only.  New ACT data
+            # must derive camera buckets from cam_*_px above.
+            "cam_dx": cam_dx, "cam_dy": cam_dy,
             "held_keys": held_keys,
             "text_action": text_action,
             # P2：校准帧标记（后续视觉辅助标注用）

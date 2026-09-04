@@ -1,4 +1,4 @@
-"""Dataset and collator for VLA action-chunk v4 records."""
+"""Dataset and collator for VLA action-chunk v5 records."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 from idv_agent.configs.game_mode import GAME_MODE_CHOICES
 from idv_agent.configs.subgoal import SUBGOAL_NAMES
-from idv_agent.vla.action_chunk import CAMERA_BUCKETS, INTENTS, validate_v4_record
+from idv_agent.vla.action_chunk import CAMERA_BUCKETS, INTENTS, validate_v5_record
 
 
 CAMERA_TO_INDEX = {value: index for index, value in enumerate(CAMERA_BUCKETS)}
@@ -21,7 +21,7 @@ HISTORY_ACTION_STEPS = 8
 
 
 class VLASequenceDataset(Dataset):
-    """Read one or more v4 JSONL files without loading model-specific pixels.
+    """Read one or more v5 JSONL files without loading model-specific pixels.
 
     Image paths stay lazy so Qwen/SigLIP processors can load them in their own
     adapter.  Validation happens once at dataset construction, not inside every
@@ -46,7 +46,7 @@ class VLASequenceDataset(Dataset):
                     except json.JSONDecodeError as exc:
                         raise ValueError(f"{path}:{line_no} JSON 无效") from exc
                     try:
-                        validate_v4_record(record)
+                        validate_v5_record(record)
                     except ValueError as exc:
                         raise ValueError(f"{path}:{line_no}: {exc}") from exc
                     image_root = Path(record.get("source_root", path.parent))

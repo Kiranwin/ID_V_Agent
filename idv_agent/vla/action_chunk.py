@@ -15,6 +15,7 @@ from idv_agent.configs.subgoal import SUBGOAL_NAMES, subgoals_for_intent
 
 VLA_SCHEMA_VERSION = "vla.action_chunk.v3"
 VLA_SCHEMA_VERSION_V4 = "vla.action_chunk.v4"
+VLA_SCHEMA_VERSION_V5 = "vla.action_chunk.v5"
 
 # Fixed lengths keep collation and low-latency rolling inference predictable.
 HISTORY_FRAMES = 3
@@ -34,6 +35,11 @@ MOVE_DIRECTIONS = (
 # Five bins per camera axis are enough for a fast first controller.  Raw mouse
 # deltas may remain in auxiliary metadata for later re-bucketing.
 CAMERA_BUCKETS = (-2, -1, 0, 1, 2)
+# v5 camera labels are quantized from a macro action's net Raw Input pixels,
+# not from a normalized per-frame value.  The same constants also define the
+# only legal ACT execution magnitudes, keeping labels and deployment aligned.
+CAMERA_BUCKET_EDGES_PX = (12.0, 48.0)
+CAMERA_BUCKET_COMMAND_PX = {-2: -110.0, -1: -25.0, 0: 0.0, 1: 25.0, 2: 110.0}
 BUTTON_NAMES = ("interact", "vault", "item", "heal", "sprint", "crouch")
 # Top-level tactical intent; sub-intents are optional metadata, not model heads.
 INTENTS = ("decipher", "kite", "rescue", "rotate", "travel", "search", "gate", "idle")
@@ -56,7 +62,30 @@ def _finite_number(value: Any, path: str) -> float:
     return number
 
 
-def _validate_action(action: Any, path: str, *, duration_required: bool = True) -> None:
+def camera_bucket_from_pixels(value: Any) -> int:
+    """Quantize one macro action's net camera displacement in pixels."""
+    pixels = _finite_number(value, "camera_pixels")
+    fine, coarse = CAMERA_BUCKET_EDGES_PX
+    if pixels < -coarse:
+        return -2
+    if pixels < -fine:
+        return -1
+    if pixels <= fine:
+        return 0
+    if pixels <= coarse:
+        return 1
+    return 2
+
+
+def camera_command_pixels(bucket: int) -> float:
+    """Return the v5 physical mouse command for a camera bucket."""
+    if isinstance(bucket, bool) or bucket not in CAMERA_BUCKET_COMMAND_PX:
+        raise ValueError(f"camera bucket 必须是 {CAMERA_BUCKETS}")
+    return CAMERA_BUCKET_COMMAND_PX[bucket]
+
+
+def _validate_action(action: Any, path: str, *, duration_required: bool = True,
+                     camera_pixels_required: bool = False) -> None:
     if not isinstance(action, Mapping):
         raise _err(path, "必须是对象")
     move_dir = action.get("move_dir")
@@ -66,6 +95,12 @@ def _validate_action(action: Any, path: str, *, duration_required: bool = True) 
         value = action.get(name)
         if not isinstance(value, int) or isinstance(value, bool) or value not in CAMERA_BUCKETS:
             raise _err(f"{path}.{name}", f"必须是离散桶 {CAMERA_BUCKETS}")
+    if camera_pixels_required:
+        for bucket_name, pixel_name in (("camera_dx", "camera_dx_px"),
+                                        ("camera_dy", "camera_dy_px")):
+            pixels = _finite_number(action.get(pixel_name), f"{path}.{pixel_name}")
+            if camera_bucket_from_pixels(pixels) != action[bucket_name]:
+                raise _err(f"{path}.{bucket_name}", f"必须与 {pixel_name} 的像素桶一致")
     buttons = action.get("buttons")
     if not isinstance(buttons, list) or len(buttons) != len(BUTTON_NAMES):
         raise _err(f"{path}.buttons", f"必须是长度为 {len(BUTTON_NAMES)} 的 0/1 数组")
@@ -199,17 +234,13 @@ def _validate_slow_label(label: Any, path: str) -> None:
         raise _err(f"{path}.subgoal_rule_version", "rule 来源必须为 subgoal.v1")
 
 
-def validate_v4_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -> None:
-    """Validate the fast/slow VLA v4 record.
-
-    v4 keeps the v3 action/alignment contract and adds frame-level slow labels
-    plus loss masks.  The v3 validator is reused for common fields so the two
-    schemas cannot silently diverge.
-    """
+def _validate_fast_slow_record(record: Mapping[str, Any], *, schema_version: str,
+                               strict_lengths: bool, camera_pixels_required: bool) -> None:
+    """Validate common v4/v5 fast-slow fields without schema drift."""
     if not isinstance(record, Mapping):
         raise ValueError("VLA record: 必须是对象")
-    if record.get("schema_version") != VLA_SCHEMA_VERSION_V4:
-        raise _err("schema_version", f"必须是 {VLA_SCHEMA_VERSION_V4!r}")
+    if record.get("schema_version") != schema_version:
+        raise _err("schema_version", f"必须是 {schema_version!r}")
     if "intent" in record:
         raise _err("intent", "v4 顶层 intent 已废弃，请使用 slow_label.intent")
 
@@ -223,18 +254,32 @@ def validate_v4_record(record: Mapping[str, Any], *, strict_lengths: bool = True
     obs = record["observations"]
     frames = obs["frames"]
     if strict_lengths and not 3 <= len(frames) <= 8:
-        raise _err("observations.frames", "v4 必须包含 3..8 帧")
+        raise _err("observations.frames", f"{schema_version.rsplit('.', 1)[-1]} 必须包含 3..8 帧")
     history = obs.get("history_actions", [])
     if strict_lengths and len(history) > 8:
-        raise _err("observations.history_actions", "v4 最多 8 个历史动作")
+        raise _err("observations.history_actions", f"{schema_version.rsplit('.', 1)[-1]} 最多 8 个历史动作")
+    if camera_pixels_required:
+        for i, action in enumerate(history):
+            _validate_action(action, f"observations.history_actions[{i}]", duration_required=False,
+                             camera_pixels_required=True)
     for i, frame in enumerate(frames):
         if "slow_label" not in frame:
             raise _err(f"observations.frames[{i}].slow_label", "缺少字段")
         _validate_slow_label(frame["slow_label"], f"observations.frames[{i}].slow_label")
 
+    if camera_pixels_required:
+        for i, action in enumerate(record["action_chunk"]):
+            _validate_action(action, f"action_chunk[{i}]", camera_pixels_required=True)
+
     if "slow_label" not in record:
         raise _err("slow_label", "缺少字段")
     _validate_slow_label(record["slow_label"], "slow_label")
+
+    alignment = record["alignment"]
+    action_end_frame = alignment.get("action_end_frame")
+    if (not isinstance(action_end_frame, int) or
+            isinstance(action_end_frame, bool) or action_end_frame < alignment["action_start_frame"]):
+        raise _err("alignment.action_end_frame", "必须是动作起始帧之后的整数")
 
     masks = record.get("loss_mask")
     if not isinstance(masks, Mapping):
@@ -243,3 +288,15 @@ def validate_v4_record(record: Mapping[str, Any], *, strict_lengths: bool = True
         value = masks.get(name)
         if isinstance(value, bool) or value not in (0, 1):
             raise _err(f"loss_mask.{name}", "必须是 0 或 1")
+
+
+def validate_v4_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -> None:
+    """Validate the legacy v4 fast/slow VLA record."""
+    _validate_fast_slow_record(record, schema_version=VLA_SCHEMA_VERSION_V4,
+                               strict_lengths=strict_lengths, camera_pixels_required=False)
+
+
+def validate_v5_record(record: Mapping[str, Any], *, strict_lengths: bool = True) -> None:
+    """Validate v5 records with pixel-provenanced camera action labels."""
+    _validate_fast_slow_record(record, schema_version=VLA_SCHEMA_VERSION_V5,
+                               strict_lengths=strict_lengths, camera_pixels_required=True)

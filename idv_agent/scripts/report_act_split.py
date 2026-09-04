@@ -29,7 +29,7 @@ def report(data: str, val_data: str, output: Path) -> dict:
     train_paths = _dataset_paths(data)
     val_paths = _dataset_paths(val_data)
     if not train_paths or not val_paths:
-        raise ValueError("train/val 至少各需要一个 vla_chunks_v4.jsonl")
+        raise ValueError("train/val 至少各需要一个 vla_chunks_v5.jsonl")
     train_n, train_counts, train_sessions = _counts(train_paths)
     val_n, val_counts, val_sessions = _counts(val_paths)
     observed = sorted(set(train_counts) | set(val_counts), key=INTENTS.index)

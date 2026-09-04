@@ -87,7 +87,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 count = self.workbench.init_intents(parts[2], overwrite=overwrite)
                 return self._send_json({"segment_count": count})
             if len(parts) == 5 and parts[:3] == ["api", "sessions", parts[2]] and parts[3:] == ["chunks", "build"]:
-                result = self.workbench.build_vla_chunks_v4(parts[2])
+                result = self.workbench.build_vla_chunks_v5(parts[2])
                 return self._send_json(result)
             self._send_error(HTTPStatus.NOT_FOUND, "route not found")
         except FileExistsError as exc:

@@ -190,15 +190,15 @@ def test_http_api_builds_actions_and_candidate_intents(tmp_path: Path):
         server.server_close()
 
 
-def test_workbench_builds_and_audits_vla_chunks_v4(tmp_path: Path):
+def test_workbench_builds_and_audits_vla_chunks_v5(tmp_path: Path):
     from idv_agent.data_tools.session_store import SessionStore
     from idv_agent.data_tools.workbench import DataWorkbench
 
     session = make_v4_ready_session(tmp_path / "sessions" / "s1")
-    result = DataWorkbench(SessionStore(tmp_path / "sessions")).build_vla_chunks_v4("s1")
+    result = DataWorkbench(SessionStore(tmp_path / "sessions")).build_vla_chunks_v5("s1")
 
-    assert result["output"] == "vla_chunks_v4.jsonl"
-    assert result["audit_output"] == "vla_chunks_v4.audit.json"
+    assert result["output"] == "vla_chunks_v5.jsonl"
+    assert result["audit_output"] == "vla_chunks_v5.audit.json"
     assert result["chunk_count"] > 0
     assert result["gate_pass"] is True
     output = session / result["output"]
@@ -207,12 +207,12 @@ def test_workbench_builds_and_audits_vla_chunks_v4(tmp_path: Path):
     assert (session / "per_frame_actions.csv").is_file()
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert len(records) == result["chunk_count"]
-    assert all(record["schema_version"] == "vla.action_chunk.v4" for record in records)
+    assert all(record["schema_version"] == "vla.action_chunk.v5" for record in records)
 
     summary = SessionStore(tmp_path / "sessions").summary("s1")
-    assert summary["v4_chunks"] == {
-        "filename": "vla_chunks_v4.jsonl",
-        "audit_filename": "vla_chunks_v4.audit.json",
+    assert summary["v5_chunks"] == {
+        "filename": "vla_chunks_v5.jsonl",
+        "audit_filename": "vla_chunks_v5.audit.json",
         "exists": True,
         "count": result["chunk_count"],
         "audit_exists": True,
@@ -221,15 +221,15 @@ def test_workbench_builds_and_audits_vla_chunks_v4(tmp_path: Path):
     }
 
 
-def test_http_api_builds_and_audits_vla_chunks_v4(tmp_path: Path):
+def test_http_api_builds_and_audits_vla_chunks_v5(tmp_path: Path):
     make_v4_ready_session(tmp_path / "sessions" / "s1")
     server = start_test_server(tmp_path / "sessions")
     try:
         response = request(server, "/api/sessions/s1/chunks/build", method="POST", payload={})
         body = json.loads(response.read())
         assert response.status == 200
-        assert body["output"] == "vla_chunks_v4.jsonl"
-        assert body["audit_output"] == "vla_chunks_v4.audit.json"
+        assert body["output"] == "vla_chunks_v5.jsonl"
+        assert body["audit_output"] == "vla_chunks_v5.audit.json"
         assert body["gate_pass"] is True
         assert body["chunk_count"] > 0
     finally:
@@ -304,7 +304,7 @@ def test_http_root_serves_workbench_markup(tmp_path: Path):
         assert 'id="frame-play"' in body
         assert 'id="frame-next"' in body
         assert 'id="build-chunks"' in body
-        assert "Generate vla_chunks_v4" in body
+        assert "Generate vla_chunks_v5" in body
         assert 'id="focused-frame"' not in body
         assert 'id="preview-strip"' not in body
     finally:

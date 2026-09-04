@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 
 from idv_agent.configs.game_mode import DEFAULT_GAME_MODE, mode_token
@@ -22,21 +23,34 @@ from idv_agent.vla.action_chunk import (
     MACRO_FRAMES,
     VLA_SCHEMA_VERSION,
     VLA_SCHEMA_VERSION_V4,
+    VLA_SCHEMA_VERSION_V5,
+    camera_bucket_from_pixels,
     BUTTON_NAMES,
     CAMERA_BUCKETS,
     INTENTS,
     MOVE_DIRECTIONS,
     validate_record,
     validate_v4_record,
+    validate_v5_record,
 )
 from idv_agent.configs.subgoal import subgoals_for_intent
 
 
-def _num(value, default=0.0):
+_MISSING = object()
+
+
+def _num(value, default=_MISSING, *, field="value", integer=False):
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        if default is not _MISSING:
+            return default
+        raise ValueError(f"{field} 必须是数字") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field} 必须是有限数字")
+    if integer and not number.is_integer():
+        raise ValueError(f"{field} 必须是整数")
+    return number
 
 
 def _move_dir(rows):
@@ -54,7 +68,7 @@ def _move_dir(rows):
 
 
 def _camera_bucket(value):
-    value = max(-1.0, min(1.0, _num(value)))
+    value = max(-1.0, min(1.0, _num(value, field="camera")))
     if value < -0.6: return -2
     if value < -0.15: return -1
     if value <= 0.15: return 0
@@ -75,26 +89,34 @@ def _buttons(rows):
     return values
 
 
-def _action(rows, frame_indices):
+def _action(rows, frame_indices, *, pixel_camera=False):
     # Camera deltas are frame-wise increments.  Averaging them over a macro
     # window makes normal left/right turns cancel out (and turns a real turn
     # into the ``0`` bucket).  Aggregate the net angular displacement instead;
     # the bucket is applied after accumulation.  This keeps the action-chunk
     # label aligned with the movement keys that are active in the same window.
-    camera_dx = sum(_num(r.get("cam_dx")) for r in rows)
-    camera_dy = sum(_num(r.get("cam_dy")) for r in rows)
-    return {
+    camera_dx_px = sum(_num(r.get("cam_dx_px"), field="cam_dx_px") for r in rows)
+    camera_dy_px = sum(_num(r.get("cam_dy_px"), field="cam_dy_px") for r in rows)
+    camera_dx = (camera_bucket_from_pixels(camera_dx_px) if pixel_camera else
+                 _camera_bucket(sum(_num(r.get("cam_dx")) for r in rows)))
+    camera_dy = (camera_bucket_from_pixels(camera_dy_px) if pixel_camera else
+                 _camera_bucket(sum(_num(r.get("cam_dy")) for r in rows)))
+    result = {
         "move_dir": _move_dir(rows),
-        "camera_dx": _camera_bucket(camera_dx),
-        "camera_dy": _camera_bucket(camera_dy),
+        "camera_dx": camera_dx,
+        "camera_dy": camera_dy,
         "buttons": _buttons(rows),
         "duration_frames": len(frame_indices),
     }
+    if pixel_camera:
+        result["camera_dx_px"] = float(camera_dx_px)
+        result["camera_dy_px"] = float(camera_dy_px)
+    return result
 
 
-def _history_action(row):
+def _history_action(row, *, pixel_camera=False):
     """Compact one-step action context (no duration needed for history)."""
-    action = _action([row], [int(row.get("frame_idx", 0))])
+    action = _action([row], [int(row.get("frame_idx", 0))], pixel_camera=pixel_camera)
     action.pop("duration_frames", None)
     return action
 
@@ -193,8 +215,10 @@ def _derive_subgoal(intent: str, state: dict, action: dict) -> str:
     elif intent == "travel":
         # Movement takes precedence when both signals are present.  A
         # camera-only frame represents sweeping the scene to find the cipher.
-        moving = abs(_num(action.get("move_x"))) > 1e-6 or abs(_num(action.get("move_y"))) > 1e-6
-        looking = abs(_num(action.get("cam_dx"))) > 1e-6 or abs(_num(action.get("cam_dy"))) > 1e-6
+        moving = (abs(_num(action.get("move_x"), 0.0)) > 1e-6 or
+                  abs(_num(action.get("move_y"), 0.0)) > 1e-6)
+        looking = (abs(_num(action.get("cam_dx"), 0.0)) > 1e-6 or
+                   abs(_num(action.get("cam_dy"), 0.0)) > 1e-6)
         candidate = "move_to_target" if moving else ("find_cipher" if looking else "move_to_target")
     elif intent == "search":
         if category == "OPEN_CHEST":
@@ -241,17 +265,22 @@ def build(session: Path, output: Path, *, stride: int = 3,
         raise ValueError("VLA 要求固定 horizon=4")
     if schema_version == VLA_SCHEMA_VERSION and history != HISTORY_FRAMES:
         raise ValueError("VLA v3 要求固定 history=3")
-    if schema_version == VLA_SCHEMA_VERSION_V4 and not 3 <= history <= 8:
-        raise ValueError("VLA v4 要求 history 在 3..8")
-    if schema_version not in {VLA_SCHEMA_VERSION, VLA_SCHEMA_VERSION_V4}:
+    if schema_version in {VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5} and not 3 <= history <= 8:
+        raise ValueError("VLA v4/v5 要求 history 在 3..8")
+    if schema_version not in {VLA_SCHEMA_VERSION, VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5}:
         raise ValueError(f"不支持 schema_version={schema_version!r}")
     if slow_period_s <= 0:
         raise ValueError("slow_period_s 必须为正数")
     if stride < 1 or macro_frames < 1 or action_delay_frames < 0:
         raise ValueError("stride/macro_frames 必须为正数")
-    frames = sorted((session / "frames").glob("*.jpg"), key=lambda p: int(p.stem))
+    try:
+        frames = sorted((session / "frames").glob("*.jpg"), key=lambda p: int(p.stem))
+    except ValueError as exc:
+        raise ValueError("frames 下所有 JPG 文件名必须是整数") from exc
     if not frames:
         raise ValueError(f"没有帧: {session / 'frames'}")
+    if [int(frame.stem) for frame in frames] != list(range(len(frames))):
+        raise ValueError("frames 文件名必须从 0 连续递增")
     action_csv = session / "per_frame_actions.csv"
     # New VLA recordings use Raw Input relative motion as the sole camera
     # source.  Always rebuild the frame-aligned action table from it before
@@ -265,17 +294,61 @@ def build(session: Path, output: Path, *, stride: int = 3,
         raise ValueError(f"动作提取失败，未生成 {action_csv}")
     actions = {}
     with action_csv.open(encoding="utf-8-sig", newline="") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        fields = set(reader.fieldnames or ())
+        required = {"timestamp_ns", "move_x", "move_y", "cam_dx", "cam_dy"}
+        if schema_version == VLA_SCHEMA_VERSION_V5:
+            required |= {"cam_dx_px", "cam_dy_px"}
+        if not required.issubset(fields) or not ({"frame_idx", "frame_id"} & fields):
+            raise ValueError("per_frame_actions.csv 缺少必要动作列")
+        for line_no, row in enumerate(reader, 2):
             try:
                 row["frame_idx"] = int(row.get("frame_idx", row.get("frame_id")))
             except (TypeError, ValueError):
-                continue
+                raise ValueError(f"per_frame_actions.csv:{line_no} frame_idx 无效")
+            if row["frame_idx"] in actions:
+                raise ValueError(f"per_frame_actions.csv:{line_no} frame_idx 重复")
+            for field in ("timestamp_ns", "move_x", "move_y", "cam_dx", "cam_dy"):
+                _num(row.get(field), field=f"per_frame_actions.csv:{line_no}.{field}",
+                     integer=(field == "timestamp_ns"))
+            if _num(row.get("timestamp_ns"), field=f"per_frame_actions.csv:{line_no}.timestamp_ns",
+                    integer=True) < 0:
+                raise ValueError(f"per_frame_actions.csv:{line_no}.timestamp_ns 必须非负")
             actions[row["frame_idx"]] = row
+    expected_frames = set(range(len(frames)))
+    actual_frames = set(actions)
+    if actual_frames != expected_frames:
+        missing = sorted(expected_frames - actual_frames)
+        extra = sorted(actual_frames - expected_frames)
+        raise ValueError(f"per_frame_actions.csv 必须覆盖全部帧；缺少={missing[:10]} 多余={extra[:10]}")
+    action_timestamps = [_num(actions[i].get("timestamp_ns"), field=f"action[{i}].timestamp_ns",
+                              integer=True) for i in range(len(frames))]
+    if action_timestamps != sorted(action_timestamps) or len(set(action_timestamps)) != len(action_timestamps):
+        raise ValueError("per_frame_actions.csv timestamp_ns 必须严格递增")
+    frame_ts_path = session / "frame_timestamps.csv"
+    if frame_ts_path.is_file():
+        with frame_ts_path.open(encoding="utf-8-sig", newline="") as f:
+            frame_rows = list(csv.DictReader(f))
+        if len(frame_rows) != len(frames):
+            raise ValueError("frame_timestamps.csv 数量必须与帧文件一致")
+        try:
+            frame_ids = [int(row["frame_id"]) for row in frame_rows]
+            frame_timestamps = [int(row["timestamp_ns"]) for row in frame_rows]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("frame_timestamps.csv frame_id/timestamp_ns 无效") from exc
+        if frame_ids != list(range(len(frames))):
+            raise ValueError("frame_timestamps.csv frame_id 必须从 0 连续递增")
+        if action_timestamps != frame_timestamps:
+            raise ValueError("per_frame_actions.csv timestamp_ns 必须与 frame_timestamps.csv 对齐")
 
-    intent_segments = _load_intent_segments(session) if schema_version == VLA_SCHEMA_VERSION_V4 else []
-    if schema_version == VLA_SCHEMA_VERSION_V4 and not intent_segments:
-        raise ValueError(f"v4 缺少 {session / 'intent_segments.jsonl'}（人工只标顶层 intent 的片段文件）")
-    frame_states = _load_frame_states(session) if schema_version == VLA_SCHEMA_VERSION_V4 else {}
+    if schema_version in {VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5}:
+        intent_segments = _load_intent_segments(session)
+        if not intent_segments:
+            raise ValueError(f"{schema_version.rsplit('.', 1)[-1]} 缺少 intent_segments.csv/jsonl（人工只标顶层 intent 的片段文件）")
+        frame_states = _load_frame_states(session)
+    else:
+        intent_segments = []
+        frame_states = {}
 
     fps = 30.0
     mode = DEFAULT_GAME_MODE
@@ -302,10 +375,10 @@ def build(session: Path, output: Path, *, stride: int = 3,
         for offset in range(history - 1, -1, -1):
             idx = anchor - offset * stride
             frame = frames[idx]
-            ts = _num(actions.get(idx, {}).get("timestamp_ns"), 0)
+            ts = _num(actions[idx].get("timestamp_ns"), field=f"action[{idx}].timestamp_ns")
             item = {"path": frame.relative_to(session).as_posix(),
                     "frame_index": idx, "timestamp_ns": int(ts)}
-            if schema_version == VLA_SCHEMA_VERSION_V4:
+            if schema_version in {VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5}:
                 item["slow_label"] = _slow_label_for_frame(idx, intent_segments,
                                                             frame_states, actions.get(idx, {}))
             history_frames.append(item)
@@ -313,23 +386,19 @@ def build(session: Path, output: Path, *, stride: int = 3,
         for step in range(horizon):
             first = anchor + action_delay_frames + step * macro_frames + 1
             indices = list(range(first, first + macro_frames))
-            chunk.append(_action([actions.get(i, {"frame_idx": i}) for i in indices], indices))
-        obs_end_ts = int(_num(actions.get(anchor, {}).get("timestamp_ns"), 0))
+            chunk.append(_action([actions[i] for i in indices], indices,
+                                 pixel_camera=schema_version == VLA_SCHEMA_VERSION_V5))
+        obs_end_ts = int(_num(actions[anchor].get("timestamp_ns"), field=f"action[{anchor}].timestamp_ns"))
         action_start_frame = anchor + action_delay_frames + 1
         action_end_frame = action_start_frame + total_future - 1
-        action_start_ts = int(_num(actions.get(action_start_frame, {}).get("timestamp_ns"), 0))
-        action_end_ts = int(_num(actions.get(action_end_frame, {}).get("timestamp_ns"), 0))
-        # Synthetic/minimal test sessions may have missing timestamps; keep
-        # the contract valid while real recordings retain their exact clocks.
-        if action_start_ts <= obs_end_ts:
-            action_start_ts = obs_end_ts + 1
-        if action_end_ts < action_start_ts:
-            action_end_ts = action_start_ts
+        action_start_ts = int(_num(actions[action_start_frame].get("timestamp_ns"), field=f"action[{action_start_frame}].timestamp_ns"))
+        action_end_ts = int(_num(actions[action_end_frame].get("timestamp_ns"), field=f"action[{action_end_frame}].timestamp_ns"))
         history_actions = []
         for offset in range(history - 1, -1, -1):
             idx = anchor - offset * stride
             if idx in actions:
-                history_actions.append(_history_action(actions[idx]))
+                history_actions.append(_history_action(
+                    actions[idx], pixel_camera=schema_version == VLA_SCHEMA_VERSION_V5))
         record = {
             "schema_version": schema_version,
             "episode_id": session.name,
@@ -346,6 +415,7 @@ def build(session: Path, output: Path, *, stride: int = 3,
                 "action_delay_frames": action_delay_frames,
                 "observation_end_frame": anchor,
                 "action_start_frame": anchor + action_delay_frames + 1,
+                "action_end_frame": action_end_frame,
                 "observation_end_timestamp_ns": obs_end_ts,
                 "action_start_timestamp_ns": action_start_ts,
                 "action_end_timestamp_ns": action_end_ts,
@@ -357,7 +427,7 @@ def build(session: Path, output: Path, *, stride: int = 3,
             # v3 keeps the legacy optional field; v4 uses slow_label.intent
             # as the single canonical intent source.
             record["intent"] = ""
-        if schema_version == VLA_SCHEMA_VERSION_V4:
+        if schema_version in {VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5}:
             slow_label = _slow_label_for_frame(anchor, intent_segments, frame_states, actions.get(anchor, {}))
             record["slow_label"] = slow_label
             anchor_ts = obs_end_ts
@@ -371,7 +441,8 @@ def build(session: Path, output: Path, *, stride: int = 3,
                 last_slow_ts = anchor_ts
                 last_slow_segment = segment_id
             record["loss_mask"] = {"slow": int(slow_due), "fast": 1}
-            validate_v4_record(record)
+            (validate_v5_record(record) if schema_version == VLA_SCHEMA_VERSION_V5
+             else validate_v4_record(record))
         else:
             validate_record(record)
         rows.append(record)
@@ -393,12 +464,12 @@ def main(argv=None):
     parser.add_argument("--action-delay-frames", type=int, default=DEFAULT_ACTION_DELAY_FRAMES,
                         help="观测结束到动作标签起点的延迟帧数，默认 1")
     parser.add_argument("--outcome", choices=("success", "partial", "failure", "unknown"), default="unknown")
-    parser.add_argument("--schema-version", choices=(VLA_SCHEMA_VERSION, VLA_SCHEMA_VERSION_V4),
+    parser.add_argument("--schema-version", choices=(VLA_SCHEMA_VERSION, VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5),
                         default=VLA_SCHEMA_VERSION)
     parser.add_argument("--slow-period-s", type=float, default=1.0)
     args = parser.parse_args(argv)
     history = args.history if args.history is not None else (
-        8 if args.schema_version == VLA_SCHEMA_VERSION_V4 else HISTORY_FRAMES
+        8 if args.schema_version in {VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5} else HISTORY_FRAMES
     )
     output = args.output or args.session / "vla_chunks.jsonl"
     build(args.session, output, stride=args.stride,

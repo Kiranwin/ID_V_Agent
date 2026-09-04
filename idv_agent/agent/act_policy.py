@@ -40,7 +40,7 @@ class ACTPolicy:
                  send: Callable[[Iterable[Any]], None] | None = None,
                  capture_fps: float = 30.0, fast_hz: float = 15.0,
                  slow_hz: float = 1.0, history_frames: int = 3,
-                 max_feature_age_s: float = 0.5, cam_pixel_scale: float = 120.0,
+                 max_feature_age_s: float = 0.5,
                  use_time_deltas: bool = False, zero_history: bool = False):
         if mode not in GAME_MODE_CHOICES:
             raise ValueError(f"未知模式: {mode}")
@@ -72,7 +72,7 @@ class ACTPolicy:
         self.slow_period = 1.0 / float(slow_hz)
         self.executor = ACTActionChunkExecutor(
             send=send or (lambda _commands: None), capture_fps=capture_fps,
-            tick_hz=fast_hz, cam_pixel_scale=cam_pixel_scale)
+            tick_hz=fast_hz)
         self.scheduler = ACTChunkScheduler(
             predict=self._predict_chunk, executor=self.executor, fast_hz=fast_hz,
             max_feature_age_s=max_feature_age_s)

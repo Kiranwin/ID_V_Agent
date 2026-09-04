@@ -53,7 +53,6 @@ def build_policy(args, device):
             use_time_deltas=args.use_time_deltas,
             zero_history=args.zero_history,
             max_feature_age_s=args.max_feature_age_s,
-            cam_pixel_scale=args.cam_pixel_scale,
         )
         return policy, policy
     raise ValueError(f"未知 mode: {args.mode}")
@@ -122,7 +121,7 @@ def main(argv=None) -> int:
     p.add_argument("--cipher-detect-interval", type=float, default=4.0,
                    help="密码机慢层检测间隔（秒，建议 3~5）")
     p.add_argument("--cam-pixel-scale", type=float, default=120.0,
-                   help="相机归一化尺度；数值越大单帧转动越慢（默认 120）")
+                   help="legacy rule 模式相机归一化尺度；ACT v5 不使用此参数")
     p.add_argument("--trajectory-log", type=Path, default=None,
                    help="可选：将每帧感知状态、宏控制动作和执行命令写入 JSONL")
     p.add_argument("--trajectory-frames", type=Path, default=None,

@@ -28,7 +28,7 @@ from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDatas
 from idv_agent.training.vla_loss import compute_vla_loss
 from idv_agent.training.utils import set_seed
 from idv_agent.configs.subgoal import SUBGOAL_NAMES
-from idv_agent.vla.action_chunk import INTENTS
+from idv_agent.vla.action_chunk import INTENTS, VLA_SCHEMA_VERSION_V5
 
 
 def _freeze_qwen(adapter: torch.nn.Module) -> None:
@@ -613,7 +613,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         base_model=args.model_path, adapters=["lora_wk", "visual_projection", "act_heads"],
         frozen=["qwen_vision_tower", "lora_wk"],
         trainable=["visual_projection", "condition_projection", "shared_temporal_encoder", "slow_head", "fast_head"],
-        data={"act": str(Path(args.data)).replace("\\", "/"), "act_glob": "vla.action_chunk.v4"},
+        data={"act": str(Path(args.data)).replace("\\", "/"), "act_glob": VLA_SCHEMA_VERSION_V5},
         counts={"train": len(dataset), "val": len(val_dataset) if val_dataset is not None else 0},
         precision="fp16+GradScaler" if amp_enabled else "fp32",
         training={"method": "action_chunk_sft", "steps": args.steps, "learning_rate": args.lr,
@@ -628,7 +628,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "teacher_forcing_start": args.teacher_forcing_start,
                   "teacher_forcing_end": args.teacher_forcing_end,
                   "teacher_forcing_decay_steps": args.teacher_forcing_decay_steps},
-        schema_versions=["vla.action_chunk.v4"],
+        schema_versions=[VLA_SCHEMA_VERSION_V5],
         artifacts={"act_checkpoint": str(checkpoint.name)},
         extra={"parent_stage": parent_manifest["stage"] if parent_manifest else None,
                "val_data": [str(Path(path)).replace("\\", "/") for path in val_paths]},
@@ -779,8 +779,8 @@ def _teacher_forcing_ratio(args: argparse.Namespace, step: int) -> float:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", required=True, help="vla_chunks_v4.jsonl")
-    parser.add_argument("--val-data", default="", help="可选：逗号/分号分隔的 session v4 JSONL 留出集")
+    parser.add_argument("--data", required=True, help="vla_chunks_v5.jsonl")
+    parser.add_argument("--val-data", default="", help="可选：逗号/分号分隔的 session v5 JSONL 留出集")
     parser.add_argument("--max-val-samples", type=int, default=64,
                         help="验证集最多编码的样本数，0 表示整集")
     parser.add_argument("--model-path", required=True, help="本地 Qwen3-VL checkpoint")
