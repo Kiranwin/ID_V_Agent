@@ -30,6 +30,7 @@ from idv_agent.training.image_augmentation import (
     apply_window_augmentation as _augment_image,
     sample_window_augmentation as _sample_image_augmentation_params,
 )
+from idv_agent.training.feature_activity import training_behavior_gate
 from idv_agent.training.vla_loss import VLALossWeights, balanced_class_weights, compute_vla_loss
 from idv_agent.training.utils import set_seed
 from idv_agent.configs.subgoal import SUBGOAL_NAMES
@@ -637,6 +638,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     baseline = float(baseline_losses["total"].detach().cpu())
     history: list[float] = []
     component_history: list[dict[str, float]] = []
+    gradient_norm_history: list[float] = []
     peak_memory = 0
     started = time.perf_counter()
     iterator = iter(loader)
@@ -662,14 +664,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if amp_enabled:
             scaler.scale(total).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            gradient_norm = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             total.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            gradient_norm = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             optimizer.step()
         history.append(float(total.detach().cpu()))
+        gradient_norm_history.append(float(gradient_norm.detach().cpu()))
         component_history.append({key: float(value.detach().cpu()) for key, value in losses.items()})
         log_interval = max(1, int(getattr(args, "log_interval", 25)))
         if step == 1 or step % log_interval == 0 or step == args.steps:
@@ -769,10 +772,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     acceptance = _balance_acceptance(val_result or {}, baseline_result)
     if getattr(args, "require_acceptance", False) and acceptance["status"] != "pass":
         raise ValueError(f"类别平衡验收未通过: {json.dumps(acceptance, ensure_ascii=False)}")
+    training_behavior = training_behavior_gate({
+        "steps": args.steps, "loss_history": history,
+        "component_loss_history": component_history,
+        "gradient_norm_history": gradient_norm_history,
+    })
+    if getattr(args, "require_training_behavior", False) and not training_behavior["pass"]:
+        raise ValueError(f"小训练行为验收未通过: {json.dumps(training_behavior, ensure_ascii=False)}")
     result = {"samples": len(dataset), "val_samples": len(val_dataset) if val_dataset is not None else 0,
             "steps": args.steps, "baseline_loss": baseline,
             "final_loss": history[-1] if history else baseline,
-            "loss_history": history, "component_loss_history": component_history, "mask": mask,
+            "loss_history": history, "component_loss_history": component_history,
+            "gradient_norm_history": gradient_norm_history,
+            "training_behavior_acceptance": training_behavior, "mask": mask,
             "checkpoint": str(checkpoint), "checkpoint_loss_delta": abs(float(before["total"] - after["total"])),
             "peak_memory_mb": peak_memory / (1024 * 1024), "elapsed_sec": elapsed,
             "manifest": str(manifest_path.resolve()),
@@ -1044,6 +1056,8 @@ def main(argv=None) -> int:
                         help="可选：旧 metrics.json，用于类别 recall 改善验收")
     parser.add_argument("--require-acceptance", action="store_true",
                         help="提供 baseline 后，验收失败则以错误退出")
+    parser.add_argument("--require-training-behavior", action="store_true",
+                        help="要求 30–60 步收敛、有限各头 loss 且无梯度爆炸")
     parser.add_argument("--checkpoint", default="checkpoints/vla_minimal.pt")
     args = parser.parse_args(argv)
     result = train(args)
