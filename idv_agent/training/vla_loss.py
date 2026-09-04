@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -20,6 +20,9 @@ class VLALossWeights:
     slow_intent: float = 1.0
     slow_subgoal: float = 0.5
     consistency: float = 0.1
+    # Supervise the history-free visual action expert with the same head
+    # weights and masks as the fused deployment outputs.
+    visual_aux: float = 1.0
     # Recorded trajectories contain many more stop than moving steps.  Keep
     # stop supervised, but prevent it from dominating the categorical head.
     move_stop_weight: float = 0.5
@@ -116,7 +119,9 @@ def _masked_mean(values: torch.Tensor, sample_mask: torch.Tensor) -> torch.Tenso
 
 
 def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
-                     batch: dict, weights: VLALossWeights = VLALossWeights()) -> dict[str, torch.Tensor]:
+                     batch: dict, weights: VLALossWeights = VLALossWeights(), *,
+                     visual_fast: Optional[FastVLAOutput] = None,
+                     visual_slow: Optional[SlowVLAOutput] = None) -> dict[str, torch.Tensor]:
     fast_mask = batch["fast_loss_mask"].to(fast.move_logits.device)
     move_class_weight = torch.ones(fast.move_logits.shape[-1], device=fast.move_logits.device,
                                    dtype=fast.move_logits.dtype)
@@ -223,4 +228,25 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
         + weights.slow_subgoal * losses["slow_subgoal"]
         + weights.consistency * losses["consistency"]
     )
+    if (visual_fast is None) != (visual_slow is None):
+        raise ValueError("visual_fast 与 visual_slow 必须同时提供或同时省略")
+    if visual_fast is not None:
+        # Reuse the exact class weights and masking rules for the visual-only
+        # branch.  The recursive call has no visual outputs, so it terminates;
+        # fast/slow consistency belongs to the fused decision only.
+        visual_base = compute_vla_loss(
+            visual_fast, visual_slow, batch,
+            weights=replace(weights, consistency=0.0, visual_aux=0.0),
+        )
+        names = ("fast_move", "fast_camera", "fast_buttons", "fast_duration",
+                 "slow_intent", "slow_subgoal")
+        for name in names:
+            losses[f"visual_{name}"] = visual_base[name]
+        visual_total = visual_base["total"]
+        total = total + weights.visual_aux * visual_total
+    else:
+        zero = fast.move_logits.sum() * 0.0
+        for name in ("fast_move", "fast_camera", "fast_buttons", "fast_duration",
+                     "slow_intent", "slow_subgoal"):
+            losses[f"visual_{name}"] = zero
     return {"total": total, **losses}

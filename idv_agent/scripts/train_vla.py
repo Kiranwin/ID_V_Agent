@@ -14,7 +14,7 @@ import json
 import math
 import random
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,6 +23,9 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset
 
 from idv_agent.model.fast_slow_vla import FastSlowVLAOutput, SharedFastSlowVLA
+from idv_agent.model.act_checkpoint import (
+    ACT_CHECKPOINT_SCHEMA, act_adapter_state, load_visual_grounded_act_checkpoint,
+)
 from idv_agent.model.qwen_backbone_adapter import load_qwen3vl_backbone
 from idv_agent.training.checkpoint_manifest import build_manifest, write_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
@@ -105,6 +108,106 @@ def _bounded_subset(dataset, limit: int):
     else:
         indices = [round(i * (len(dataset) - 1) / (limit - 1)) for i in range(limit)]
     return Subset(dataset, indices)
+
+
+def _episode_diverse_subset(dataset, limit: int):
+    """Select one middle record per episode before filling the requested cap.
+
+    Small evaluation caps must not accidentally become a contiguous slice of
+    the first session.  The first pass therefore covers episodes in their
+    source order and uses each episode's middle record; the second pass adds
+    remaining records in source order.  This preserves deterministic input
+    while making ``max_samples`` meaningful for cross-session diagnostics.
+    """
+    if limit <= 0 or len(dataset) <= limit:
+        return dataset
+    episode_indices: dict[Any, list[int]] = {}
+    for index in range(len(dataset)):
+        episode = dataset[index].get("episode_id")
+        episode_indices.setdefault(episode, []).append(index)
+    representatives = [indices[len(indices) // 2] for indices in episode_indices.values()]
+    selected = representatives[:limit]
+    if len(selected) < limit:
+        used = set(selected)
+        selected.extend(index for index in range(len(dataset))
+                       if index not in used)
+        selected = selected[:limit]
+    return Subset(dataset, selected)
+
+
+def _evaluation_stratified_subset(dataset, limit: int):
+    """Pick deterministic cross-episode examples that cover rare output labels.
+
+    Image-dependency acceptance is invalid when its cap accidentally includes
+    only the dominant tactical intent or neutral camera bucket.  This selector
+    scores each not-yet-selected record by the inverse frequency of *uncovered*
+    intent/move/camera labels, with a small bonus for a new episode.  It only
+    reads supervision to choose a fixed evaluation cohort; labels never enter
+    the model inputs.
+    """
+    if limit <= 0 or len(dataset) <= limit:
+        return dataset
+
+    def tags(sample: dict[str, Any]) -> set[tuple[str, int]]:
+        result: set[tuple[str, int]] = set()
+        intent = sample.get("intent_target")
+        if intent is not None:
+            intent_value = int(intent.reshape(-1)[0]) if isinstance(intent, torch.Tensor) else int(intent)
+            if intent_value >= 0:
+                result.add(("intent", intent_value))
+        for name in ("move_target", "camera_dx_target", "camera_dy_target"):
+            values = sample.get(name)
+            if values is None:
+                continue
+            values = values.reshape(-1).tolist() if isinstance(values, torch.Tensor) else values
+            result.update((name, int(value)) for value in values)
+        return result
+
+    rows = [dataset[index] for index in range(len(dataset))]
+    tag_counts = Counter(tag for sample in rows for tag in tags(sample))
+    selected: list[int] = []
+    uncovered = set(tag_counts)
+    seen_episodes: set[Any] = set()
+    remaining = set(range(len(rows)))
+
+    # Reserve a small but usable estimate for every intent that exists in the
+    # held-out data.  A single rare-intent example can prove presence, but it
+    # cannot support a meaningful normal-vs-degraded accuracy comparison.
+    intent_indices: dict[int, list[int]] = defaultdict(list)
+    for index, sample in enumerate(rows):
+        intent_tags = [tag for tag in tags(sample) if tag[0] == "intent"]
+        if intent_tags:
+            intent_indices[intent_tags[0][1]].append(index)
+    quota = 4
+    if len(intent_indices) * quota <= limit:
+        for intent in sorted(intent_indices):
+            candidates = set(intent_indices[intent])
+            while candidates and len([i for i in selected if i in intent_indices[intent]]) < quota:
+                index = max(candidates, key=lambda candidate: (
+                    sum(1.0 / tag_counts[tag] for tag in tags(rows[candidate]) & uncovered),
+                    int(rows[candidate].get("episode_id") not in seen_episodes),
+                    -candidate,
+                ))
+                candidates.remove(index)
+                remaining.remove(index)
+                selected.append(index)
+                uncovered.difference_update(tags(rows[index]))
+                seen_episodes.add(rows[index].get("episode_id"))
+
+    while remaining and len(selected) < limit:
+        def score(index: int) -> tuple[float, int, int]:
+            sample_tags = tags(rows[index])
+            rarity = sum(1.0 / tag_counts[tag] for tag in sample_tags & uncovered)
+            new_episode = int(rows[index].get("episode_id") not in seen_episodes)
+            # Lower source index makes ties deterministic.
+            return rarity, new_episode, -index
+
+        index = max(remaining, key=score)
+        selected.append(index)
+        remaining.remove(index)
+        uncovered.difference_update(tags(rows[index]))
+        seen_episodes.add(rows[index].get("episode_id"))
+    return Subset(dataset, selected)
 
 
 def _contiguous_subset(dataset, limit: int):
@@ -361,6 +464,16 @@ def _model_inputs(batch: dict[str, Any], device: torch.device) -> dict[str, torc
     return {key: batch[key].to(device) for key in keys}
 
 
+def _drop_history_actions(history_actions: torch.Tensor, *, probability: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop complete action histories per sample during training only."""
+    if not 0.0 <= float(probability) <= 1.0:
+        raise ValueError("history_dropout 必须在 [0,1]")
+    if history_actions.ndim != 2:
+        raise ValueError("history_actions 必须是 [B,H]")
+    drop_mask = torch.rand(history_actions.shape[0], device=history_actions.device) < float(probability)
+    return history_actions.masked_fill(drop_mask.unsqueeze(-1), 0), drop_mask
+
+
 def _scheduled_condition(core, slow, model_batch, *, teacher_forcing_ratio: float):
     """Mix ground-truth and predicted slow discrete conditions.
 
@@ -415,13 +528,13 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
                  vision_micro_batch_size: int = 8,
                  raw_feature_cache: Any | None = None,
                  ablate_frame_avg: bool = False, no_history: bool = False,
-                 augment_images: bool = False):
+                 augment_images: bool = False, history_dropout_p: float = 0.0):
     """Forward + loss for one batch.
 
     ``frame_cache``/``frame_stats`` are passed through to ``encode_batch``.
     The gradient training loop must leave them ``None``: cache entries are
     detached CPU snapshots, and reusing them across steps would silently
-    disconnect ``visual_projection``/``condition_projection`` from the loss.
+    disconnect the trainable visual/condition projections from the loss.
     Only ``eval()``+``torch.no_grad()`` evaluation paths (``_evaluate``,
     ``_slow_accuracy``) may pass a cache.
     """
@@ -430,6 +543,9 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
         # 时序/历史剥离：把 fast 头消费的上一动作条件 history_actions 置零，
         # 使模型无法凭“上一步动作的自相关”去拟合，只留(可选的)画面与时序帧结构。
         model_batch["history_actions"] = torch.zeros_like(model_batch["history_actions"])
+    elif history_dropout_p:
+        model_batch["history_actions"], _ = _drop_history_actions(
+            model_batch["history_actions"], probability=history_dropout_p)
     frame_features = encode_batch(adapter, batch, device=device,
                                   frame_cache=frame_cache, frame_stats=frame_stats,
                                   vision_micro_batch_size=vision_micro_batch_size,
@@ -483,9 +599,18 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
             temporal_feature=fast_pass.temporal_feature,
             fast=fast_pass.fast,
             slow=slow_pass.slow,
+            visual=fast_pass.visual,
+            prior_fast=fast_pass.prior_fast,
+            prior_slow=slow_pass.prior_slow,
         )
-        losses = compute_vla_loss(output.fast, output.slow, model_batch,
-                                  weights=loss_weights) if loss_weights is not None else compute_vla_loss(output.fast, output.slow, model_batch)
+        loss_kwargs = {
+            "visual_fast": output.visual.fast,
+            "visual_slow": slow_pass.visual.slow,
+        }
+        losses = (compute_vla_loss(output.fast, output.slow, model_batch,
+                                   weights=loss_weights, **loss_kwargs)
+                  if loss_weights is not None else
+                  compute_vla_loss(output.fast, output.slow, model_batch, **loss_kwargs))
     return losses, output
 
 
@@ -561,6 +686,15 @@ def _gradient_diagnostics(named_parameters: list[tuple[str, torch.nn.Parameter]]
     return invalid
 
 
+def _named_act_trainable(adapter: torch.nn.Module, core: torch.nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
+    """Return ACT optimizer parameters while excluding the unused lazy legacy path."""
+    adapter_params = [(f"adapter.{name}", parameter) for name, parameter in adapter.named_parameters()
+                      if parameter.requires_grad and not name.startswith("visual_projection.")]
+    core_params = [(f"core.{name}", parameter) for name, parameter in core.named_parameters()
+                   if parameter.requires_grad]
+    return adapter_params + core_params
+
+
 def train(args: argparse.Namespace) -> dict[str, Any]:
     set_seed(int(getattr(args, "seed", 0)))
     device = torch.device(args.device)
@@ -580,6 +714,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     vision_micro_batch_size = max(1, int(getattr(args, "vision_micro_batch_size", 8)))
     _ablate_frame = bool(getattr(args, "ablate_frame_avg", False))
     _no_history = bool(getattr(args, "no_history", False))
+    history_dropout_p = float(getattr(args, "history_dropout_p", 0.5))
     image_augmentation = bool(getattr(args, "image_augmentation", True))
     raw_feature_cache = None
     if getattr(args, "raw_feature_cache", ""):
@@ -613,8 +748,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(f"spatial ACT 需要 {expected} cache，收到 {raw_feature_cache.index.get('pooling')}")
     # Keep newly-trained layers in FP32 (GradScaler cannot unscale FP16
     # gradients); autocast still executes their matmuls in FP16 on CUDA.
-    for name in ("visual_projection", "condition_projection"):
-        getattr(adapter, name).to(device=device, dtype=torch.float32)
+    adapter.condition_projection.to(device=device, dtype=torch.float32)
     core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
     global_counts = None
@@ -639,6 +773,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             button_global_counts[:, 0] += (target.shape[0] - target.sum(dim=0))
     loss_weights = VLALossWeights(move_stop_weight=args.move_stop_weight,
                                    button_positive_weight=args.button_positive_weight,
+                                   visual_aux=float(getattr(args, "visual_aux", 1.0)),
                                    move_direction_balance=args.move_direction_balance,
                                    move_global_counts=(class_balance_statistics["move"]
                                                         if class_balance_statistics else global_counts),
@@ -659,10 +794,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         first_batch["slow_loss_mask"] = torch.ones_like(first_batch["slow_loss_mask"])
     with torch.no_grad():
         encode_batch(adapter, first_batch, device=device)
-    named_trainable = [(f"adapter.{name}", parameter) for name, parameter in adapter.named_parameters()
-                       if parameter.requires_grad]
-    named_trainable += [(f"core.{name}", parameter) for name, parameter in core.named_parameters()
-                        if parameter.requires_grad]
+    if adapter.spatial_cell_projector is None:
+        raise RuntimeError("ACT 视觉 warm-up 未 materialize SpatialCellProjector")
+    adapter.spatial_cell_projector.to(device=device, dtype=torch.float32)
+    named_trainable = _named_act_trainable(adapter, core)
     trainable = [parameter for _name, parameter in named_trainable]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr)
     grad_initial_scale = float(getattr(args, "grad_initial_scale", 1024.0))
@@ -698,7 +833,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                       loss_weights=loss_weights,
                                       teacher_forcing_ratio=_teacher_forcing_ratio(args, step - 1),
                                       ablate_frame_avg=_ablate_frame, no_history=_no_history,
-                                      augment_images=image_augmentation)
+                                      augment_images=image_augmentation,
+                                      history_dropout_p=history_dropout_p)
         total = losses["total"]
         if not torch.isfinite(total):
             raise FloatingPointError(f"step {step}: loss 非有限值")
@@ -754,11 +890,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     mask = _mask_comparison(history, adapter, core, first_batch, device, amp_enabled)
     checkpoint = Path(args.checkpoint)
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    adapter_state = {"visual_projection": adapter.visual_projection.state_dict(),
-                     "condition_projection": adapter.condition_projection.state_dict()}
-    if getattr(adapter, "spatial_agg", None) is not None:
-        adapter_state["spatial_agg"] = adapter.spatial_agg.state_dict()
-    torch.save({"checkpoint_schema_version": "m3_act.internal.v2",
+    adapter_state = act_adapter_state(adapter)
+    torch.save({"checkpoint_schema_version": ACT_CHECKPOINT_SCHEMA,
                 "adapter": adapter_state,
                 "core": core.state_dict(),
                 "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
@@ -767,20 +900,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     # Checkpoint reproducibility: restore into the same modules and compare outputs.
     before, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=False)
     saved = torch.load(checkpoint, map_location=device, weights_only=False)
-    adapter.visual_projection.load_state_dict(saved["adapter"]["visual_projection"])
-    adapter.condition_projection.load_state_dict(saved["adapter"]["condition_projection"])
-    if "spatial_agg" in saved["adapter"]:
-        agg_state = saved["adapter"]["spatial_agg"]
-        adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
-    core.load_state_dict(saved["core"])
+    load_visual_grounded_act_checkpoint(adapter, core, saved)
     after, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=False)
     elapsed = time.perf_counter() - started
     manifest = build_manifest(
         stage="M3_ACT", parent=None,
-        base_model=args.model_path, adapters=["visual_projection", "spatial_agg", "act_heads"],
+        base_model=args.model_path, adapters=["spatial_cell_projector", "act_heads"],
         frozen=["qwen_language_vision_backbone"],
-        trainable=["visual_projection", "condition_projection", "spatial_agg",
-                   "shared_temporal_encoder", "slow_head", "fast_head"],
+        trainable=["spatial_cell_projector", "condition_projection",
+                   "slow_temporal", "fast_temporal", "slow_head", "fast_head"],
         data={"act": str(Path(args.data)).replace("\\", "/"), "act_glob": VLA_SCHEMA_VERSION_V5},
         counts={"train": len(dataset), "val": len(val_dataset) if val_dataset is not None else 0},
         precision="fp16+GradScaler" if amp_enabled else "fp32",
@@ -790,6 +918,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "max_samples": args.max_samples, "sampling": sampling,
                   "seed": int(getattr(args, "seed", 0)), "move_stop_weight": args.move_stop_weight,
                   "grad_initial_scale": grad_initial_scale,
+                  "history_dropout_p": history_dropout_p,
+                  "visual_aux": float(getattr(args, "visual_aux", 1.0)),
                   "button_positive_weight": args.button_positive_weight,
                   "move_direction_balance": args.move_direction_balance,
                   "class_balance": class_balance_manifest,
@@ -1076,6 +1206,10 @@ def main(argv=None) -> int:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--grad-initial-scale", type=float, default=1024.0,
                         help="FP16 GradScaler 初始 scale；2080 Ti 默认 1024 以避免首步溢出")
+    parser.add_argument("--history-dropout-p", type=float, default=0.5,
+                        help="训练时按样本清零完整 action history 的概率；验证/部署始终为 0")
+    parser.add_argument("--visual-aux", type=float, default=1.0,
+                        help="history-free visual action expert 的显式监督权重")
     parser.add_argument("--move-stop-weight", type=float, default=0.5)
     parser.add_argument("--move-direction-balance", action="store_true",
                         help="batch>=4 时按 batch 频率；batch<4 时按采样训练集全局频率做 inverse-sqrt balance")

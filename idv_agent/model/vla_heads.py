@@ -51,6 +51,15 @@ class FastVLAOutput:
     intent_context_logits: torch.Tensor
 
 
+@dataclass
+class VisualExpertOutput:
+    """History-free visual predictions and their decision representation."""
+
+    fast: FastVLAOutput
+    slow: SlowVLAOutput
+    feature: torch.Tensor
+
+
 class FiLMConditioner(nn.Module):
     """Turn slow discrete/continuous context into per-channel FiLM values."""
 
@@ -180,3 +189,58 @@ class FastVLAHead(nn.Module):
             stop_or_replan=torch.sigmoid(self.stop(hidden)).squeeze(-1),
             intent_context_logits=self.intent_context(hidden),
         )
+
+
+class VisualActionExpert(nn.Module):
+    """Predict action and tactical outputs from image evidence only.
+
+    The input explicitly contains the latest visual state and its change from
+    the first valid observation.  It intentionally has no history-action or
+    slow-condition input, making the visual path inspectable and deployable.
+    """
+
+    def __init__(self, frame_feature_dim: int, temporal_dim: int,
+                 horizon: int = ACTION_CHUNK_HORIZON):
+        super().__init__()
+        if frame_feature_dim < 1 or temporal_dim < 1 or horizon < 1:
+            raise ValueError("frame_feature_dim/temporal_dim/horizon 必须为正数")
+        self.frame_feature_dim = int(frame_feature_dim)
+        self.temporal_dim = int(temporal_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(self.frame_feature_dim * 2, self.temporal_dim), nn.GELU(),
+            nn.Linear(self.temporal_dim, self.temporal_dim), nn.GELU(),
+        )
+        self.fast = FastVLAHead(self.temporal_dim, history_action_dim=0, horizon=horizon)
+        self.slow = SlowVLAHead(self.temporal_dim)
+
+    @staticmethod
+    def _valid_indices(frame_features: torch.Tensor,
+                       valid_mask: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, steps, _ = frame_features.shape
+        if valid_mask is None:
+            first = torch.zeros(batch, dtype=torch.long, device=frame_features.device)
+            last = torch.full((batch,), steps - 1, dtype=torch.long, device=frame_features.device)
+            return first, last
+        if valid_mask.ndim == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != (batch, steps):
+            raise ValueError("valid_mask shape 必须为 [B,L]")
+        valid_mask = valid_mask.bool()
+        if not bool(valid_mask.any(dim=1).all()):
+            raise ValueError("每个视觉窗口至少需要一帧有效画面")
+        first = valid_mask.long().argmax(dim=1)
+        last = valid_mask.long().sum(dim=1).clamp_min(1) - 1
+        return first, last
+
+    def forward(self, frame_features: torch.Tensor,
+                valid_mask: Optional[torch.Tensor] = None) -> VisualExpertOutput:
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        if frame_features.ndim != 3 or frame_features.shape[-1] != self.frame_feature_dim:
+            raise ValueError(f"frame_features 必须是 [B,L,{self.frame_feature_dim}]")
+        first_index, last_index = self._valid_indices(frame_features, valid_mask)
+        rows = torch.arange(frame_features.shape[0], device=frame_features.device)
+        first = frame_features[rows, first_index]
+        last = frame_features[rows, last_index]
+        feature = self.trunk(torch.cat((last, last - first), dim=-1))
+        return VisualExpertOutput(fast=self.fast(feature), slow=self.slow(feature), feature=feature)
