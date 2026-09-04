@@ -3,6 +3,31 @@ from __future__ import annotations
 import torch
 
 
+def test_gradient_diagnostics_reports_only_nonfinite_named_gradients():
+    from idv_agent.scripts.train_vla import _gradient_diagnostics
+
+    finite = torch.nn.Parameter(torch.tensor([1.0]))
+    finite.grad = torch.tensor([0.25])
+    nonfinite = torch.nn.Parameter(torch.tensor([1.0]))
+    nonfinite.grad = torch.tensor([float("inf")])
+    unused = torch.nn.Parameter(torch.tensor([1.0]))
+
+    assert _gradient_diagnostics([("finite", finite), ("unused", unused)]) == []
+    assert _gradient_diagnostics([("bad", nonfinite)]) == [{
+        "name": "bad", "dtype": "torch.float32", "max_abs": None,
+    }]
+
+
+def test_grad_scaler_uses_conservative_configured_initial_scale(monkeypatch):
+    from idv_agent.scripts.train_vla import _make_grad_scaler
+
+    captured = {}
+    monkeypatch.setattr(torch.amp, "GradScaler", lambda *args, **kwargs: captured.update(
+        args=args, kwargs=kwargs) or "scaler")
+    assert _make_grad_scaler(amp_enabled=True, initial_scale=1024.0) == "scaler"
+    assert captured == {"args": ("cuda",), "kwargs": {"enabled": True, "init_scale": 1024.0}}
+
+
 def test_training_behavior_gate_requires_decreasing_finite_loss_and_gradients():
     from idv_agent.training.feature_activity import training_behavior_gate
 

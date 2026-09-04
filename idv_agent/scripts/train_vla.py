@@ -50,6 +50,19 @@ def _device_dtype(device: torch.device) -> tuple[torch.dtype, bool]:
     return (torch.float16 if use_amp else torch.float32), use_amp
 
 
+def _make_grad_scaler(*, amp_enabled: bool, initial_scale: float = 1024.0) -> torch.amp.GradScaler:
+    """Construct FP16 loss scaling conservatively for the frozen VLA stack.
+
+    The PyTorch default (65536) overflowed the first scaled backward pass on
+    an RTX 2080 Ti even though the unscaled loss was finite.  1024 has been
+    verified on the same batch to keep every trainable gradient finite; the
+    scaler may still grow it automatically when later steps permit.
+    """
+    if not math.isfinite(initial_scale) or initial_scale < 1.0:
+        raise ValueError("grad initial scale 必须是 >= 1 的有限数")
+    return torch.amp.GradScaler("cuda", enabled=amp_enabled, init_scale=float(initial_scale))
+
+
 def _load_act_base_backbone(model_path: str | Path, *, dtype: torch.dtype,
                             device: torch.device | str):
     """Load the ACT base backbone without the known-bad M2 projection/LoRA."""
@@ -526,6 +539,28 @@ def _class_balance_manifest(statistics: dict[str, torch.Tensor], *, data_paths: 
     }
 
 
+def _gradient_diagnostics(named_parameters: list[tuple[str, torch.nn.Parameter]]) -> list[dict[str, object]]:
+    """Return compact, serializable evidence for non-finite trainable grads.
+
+    This intentionally runs after ``GradScaler.unscale_`` and before clipping:
+    clipping an infinity by an infinite global norm turns it into NaN and
+    destroys the evidence needed to distinguish a scaler overflow from an
+    invalid forward/backward computation.
+    """
+    invalid: list[dict[str, object]] = []
+    for name, parameter in named_parameters:
+        gradient = parameter.grad
+        if gradient is None or bool(torch.isfinite(gradient).all()):
+            continue
+        max_abs = gradient.detach().abs().max()
+        invalid.append({
+            "name": name,
+            "dtype": str(gradient.dtype),
+            "max_abs": (float(max_abs.cpu()) if bool(torch.isfinite(max_abs)) else None),
+        })
+    return invalid
+
+
 def train(args: argparse.Namespace) -> dict[str, Any]:
     set_seed(int(getattr(args, "seed", 0)))
     device = torch.device(args.device)
@@ -624,9 +659,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         first_batch["slow_loss_mask"] = torch.ones_like(first_batch["slow_loss_mask"])
     with torch.no_grad():
         encode_batch(adapter, first_batch, device=device)
-    trainable = [p for p in list(adapter.parameters()) + list(core.parameters()) if p.requires_grad]
+    named_trainable = [(f"adapter.{name}", parameter) for name, parameter in adapter.named_parameters()
+                       if parameter.requires_grad]
+    named_trainable += [(f"core.{name}", parameter) for name, parameter in core.named_parameters()
+                        if parameter.requires_grad]
+    trainable = [parameter for _name, parameter in named_trainable]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr)
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    grad_initial_scale = float(getattr(args, "grad_initial_scale", 1024.0))
+    scaler = _make_grad_scaler(amp_enabled=amp_enabled, initial_scale=grad_initial_scale)
 
     baseline_losses, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=amp_enabled,
                                       vision_micro_batch_size=vision_micro_batch_size,
@@ -639,6 +679,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     history: list[float] = []
     component_history: list[dict[str, float]] = []
     gradient_norm_history: list[float] = []
+    gradient_diagnostics: list[dict[str, object]] = []
     peak_memory = 0
     started = time.perf_counter()
     iterator = iter(loader)
@@ -664,11 +705,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if amp_enabled:
             scaler.scale(total).backward()
             scaler.unscale_(optimizer)
+            invalid_gradients = _gradient_diagnostics(named_trainable)
+            gradient_diagnostics.append({"step": step, "scale": float(scaler.get_scale()),
+                                         "invalid_parameters": invalid_gradients})
             gradient_norm = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             total.backward()
+            invalid_gradients = _gradient_diagnostics(named_trainable)
+            gradient_diagnostics.append({"step": step, "scale": None,
+                                         "invalid_parameters": invalid_gradients})
             gradient_norm = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             optimizer.step()
         history.append(float(total.detach().cpu()))
@@ -742,6 +789,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "temporal_dim": args.temporal_dim,
                   "max_samples": args.max_samples, "sampling": sampling,
                   "seed": int(getattr(args, "seed", 0)), "move_stop_weight": args.move_stop_weight,
+                  "grad_initial_scale": grad_initial_scale,
                   "button_positive_weight": args.button_positive_weight,
                   "move_direction_balance": args.move_direction_balance,
                   "class_balance": class_balance_manifest,
@@ -777,13 +825,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "component_loss_history": component_history,
         "gradient_norm_history": gradient_norm_history,
     })
-    if getattr(args, "require_training_behavior", False) and not training_behavior["pass"]:
-        raise ValueError(f"小训练行为验收未通过: {json.dumps(training_behavior, ensure_ascii=False)}")
     result = {"samples": len(dataset), "val_samples": len(val_dataset) if val_dataset is not None else 0,
             "steps": args.steps, "baseline_loss": baseline,
             "final_loss": history[-1] if history else baseline,
             "loss_history": history, "component_loss_history": component_history,
             "gradient_norm_history": gradient_norm_history,
+            "gradient_diagnostics": gradient_diagnostics,
             "training_behavior_acceptance": training_behavior, "mask": mask,
             "checkpoint": str(checkpoint), "checkpoint_loss_delta": abs(float(before["total"] - after["total"])),
             "peak_memory_mb": peak_memory / (1024 * 1024), "elapsed_sec": elapsed,
@@ -794,6 +841,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "val": val_result, "class_balance_acceptance": acceptance}
     (checkpoint.parent / "metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if getattr(args, "require_training_behavior", False) and not training_behavior["pass"]:
+        raise ValueError(f"小训练行为验收未通过: {json.dumps(training_behavior, ensure_ascii=False)}")
     return result
 
 
@@ -1025,6 +1074,8 @@ def main(argv=None) -> int:
     parser.add_argument("--max-samples", type=int, default=32)
     parser.add_argument("--temporal-dim", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--grad-initial-scale", type=float, default=1024.0,
+                        help="FP16 GradScaler 初始 scale；2080 Ti 默认 1024 以避免首步溢出")
     parser.add_argument("--move-stop-weight", type=float, default=0.5)
     parser.add_argument("--move-direction-balance", action="store_true",
                         help="batch>=4 时按 batch 频率；batch<4 时按采样训练集全局频率做 inverse-sqrt balance")
