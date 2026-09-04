@@ -9,6 +9,7 @@ short 20--100 step smoke run on the real session data.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import math
@@ -324,7 +325,8 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
                  vision_micro_batch_size: int = 8,
                  raw_feature_cache: Any | None = None,
                  augment_images: bool = False,
-                 image_transform: Callable[[Image.Image], Image.Image] | None = None) -> torch.Tensor:
+                 image_transform: Callable[[Image.Image], Image.Image] | None = None,
+                 return_visual: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Encode real images in vision micro-batches and return ``[B, L, D]`` features.
 
     ``frame_cache`` deduplicates vision-tower forwards across calls by task and
@@ -346,6 +348,7 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
     if augment_images and raw_feature_cache is not None:
         raise ValueError("augment_images 与 raw_feature_cache 不兼容；增强必须在原始图像上执行")
     features = []
+    visual_features = []
     cache_by_task: dict[tuple[str, int], Any] = {}
     # Per-batch cache deliberately keeps graph-connected tensors.  This is
     # safe for training and preserves gradient accumulation when duplicate
@@ -365,6 +368,7 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
         cache = cache_by_task[task_key]
         augmentation_params = (_sample_image_augmentation_params() if augment_images else None)
         row = [None] * len(paths)
+        visual_row = [None] * len(paths)
         images = []
         load_paths = []
         for path in paths:
@@ -396,11 +400,17 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
             cache_key = path_key if not augment_images else (*path_key, row_index)
             if path is not None and cache_key in batch_frame_cache:
                 row[col_index] = batch_frame_cache[cache_key]
+                if return_visual:
+                    visual_row[col_index] = adapter.uncondition_features(
+                        row[col_index].unsqueeze(0), cache)[0]
                 if frame_stats is not None:
                     frame_stats["hits"] += 1
                 continue
             if path is not None and frame_cache is not None and cache_key in frame_cache:
                 row[col_index] = frame_cache[cache_key].to(device=device)
+                if return_visual:
+                    visual_row[col_index] = adapter.uncondition_features(
+                        row[col_index].unsqueeze(0), cache)[0]
                 if frame_stats is not None:
                     frame_stats["hits"] += 1
                 continue
@@ -422,39 +432,61 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
                 feature = project(raw, cache)[0]
                 batch_frame_cache[cache_key] = feature
                 row[col_index] = feature
+                if return_visual:
+                    visual_row[col_index] = adapter.project_raw_visual_features(raw)[0]
                 if frame_stats is not None:
                     frame_stats["raw_cache_hits"] = frame_stats.get("raw_cache_hits", 0) + 1
                 continue
             if image is None:
-                row[col_index] = torch.zeros(adapter.hidden_size, device=device, dtype=next(adapter.parameters()).dtype)
+                row[col_index] = torch.zeros(getattr(adapter, "act_feature_dim",
+                                                     getattr(adapter, "hidden_size")), device=device,
+                                             dtype=next(adapter.parameters()).dtype)
+                if return_visual:
+                    visual_row[col_index] = torch.zeros_like(row[col_index])
             else:
                 pending_refs[cache_key].append((row_index, col_index))
                 if not any(entry[4] == cache_key for entry in pending[task_key]):
                     pending[task_key].append((row_index, col_index, path, image, cache_key))
         features.append(row)
+        if return_visual:
+            visual_features.append(visual_row)
     for task_key, entries in pending.items():
         cache = cache_by_task[task_key]
         for start in range(0, len(entries), vision_micro_batch_size):
             chunk = entries[start:start + vision_micro_batch_size]
             images = [entry[3] for entry in chunk]
             encode_frames = getattr(adapter, "encode_frames", None)
-            if encode_frames is not None:
+            encode_pair = getattr(adapter, "encode_frames_with_visual", None)
+            if return_visual and encode_pair is not None:
+                encoded, encoded_visual = encode_pair(
+                    images, cache, micro_batch_size=vision_micro_batch_size)
+            elif encode_frames is not None:
                 encoded = encode_frames(images, cache, micro_batch_size=vision_micro_batch_size)
+                encoded_visual = encoded
             else:
                 encoded = torch.stack([adapter.encode_frame(image, cache) for image in images])
+                encoded_visual = encoded
             if encoded.ndim != 2 or encoded.shape[0] != len(chunk):
                 raise ValueError("encode_frames 必须返回 [N,D] Tensor")
-            for entry, feature in zip(chunk, encoded):
+            if encoded_visual.ndim != 2 or encoded_visual.shape != encoded.shape:
+                raise ValueError("encode_frames_with_visual 必须返回两个同形状 [N,D] Tensor")
+            for entry, feature, visual_feature in zip(chunk, encoded, encoded_visual):
                 row_index, col_index, path, _image, cache_key = entry
                 for row_index, col_index in pending_refs[cache_key]:
                     features[row_index][col_index] = feature
+                    if return_visual:
+                        visual_features[row_index][col_index] = visual_feature
                 batch_frame_cache[cache_key] = feature
                 if frame_cache is not None:
                     frame_cache[cache_key] = feature.detach().cpu()
                 if frame_stats is not None:
                     frame_stats["encoded"] += 1
     features = [torch.stack(row) for row in features]
-    return torch.stack(features).to(device)
+    conditioned = torch.stack(features).to(device)
+    if not return_visual:
+        return conditioned
+    visual_features = [torch.stack(row) for row in visual_features]
+    return conditioned, torch.stack(visual_features).to(device)
 
 
 def _model_inputs(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
@@ -546,11 +578,12 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
     elif history_dropout_p:
         model_batch["history_actions"], _ = _drop_history_actions(
             model_batch["history_actions"], probability=history_dropout_p)
-    frame_features = encode_batch(adapter, batch, device=device,
+    encoded = encode_batch(adapter, batch, device=device,
                                   frame_cache=frame_cache, frame_stats=frame_stats,
                                   vision_micro_batch_size=vision_micro_batch_size,
                                   raw_feature_cache=raw_feature_cache,
-                                  augment_images=augment_images)
+                                  augment_images=augment_images, return_visual=True)
+    frame_features, visual_frame_features = encoded
     if ablate_frame_avg:
         # 画面边际贡献 ablation：把 (B,L,D) 里区分不同帧/不同画面(multi-session batch)
         # 的可分辨分量中和——把所有 **valid(真实)帧** 替换为其全局均值特征。
@@ -571,6 +604,7 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
         else:
             mean_feat = frame_features.mean(dim=(0, 1), keepdim=True)
         frame_features = mean_feat.reshape(1, 1, -1).expand_as(frame_features).clone()
+        visual_frame_features = frame_features.clone()
     condition = core.initial_condition(frame_features.shape[0], device=device,
                                        mode_id=0)
     # Keep the per-record mode conditioning from v4 (normally all rows in the
@@ -581,6 +615,7 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
         # First pass updates the slow state from the current visual window.
         slow_pass = core(frame_features, condition,
                          valid_mask=model_batch["frame_valid_mask"],
+                         visual_frame_features=visual_frame_features,
                          history_actions=model_batch["history_actions"], run_slow=True)
         if slow_pass.slow is None:  # defensive; run_slow=True above is required
             raise RuntimeError("slow pass 未产生 SlowVLAOutput")
@@ -593,6 +628,7 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
         )
         fast_pass = core(frame_features, next_condition,
                          valid_mask=model_batch["frame_valid_mask"],
+                         visual_frame_features=visual_frame_features,
                          history_actions=model_batch["history_actions"], run_slow=False,
                          detach_slow_condition=False)
         output = FastSlowVLAOutput(
@@ -607,9 +643,14 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
             "visual_fast": output.visual.fast,
             "visual_slow": slow_pass.visual.slow,
         }
+        effective_weights = loss_weights
+        if effective_weights is not None and getattr(core, "visual_only_deployment", False):
+            # ``output.fast/.slow`` are already the visual expert outputs in
+            # this ACT schema; applying visual_aux would double its gradient.
+            effective_weights = replace(effective_weights, visual_aux=0.0)
         losses = (compute_vla_loss(output.fast, output.slow, model_batch,
-                                   weights=loss_weights, **loss_kwargs)
-                  if loss_weights is not None else
+                                   weights=effective_weights, **loss_kwargs)
+                  if effective_weights is not None else
                   compute_vla_loss(output.fast, output.slow, model_batch, **loss_kwargs))
     return losses, output
 
@@ -695,6 +736,47 @@ def _named_act_trainable(adapter: torch.nn.Module, core: torch.nn.Module) -> lis
     return adapter_params + core_params
 
 
+def _calibrate_visual_input_center(adapter: torch.nn.Module, core: SharedFastSlowVLA, dataset,
+                                   *, device: torch.device, samples: int,
+                                   vision_micro_batch_size: int, seed: int) -> dict[str, object]:
+    """Set the persistent raw-visual center from deterministic training examples.
+
+    A frozen Qwen grid contains a large cross-image common direction.  The
+    visual-only linear heads must see residual image evidence, not use that
+    direction as a majority-class bias.  Calibration is separate from random
+    augmentation and is checkpointed in ``visual_expert.input_center``.
+    """
+    samples = int(samples)
+    if samples < 1:
+        raise ValueError("visual_center_samples 必须为正数")
+    subset = _stratified_subset(dataset, min(samples, len(dataset)), seed=int(seed))
+    loader = DataLoader(subset, batch_size=1, shuffle=False,
+                        collate_fn=VLASequenceCollator(max_frames=8))
+    was_adapter_training, was_core_training = adapter.training, core.training
+    adapter.eval(); core.eval()
+    total: torch.Tensor | None = None
+    count = 0
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                _, raw_visual = encode_batch(adapter, batch, device=device,
+                                             vision_micro_batch_size=vision_micro_batch_size,
+                                             return_visual=True)
+                pairs = core.visual_expert.pair_features(
+                    raw_visual, valid_mask=batch["frame_valid_mask"].to(device)).detach().double()
+                current = pairs.sum(dim=0)
+                total = current if total is None else total + current
+                count += int(pairs.shape[0])
+    finally:
+        adapter.train(was_adapter_training); core.train(was_core_training)
+    if total is None or count < 1:
+        raise RuntimeError("visual center calibration 未产生有效样本")
+    center = (total / count).float()
+    core.visual_expert.set_input_center(center)
+    return {"samples": count, "pair_dim": int(center.numel()),
+            "abs_mean": float(center.abs().mean().cpu())}
+
+
 def train(args: argparse.Namespace) -> dict[str, Any]:
     set_seed(int(getattr(args, "seed", 0)))
     device = torch.device(args.device)
@@ -749,8 +831,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     # Keep newly-trained layers in FP32 (GradScaler cannot unscale FP16
     # gradients); autocast still executes their matmuls in FP16 on CUDA.
     adapter.condition_projection.to(device=device, dtype=torch.float32)
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
-                             history_action_dim=72).to(device=device, dtype=torch.float32)
     global_counts = None
     class_balance_statistics = None
     class_balance_manifest = None
@@ -786,7 +866,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                                          if class_balance_statistics else None),
                                    button_global_counts=button_global_counts)
 
-    # Materialize LazyLinear before constructing the optimizer/checkpoint.
+    # Materialize the direct raw-grid feature contract before constructing the
+    # core/optimizer.  ``hidden_size`` is Qwen text width (2560), not ACT
+    # visual width (2*2*1024 = 4096).
     first_batch = next(iter(loader))
     if getattr(args, "overfit_slow_mask", False):
         # Small-set memorization check: supervise the slow head on every
@@ -794,9 +876,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         first_batch["slow_loss_mask"] = torch.ones_like(first_batch["slow_loss_mask"])
     with torch.no_grad():
         encode_batch(adapter, first_batch, device=device)
-    if adapter.spatial_cell_projector is None:
-        raise RuntimeError("ACT 视觉 warm-up 未 materialize SpatialCellProjector")
-    adapter.spatial_cell_projector.to(device=device, dtype=torch.float32)
+    if int(getattr(adapter, "act_feature_dim", 0)) < 1:
+        raise RuntimeError("ACT raw-grid feature dim 未 materialize")
+    core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
+                             history_action_dim=72).to(device=device, dtype=torch.float32)
+    visual_center = _calibrate_visual_input_center(
+        adapter, core, dataset, device=device,
+        samples=int(getattr(args, "visual_center_samples", 64)),
+        vision_micro_batch_size=vision_micro_batch_size,
+        seed=int(getattr(args, "seed", 0)),
+    )
     named_trainable = _named_act_trainable(adapter, core)
     trainable = [parameter for _name, parameter in named_trainable]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr)
@@ -905,9 +994,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     elapsed = time.perf_counter() - started
     manifest = build_manifest(
         stage="M3_ACT", parent=None,
-        base_model=args.model_path, adapters=["spatial_cell_projector", "act_heads"],
+        base_model=args.model_path, adapters=["deterministic_raw_grid_2x2", "act_heads"],
         frozen=["qwen_language_vision_backbone"],
-        trainable=["spatial_cell_projector", "condition_projection",
+        trainable=["condition_projection", "visual_expert",
                    "slow_temporal", "fast_temporal", "slow_head", "fast_head"],
         data={"act": str(Path(args.data)).replace("\\", "/"), "act_glob": VLA_SCHEMA_VERSION_V5},
         counts={"train": len(dataset), "val": len(val_dataset) if val_dataset is not None else 0},
@@ -920,6 +1009,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "grad_initial_scale": grad_initial_scale,
                   "history_dropout_p": history_dropout_p,
                   "visual_aux": float(getattr(args, "visual_aux", 1.0)),
+                  "prior_scale": float(core.prior_scale), "prior_logits_bounded": True,
+                  "camera_prior_scale": float(core.camera_prior_scale),
+                  "visual_input_center": visual_center,
                   "button_positive_weight": args.button_positive_weight,
                   "move_direction_balance": args.move_direction_balance,
                   "class_balance": class_balance_manifest,
@@ -966,8 +1058,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "peak_memory_mb": peak_memory / (1024 * 1024), "elapsed_sec": elapsed,
             "manifest": str(manifest_path.resolve()),
             "checkpoint_manifest_embedded": True,
-            "slow_accuracy": _slow_accuracy(adapter, core, eval_loader, device, amp_enabled,
-                                             raw_feature_cache=raw_feature_cache),
+            "slow_accuracy": _slow_accuracy(
+                adapter, core, eval_loader, device, amp_enabled,
+                max_samples=int(getattr(args, "max_eval_samples", 64) or 0) or None,
+                raw_feature_cache=raw_feature_cache),
             "val": val_result, "class_balance_acceptance": acceptance}
     (checkpoint.parent / "metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1191,6 +1285,8 @@ def main(argv=None) -> int:
     parser.add_argument("--val-data", default="", help="可选：逗号/分号分隔的 session v5 JSONL 留出集")
     parser.add_argument("--max-val-samples", type=int, default=64,
                         help="验证集最多编码的样本数，0 表示整集")
+    parser.add_argument("--max-eval-samples", type=int, default=64,
+                        help="训练后训练集诊断最多编码的样本数，0 表示整集")
     parser.add_argument("--model-path", required=True, help="本地 Qwen3-VL checkpoint")
     parser.add_argument("--init-checkpoint", default="", help="已废弃：ACT 不加载 M2_VG")
     parser.add_argument("--allow-base-init", action="store_true", help="已废弃：ACT 默认从基础模型初始化")
@@ -1210,6 +1306,8 @@ def main(argv=None) -> int:
                         help="训练时按样本清零完整 action history 的概率；验证/部署始终为 0")
     parser.add_argument("--visual-aux", type=float, default=1.0,
                         help="history-free visual action expert 的显式监督权重")
+    parser.add_argument("--visual-center-samples", type=int, default=64,
+                        help="从训练集分层抽取的 raw visual center 校准样本数")
     parser.add_argument("--move-stop-weight", type=float, default=0.5)
     parser.add_argument("--move-direction-balance", action="store_true",
                         help="batch>=4 时按 batch 频率；batch<4 时按采样训练集全局频率做 inverse-sqrt balance")

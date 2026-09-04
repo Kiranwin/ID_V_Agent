@@ -6,14 +6,14 @@
 
 冻结 Qwen 的空间网格线性 probe 已在 79 个训练 session、20 个保留 session 上证明存在可学视觉信号：只用最新画面的 move 准确率为 70.55%，超过 62.50% 的多数类基线；只用画面的 decipher/travel macro recall 为 92.27%。因此问题不在采集、回放、v5 标签或视觉塔。
 
-现行 m6 堆栈将画面、时间和 history 先融合再由同一 fast head 分类。即使 cell projector、GRU input residual、post-GRU visual residual、history dropout 已加入，最终 GRU different-scene cosine 仍为 0.999938，且 normal/image-zero/image-shuffle 指标完全一致。历史和慢层先验可在共享 logits 上覆盖视觉梯度；继续增加 residual 没有可证伪性。
+现行 m7 堆栈将冻结的 8×8 raw cells 送入可学习的 SpatialCellProjector。即使新增 history-free visual expert，最终特征 different-scene cosine 仍为 0.999942，image-zero/image-shuffle 的 argmax 几乎不变，说明高容量的 raster 压缩仍可抹掉视觉信号。视觉 probe 已证明冻结 raw grid 本身有可学信号，因此 ACT 视觉路径必须移除该学习型空间瓶颈。
 
 ## 架构
 
-保留已实现的冻结 Qwen 8x8 token、SpatialCellProjector、8 帧 v5 输入和独立 fast/slow GRU。新增 `VisualActionExpert`，直接从最后有效帧的保胞投影特征和“末帧减首有效帧”变化特征产生：
+保留冻结 Qwen 8x8 token、8 帧 v5 输入和独立 fast/slow GRU。先把 `[N,8,8,1024]` 按 4×4 邻域做确定性平均，得到 `[N,2,2,1024]`，再按行展平为 `[N,4096]`。该表示不含可学习空间投影，直接作为 ACT 的 `act_feature_dim`；Qwen 的文本 `hidden_size=2560` 只用于文本条件投影，不能拿来建 ACT core。新增 `VisualActionExpert`，直接从最后有效帧的 raw-grid 特征和“末帧减首有效帧”变化特征产生：
 
 ```text
-f_last, Δf = f_last - f_first               # 每项 2560，视觉专属
+f_last, Δf = f_last - f_first               # 每项 4096，视觉专属
   -> visual trunk (Linear -> GELU -> Linear -> GELU)
   -> visual fast heads: move/dx/dy/buttons/duration/intent-context
   -> visual slow heads: intent/subgoal/context/refresh
@@ -31,9 +31,9 @@ final duration = clamp(visual_duration + 0.5*(prior_duration - 6), 1, 30)
 
 `compute_vla_loss` 接收可选 visual fast/slow 输出，新增逐头 `visual_*` 损失并以 `visual_aux=1.0` 加入 total。类别权重继续每头独立、bounded inverse-sqrt `[0.35, 3.0]`，训练图像增强与 history dropout=0.5 继续仅用于训练。
 
-新 checkpoint schema 为 `m7_act.visual_expert.v1`。旧 m6 与 M2 均 fail-closed。checkpoint core state 自然包含 visual expert；adapter state 仍严格为 raster projector 和 condition projection。M2 不加载。
+当前 checkpoint schema 为 `m13_act.visual_camera_prior.v1`。旧 m12、m11、m10、m9、m8、m7、m6 与 M2 均 fail-closed。checkpoint core state 包含 visual expert 及其训练中心；adapter state 只允许 task condition projection，禁止 raster projector/SpatialAgg。M2 不加载。
 
-raw feature cache 仍保存冻结 `[64,1024]`，训练时重新运行可训练 SpatialCellProjector，因此不缓存 expert 或其随机增强输出。增强与 raw feature cache 仍互斥。当前 cache 与 decorrelated session 的覆盖不完整，此次严格训练继续原图实时视觉路径，不能把不完整 cache 当作训练数据。
+raw feature cache 仍保存冻结 `[64,1024]`，训练/评估查缓存后统一经过同一个确定性 2×2 pooling 和 condition projection；不缓存 expert 或其随机增强输出。增强与 raw feature cache 仍互斥。当前 cache 与 decorrelated session 的覆盖不完整，因此本次带增强训练继续原图实时视觉路径，不能把不完整 cache 当作完整训练数据。
 
 ## 验收
 

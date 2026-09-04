@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import (_contiguous_subset, _bounded_subset, _stratified_subset, _dataset_paths,
                                           _load_act_base_backbone, _model_inputs,
                                           encode_batch, _scheduled_condition)
@@ -32,10 +33,9 @@ def _load(args):
     adapter, _ = _load_act_base_backbone(
         args.model_path, dtype=torch.float16 if amp else torch.float32, device=device)
     manifest = load_manifest(Path(args.checkpoint).parent / "manifest.json", require_artifacts=True)
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
+    core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
-    for name in ("visual_projection", "condition_projection"):
-        getattr(adapter, name).to(device=device, dtype=torch.float32)
+    adapter.condition_projection.to(device=device, dtype=torch.float32)
     # Materialize lazy projection exactly as evaluation does.
     probe = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
     probe = _bounded_subset(probe, min(1, len(probe)))
@@ -43,12 +43,7 @@ def _load(args):
     with torch.no_grad():
         encode_batch(adapter, next(iter(loader)), device=device)
     saved = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    adapter.visual_projection.load_state_dict(saved["adapter"]["visual_projection"])
-    adapter.condition_projection.load_state_dict(saved["adapter"]["condition_projection"])
-    if "spatial_agg" in saved["adapter"]:
-        agg_state = saved["adapter"]["spatial_agg"]
-        adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
-    core.load_state_dict(saved["core"])
+    load_visual_grounded_act_checkpoint(adapter, core, saved)
     adapter.eval(); core.eval()
     return device, amp, adapter, core, {"stage": "base_without_m2"}, manifest
 

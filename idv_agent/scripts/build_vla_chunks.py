@@ -281,7 +281,11 @@ def build(session: Path, output: Path, *, stride: int = 3,
         # v5's canonical sampling separates anchor decorrelation from the
         # temporal spacing inside the observation window.  Legacy v3/v4
         # callers retain the old ``stride`` alias behavior.
-        anchor_stride = 12 if schema_version == VLA_SCHEMA_VERSION_V5 else stride
+        # Four six-frame future macro actions occupy 24 frames.  A 36-frame
+        # anchor interval leaves a 12-frame gap after that label horizon, so
+        # adjacent default samples cannot share either target frames or an
+        # observation inside the preceding sample's target horizon.
+        anchor_stride = 36 if schema_version == VLA_SCHEMA_VERSION_V5 else stride
     if history_stride is None:
         history_stride = stride
     if schema_version == VLA_SCHEMA_VERSION_V5 and history_stride != 3:

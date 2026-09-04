@@ -96,7 +96,7 @@ def main(argv=None):
         adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
     manifest = json.load(open(Path(ckpt).parent / "manifest.json", encoding="utf-8"))
     td = int(manifest["training"]["temporal_dim"])
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=td,
+    core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=td,
                              history_action_dim=72).to(dev)
     core.load_state_dict(saved["core"])
     core.eval()

@@ -19,26 +19,22 @@ def _adapter(hidden_size: int = 5):
     return Qwen3VLBackboneAdapter(Model())
 
 
-def test_act_checkpoint_restores_only_raster_projector_and_condition():
+def test_act_checkpoint_restores_only_condition_projection():
     from idv_agent.model.act_checkpoint import act_adapter_state, load_act_adapter_state
 
     source = _adapter()
-    source._ensure_spatial_cell_projector(4)
     state = act_adapter_state(source)
-    assert set(state) == {"spatial_cell_projector", "condition_projection"}
+    assert set(state) == {"condition_projection"}
 
     target = _adapter()
     load_act_adapter_state(target, state)
-    assert target.spatial_cell_projector is not None
-    assert torch.equal(target.spatial_cell_projector.position,
-                       source.spatial_cell_projector.position)
     assert torch.equal(target.condition_projection.weight, source.condition_projection.weight)
 
 
 def test_act_checkpoint_rejects_legacy_spatial_aggregator():
     from idv_agent.model.act_checkpoint import load_act_adapter_state
 
-    with pytest.raises(ValueError, match="legacy|旧"):
+    with pytest.raises(ValueError, match="m7|legacy|旧"):
         load_act_adapter_state(_adapter(), {"spatial_agg": {}})
 
 
@@ -51,7 +47,7 @@ def test_act_checkpoint_schema_rejects_layernorm_cell_projector_contract():
     checkpoint = {"checkpoint_schema_version": "m4_act.visual_grounded.v1",
                   "adapter": {}, "core": {}}
 
-    with pytest.raises(ValueError, match="m7_act"):
+    with pytest.raises(ValueError, match="m13_act"):
         load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
 
 
@@ -64,7 +60,7 @@ def test_act_checkpoint_rejects_previous_m6_visual_residual_schema():
     checkpoint = {"checkpoint_schema_version": "m6_act.visual_decision_residual.v1",
                   "adapter": {}, "core": {}}
 
-    with pytest.raises(ValueError, match="m7_act"):
+    with pytest.raises(ValueError, match="m13_act"):
         load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
 
 
@@ -92,3 +88,14 @@ def test_act_trainable_parameters_exclude_uninitialized_legacy_projection():
     assert not any(name.startswith("adapter.visual_projection") for name in names)
     assert "adapter.condition_projection.weight" in names
     assert "core.fast_temporal.input_residual.weight" in names
+
+
+def test_visual_center_is_checkpointed_in_core_state():
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+
+    core = SharedFastSlowVLA(frame_feature_dim=5, temporal_dim=4, history_action_dim=0)
+    core.visual_expert.set_input_center(torch.arange(10, dtype=torch.float32))
+    restored = SharedFastSlowVLA(frame_feature_dim=5, temporal_dim=4, history_action_dim=0)
+    restored.load_state_dict(core.state_dict())
+    assert torch.equal(restored.visual_expert.input_center,
+                       torch.arange(10, dtype=torch.float32))

@@ -22,19 +22,19 @@ def test_runtime_loader_uses_base_loader_and_never_passes_m2(monkeypatch):
 
     class Adapter:
         hidden_size = 4
-        visual_projection = torch.nn.Linear(1, 1)
         condition_projection = torch.nn.Linear(1, 1)
         def eval(self): return self
-    checkpoint = {"adapter": {"visual_projection": Adapter.visual_projection.state_dict(),
-                                "condition_projection": Adapter.condition_projection.state_dict()},
-                  "core": {}}
+    checkpoint = {"checkpoint_schema_version": "m4_act.visual_grounded.v1",
+                  "adapter": {}, "core": {}}
     seen = []
     monkeypatch.setattr(realtime, "_load_act_base_backbone", lambda *args, **kwargs: seen.append((args, kwargs)) or (Adapter(), "processor"))
     monkeypatch.setattr(torch, "load", lambda *args, **kwargs: checkpoint)
-    monkeypatch.setattr(realtime.SharedFastSlowVLA, "load_state_dict", lambda *args, **kwargs: None)
+    monkeypatch.setattr(realtime, "load_visual_grounded_act_checkpoint",
+                        lambda adapter, core, saved: seen.append((adapter, core, saved)))
     args = type("Args", (), {"model_path": "base", "checkpoint": "act.pt", "temporal_dim": 4})()
     realtime._load_model(args, torch.device("cpu"))
-    assert seen == [(("base",), {"dtype": torch.float32, "device": torch.device("cpu")})]
+    assert seen[0] == (("base",), {"dtype": torch.float32, "device": torch.device("cpu")})
+    assert seen[1][2] is checkpoint
 
 
 def test_act_policy_checkpoint_api_does_not_require_m2_init_checkpoint():

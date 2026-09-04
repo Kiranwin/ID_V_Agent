@@ -18,6 +18,7 @@ import torch
 
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA, SlowCondition
+from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import _load_act_base_backbone
 from idv_agent.vla.action_chunk import BUTTON_NAMES, MOVE_DIRECTIONS, CAMERA_BUCKETS
 
@@ -138,28 +139,23 @@ def _load_model(args: argparse.Namespace, device: torch.device):
     amp_dtype = torch.float16 if device.type == "cuda" else torch.float32
     adapter, _ = _load_act_base_backbone(args.model_path, dtype=amp_dtype, device=device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if "adapter" not in checkpoint or "core" not in checkpoint:
-        raise ValueError("ACT checkpoint 缺少 adapter/core")
-    adapter.visual_projection.load_state_dict(checkpoint["adapter"]["visual_projection"])
-    adapter.condition_projection.load_state_dict(checkpoint["adapter"]["condition_projection"])
-    if "spatial_agg" in checkpoint["adapter"]:
-        agg_state = checkpoint["adapter"]["spatial_agg"]
-        adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
     temporal_dim = int(checkpoint.get("manifest", {}).get("training", {}).get("temporal_dim", args.temporal_dim))
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=temporal_dim,
+    core = SharedFastSlowVLA(getattr(adapter, "act_feature_dim", adapter.hidden_size), temporal_dim=temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
-    core.load_state_dict(checkpoint["core"])
+    load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
     adapter.eval()
     core.eval()
     return adapter, core, {"stage": "base_without_m2"}
 
 
 def _predict(core: SharedFastSlowVLA, window: RealtimeWindow, condition: SlowCondition,
-             device: torch.device):
+             device: torch.device, visual_window: RealtimeWindow | None = None):
     features, valid, _ = window.snapshot()
+    visual_features = features if visual_window is None else visual_window.snapshot()[0]
     history = torch.zeros((1, 72), device=device, dtype=torch.float32)
     with torch.inference_mode():
-        output = core(features, condition, valid_mask=valid, history_actions=history,
+        output = core(features, condition, valid_mask=valid, visual_frame_features=visual_features,
+                      history_actions=history,
                       run_slow=False)
     fast = output.fast
     move = fast.move_logits.argmax(-1)[0]
@@ -180,6 +176,7 @@ def run(args: argparse.Namespace) -> dict:
     adapter, core, parent_manifest = _load_model(args, device)
     task_cache = adapter.encode_task_once(args.instruction, args.mode, task_id="realtime-benchmark")
     window = RealtimeWindow(args.history_frames)
+    visual_window = RealtimeWindow(args.history_frames)
     condition = core.initial_condition(1, device=device, mode_id=0)
     condition.mode_id = torch.tensor([0], dtype=torch.long, device=device)
     slow_period = 1.0 / args.slow_hz
@@ -233,11 +230,20 @@ def run(args: argparse.Namespace) -> dict:
                 rgb = cv2.cvtColor(item.payload, cv2.COLOR_BGR2RGB)
                 image = Image.fromarray(rgb)
                 t0 = time.perf_counter()
-                feature = adapter.encode_frame(image, task_cache).to(torch.float32)
+                pair = getattr(adapter, "encode_frames_with_visual", None)
+                if pair is not None:
+                    feature, visual_feature = pair([image], task_cache)
+                    feature = feature[0].to(torch.float32)
+                    visual_feature = visual_feature[0].to(torch.float32)
+                else:
+                    feature = adapter.encode_frame(image, task_cache).to(torch.float32)
+                    visual_feature = feature
                 _sync(device)
                 timings["encode"].append((time.perf_counter() - t0) * 1000)
                 window.append(feature, frame_index=item.frame_index,
                               timestamp_ns=int(item.captured_at * 1_000_000_000))
+                visual_window.append(visual_feature, frame_index=item.frame_index,
+                                     timestamp_ns=int(item.captured_at * 1_000_000_000))
                 encoded += 1
         except BaseException as exc:
             worker_error.append(exc)
@@ -259,9 +265,11 @@ def run(args: argparse.Namespace) -> dict:
         if latest_ts is not None and now >= next_slow:
             t0 = time.perf_counter()
             features, valid, _ = window.snapshot()
+            visual_features, _, _ = visual_window.snapshot()
             history = torch.zeros((1, 72), device=device, dtype=torch.float32)
             with torch.inference_mode():
                 slow_pass = core(features, condition, valid_mask=valid,
+                                 visual_frame_features=visual_features,
                                  history_actions=history, run_slow=True)
             _sync(device)
             timings["slow"].append((time.perf_counter() - t0) * 1000)
@@ -271,7 +279,7 @@ def run(args: argparse.Namespace) -> dict:
                 next_slow += slow_period
         if latest_ts is not None and now >= next_fast:
             t0 = time.perf_counter()
-            _, steps = _predict(core, window, condition, device)
+            _, steps = _predict(core, window, condition, device, visual_window)
             _sync(device)
             timings["fast"].append((time.perf_counter() - t0) * 1000)
             fast_ticks += 1

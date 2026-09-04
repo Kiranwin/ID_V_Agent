@@ -159,6 +159,42 @@ def test_v5_separates_anchor_sampling_from_history_sampling(tmp_path: Path):
                for action in records[0]["observations"]["history_actions"])
 
 
+def test_v5_default_anchor_stride_prevents_future_action_window_overlap(tmp_path: Path):
+    """The default v5 dataset must not train twice on intersecting futures."""
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(140):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(140)),
+        encoding="utf-8",
+    )
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(140)),
+        encoding="utf-8",
+    )
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,139,travel\n",
+        encoding="utf-8",
+    )
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 140, "target_fps": 30}), encoding="utf-8")
+
+    output = tmp_path / "vla_v5.jsonl"
+    build(session, output, history=8, macro_frames=6,
+          schema_version=VLA_SCHEMA_VERSION_V5)
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+
+    assert [row["anchor_frame"] for row in records] == [47, 83]
+    assert all(
+        left["alignment"]["action_end_frame"] < right["alignment"]["action_start_frame"]
+        for left, right in zip(records, records[1:])
+    )
+
+
 def test_v5_history_actions_are_six_frame_macro_summaries(tmp_path: Path):
     session = tmp_path / "ep"
     frames = session / "frames"

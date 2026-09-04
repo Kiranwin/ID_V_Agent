@@ -21,6 +21,35 @@ from idv_agent.model.backbone_types import BackboneOutput
 from idv_agent.model.temporal import TaskConditionCache
 
 
+ACT_RAW_GRID_SIZE = 2
+ACT_RAW_GRID_K = 8
+ACT_FEATURE_DIM = ACT_RAW_GRID_SIZE * ACT_RAW_GRID_SIZE * 1024
+
+
+def pool_raw_spatial_grid(raw_features: torch.Tensor, *, input_k: int = ACT_RAW_GRID_K,
+                          output_k: int = ACT_RAW_GRID_SIZE) -> torch.Tensor:
+    """Deterministically pool a frozen ``[B,k*k,D]`` raster to ``[B,4*D]``.
+
+    This is deliberately not an ``nn.Module``: ACT must retain the spatial
+    signal exposed by the frozen vision tower without a learned raster
+    bottleneck.  The output order is row-major ``2x2`` cells, matching the
+    raw Qwen raster order.
+    """
+    if raw_features.ndim != 3:
+        raise ValueError("raw_features 必须是 [B,k*k,D]")
+    input_k = int(input_k)
+    output_k = int(output_k)
+    if input_k < 1 or output_k < 1 or input_k % output_k:
+        raise ValueError("input_k 必须是 output_k 的整数倍")
+    if raw_features.shape[1] != input_k * input_k:
+        raise ValueError(f"raw_features 必须有 {input_k * input_k} 个 spatial cells")
+    block = input_k // output_k
+    pooled = raw_features.reshape(raw_features.shape[0], input_k, input_k, raw_features.shape[-1])
+    pooled = pooled.reshape(raw_features.shape[0], output_k, block, output_k, block,
+                            raw_features.shape[-1]).mean(dim=(2, 4))
+    return pooled.reshape(raw_features.shape[0], output_k * output_k * raw_features.shape[-1])
+
+
 def default_qwen_lora_config():
     from peft import LoraConfig, TaskType
     return LoraConfig(
@@ -74,15 +103,24 @@ def _spatial_grid_forward(images, adapter, k: int, merge_size: int):
 class Qwen3VLBackboneAdapter(nn.Module):
     """把 Qwen3VLForConditionalGeneration 适配到 BackboneOutput 接口。"""
 
-    def __init__(self, model: nn.Module, processor: Any | None = None):
+    def __init__(self, model: nn.Module, processor: Any | None = None,
+                 act_feature_dim: int = ACT_FEATURE_DIM):
         super().__init__()
         self.model = model
         self.processor = processor
         cfg = self._underlying_config()
         self.hidden_size = cfg.text_config.hidden_size
         self.vocab_size = cfg.text_config.vocab_size
+        self.act_feature_dim = int(act_feature_dim)
+        if self.act_feature_dim < 1:
+            raise ValueError("act_feature_dim 必须为正数")
         self.visual_projection = nn.LazyLinear(self.hidden_size, bias=False)
-        self.condition_projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        self.condition_projection = nn.Linear(self.hidden_size * 2, self.act_feature_dim)
+        # ACT projects every k×k cell before fixed-raster fusion.  It is lazy
+        # because small unit-test adapters and the real Qwen tower expose
+        # different raw widths; the training warm-up materializes it before
+        # optimizer/checkpoint construction.
+        self.spatial_cell_projector: Optional[nn.Module] = None
         # Spatial cells are the only raw visual representation.  The aggregator
         # is materialized lazily from the vision feature width, or loaded from
         # the VG checkpoint before ACT training.
@@ -128,6 +166,18 @@ class Qwen3VLBackboneAdapter(nn.Module):
         elif self.spatial_agg.dim != int(dim) or self.spatial_agg.k != self.spatial_k:
             raise ValueError("SpatialAgg 与 spatial token shape 不匹配")
         return self.spatial_agg
+
+    def _ensure_spatial_cell_projector(self, dim: int) -> nn.Module:
+        if self.spatial_cell_projector is None:
+            from idv_agent.model.spatial_cell_projector import SpatialCellProjector
+            self.spatial_cell_projector = SpatialCellProjector(
+                dim=int(dim), k=self.spatial_k, output_dim=self.hidden_size)
+            self.spatial_cell_projector.to(device=self.device)
+        elif (self.spatial_cell_projector.dim != int(dim)
+              or self.spatial_cell_projector.k != self.spatial_k
+              or self.spatial_cell_projector.output_dim != self.hidden_size):
+            raise ValueError("SpatialCellProjector 与 spatial token shape 不匹配")
+        return self.spatial_cell_projector
 
     def spatial_raw_tokens(self, images: list[Any]) -> torch.Tensor:
         """返回 [N, k*k, dim] 每帧保胞 token（冻结视觉塔，无 agg）。"""
@@ -250,25 +300,47 @@ class Qwen3VLBackboneAdapter(nn.Module):
 
     def project_raw_features(self, raw_features: torch.Tensor,
                              task_cache: TaskConditionCache) -> torch.Tensor:
-        """Apply SpatialAgg and current trainable visual/task projections."""
+        """Return the conditioned ACT feature used by the temporal prior path."""
+        visual = self.project_raw_visual_features(raw_features)
+        condition = self._condition_vector(task_cache, visual.shape[0], visual)
+        return visual + condition
+
+    def project_raw_visual_features(self, raw_features: torch.Tensor) -> torch.Tensor:
+        """Return pure deterministic raw-grid features, with no task condition."""
         if raw_features.ndim == 3:
-            raw_features = self._aggregate_spatial_tokens(raw_features)
-        if raw_features.ndim != 2:
-            raise ValueError("raw_features 必须是 [N,C,D] spatial tokens")
-        self.visual_projection.to(device=raw_features.device)
-        # ``encode_raw_frames`` returns inference tensors; clone to re-enter an
-        # autograd-compatible graph for the trainable projection layers.
-        visual = self.visual_projection(raw_features.clone().to(self.visual_projection.weight.dtype))
-        ins = task_cache.instruction_embedding.to(visual).reshape(-1)
-        mode = task_cache.mode_embedding.to(visual).reshape(-1)
+            visual = pool_raw_spatial_grid(raw_features.clone(), input_k=self.spatial_k)
+        elif raw_features.ndim == 2:
+            visual = raw_features.clone()
+        else:
+            raise ValueError("raw_features 必须是 [N,C,D] spatial tokens 或 [N,D] 向量")
+        if visual.shape[-1] != self.act_feature_dim:
+            raise ValueError(
+                f"ACT raw grid 输出维度 {visual.shape[-1]} 与 act_feature_dim "
+                f"{self.act_feature_dim} 不匹配；Qwen 预期为 {ACT_FEATURE_DIM}"
+            )
+        return visual
+
+    def _condition_vector(self, task_cache: TaskConditionCache, count: int,
+                          reference: torch.Tensor) -> torch.Tensor:
+        ins = task_cache.instruction_embedding.to(reference).reshape(-1)
+        mode = task_cache.mode_embedding.to(reference).reshape(-1)
         if ins.numel() != self.hidden_size or mode.numel() != self.hidden_size:
             raise ValueError("task embedding 维度必须等于 Qwen text hidden_size")
-        self.condition_projection.to(device=visual.device)
-        cond_input = torch.cat((ins, mode)).unsqueeze(0).expand(visual.shape[0], -1)
+        self.condition_projection.to(device=reference.device)
+        cond_input = torch.cat((ins, mode)).unsqueeze(0).expand(int(count), -1)
         condition = self.condition_projection(
             cond_input.to(self.condition_projection.weight.dtype)
-        ).to(visual.dtype)
-        return visual + condition
+        ).to(reference.dtype)
+        return condition
+
+    def uncondition_features(self, conditioned_features: torch.Tensor,
+                             task_cache: TaskConditionCache) -> torch.Tensor:
+        """Recover pure visual features from an exact conditioned cache entry."""
+        if conditioned_features.ndim not in (2, 3) or conditioned_features.shape[-1] != self.act_feature_dim:
+            raise ValueError("conditioned_features 必须是 [...,act_feature_dim]")
+        reference = conditioned_features.reshape(-1, conditioned_features.shape[-1])
+        condition = self._condition_vector(task_cache, reference.shape[0], reference)
+        return (reference - condition).reshape_as(conditioned_features)
 
     def encode_frames(self, images: list[Any], task_cache: TaskConditionCache | None = None,
                       *, micro_batch_size: int | None = None) -> torch.Tensor:
@@ -276,7 +348,7 @@ class Qwen3VLBackboneAdapter(nn.Module):
         if task_cache is None:
             raise ValueError("必须提供 task_cache")
         if not images:
-            return torch.empty((0, self.hidden_size), device=self.device)
+            return torch.empty((0, self.act_feature_dim), device=self.device)
         limit = len(images) if micro_batch_size is None else max(1, int(micro_batch_size))
         outputs = []
         for start in range(0, len(images), limit):
@@ -284,6 +356,24 @@ class Qwen3VLBackboneAdapter(nn.Module):
             cells = self.spatial_raw_tokens(chunk)
             outputs.append(self.project_raw_features(cells, task_cache))
         return torch.cat(outputs, dim=0)
+
+    def encode_frames_with_visual(self, images: list[Any], task_cache: TaskConditionCache,
+                                  *, micro_batch_size: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode once and return ``(conditioned_prior, pure_visual)`` features."""
+        if task_cache is None:
+            raise ValueError("必须提供 task_cache")
+        if not images:
+            empty = torch.empty((0, self.act_feature_dim), device=self.device)
+            return empty, empty.clone()
+        limit = len(images) if micro_batch_size is None else max(1, int(micro_batch_size))
+        conditioned_outputs = []
+        visual_outputs = []
+        for start in range(0, len(images), limit):
+            cells = self.spatial_raw_tokens(images[start:start + limit])
+            visual = self.project_raw_visual_features(cells)
+            conditioned_outputs.append(visual + self._condition_vector(task_cache, visual.shape[0], visual))
+            visual_outputs.append(visual)
+        return torch.cat(conditioned_outputs, dim=0), torch.cat(visual_outputs, dim=0)
 
     def encode_frame(self, image: Any, task_cache: TaskConditionCache | None = None,
                      *, instruction_embedding: torch.Tensor | None = None,

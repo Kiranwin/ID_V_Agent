@@ -16,7 +16,7 @@ from idv_agent.vla.action_chunk import (
 
 
 def build_train(session: Path, output: Path, *, stride: int = 3,
-                anchor_stride: int = 12, history_stride: int = 3, history: int = 8,
+                anchor_stride: int = 36, history_stride: int = 3, history: int = 8,
                 slow_period_s: float = 1.0) -> dict:
     if history != 8:
         raise ValueError("v5 history 必须固定为 8")
@@ -45,7 +45,7 @@ def main(argv=None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stride", type=int, default=3,
                         help="兼容旧调用；未显式覆盖时 v5 使用 anchor=12/history=3")
-    parser.add_argument("--anchor-stride", type=int, default=12)
+    parser.add_argument("--anchor-stride", type=int, default=36)
     parser.add_argument("--history-stride", type=int, default=3)
     parser.add_argument("--history", type=int, default=8)
     parser.add_argument("--slow-period-s", type=float, default=1.0)

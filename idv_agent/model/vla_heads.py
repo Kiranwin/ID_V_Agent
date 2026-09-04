@@ -117,15 +117,16 @@ class SlowVLAHead(nn.Module):
     """Low-frequency tactical intent/subgoal/context head."""
 
     def __init__(self, feature_dim: int, context_dim: int = CONTEXT_EMBEDDING_DIM,
-                 refresh_classes: int = 3):
+                 refresh_classes: int = 3, *, bias: bool = True, direct: bool = False):
         super().__init__()
         if feature_dim < 1 or context_dim != CONTEXT_EMBEDDING_DIM:
             raise ValueError("feature_dim 必须为正数且 context_dim 必须为 256")
-        self.intent = nn.Linear(feature_dim, len(INTENTS))
-        self.subgoal = nn.Linear(feature_dim, len(SUBGOAL_NAMES))
-        self.context = nn.Sequential(nn.Linear(feature_dim, feature_dim), nn.GELU(),
-                                     nn.Linear(feature_dim, context_dim))
-        self.refresh = nn.Linear(feature_dim, refresh_classes)
+        self.intent = nn.Linear(feature_dim, len(INTENTS), bias=bias)
+        self.subgoal = nn.Linear(feature_dim, len(SUBGOAL_NAMES), bias=bias)
+        self.context = (nn.Linear(feature_dim, context_dim, bias=bias) if direct else
+                        nn.Sequential(nn.Linear(feature_dim, feature_dim, bias=bias), nn.GELU(),
+                                      nn.Linear(feature_dim, context_dim, bias=bias)))
+        self.refresh = nn.Linear(feature_dim, refresh_classes, bias=bias)
 
     def forward(self, temporal_feature: torch.Tensor) -> SlowVLAOutput:
         if temporal_feature.ndim == 1:
@@ -144,24 +145,29 @@ class FastVLAHead(nn.Module):
     """High-frequency action-chunk head with fixed v3/v4 action dimensions."""
 
     def __init__(self, feature_dim: int, history_action_dim: int = 0,
-                 horizon: int = ACTION_CHUNK_HORIZON):
+                 horizon: int = ACTION_CHUNK_HORIZON, *, bias: bool = True, direct: bool = False):
         super().__init__()
         if feature_dim < 1 or horizon < 1:
             raise ValueError("feature_dim/horizon 必须为正数")
         self.horizon = int(horizon)
         input_dim = feature_dim + max(0, int(history_action_dim))
-        self.trunk = nn.Sequential(nn.Linear(input_dim, feature_dim), nn.GELU(),
-                                   nn.Linear(feature_dim, feature_dim), nn.GELU())
-        self.move = nn.Linear(feature_dim, self.horizon * len(MOVE_DIRECTIONS))
-        self.camera_dx = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS))
-        self.camera_dy = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS))
-        self.buttons = nn.Linear(feature_dim, self.horizon * 6)
+        if direct:
+            if history_action_dim:
+                raise ValueError("direct FastVLAHead 不允许 history actions")
+            self.trunk = nn.Identity()
+        else:
+            self.trunk = nn.Sequential(nn.Linear(input_dim, feature_dim, bias=bias), nn.GELU(),
+                                       nn.Linear(feature_dim, feature_dim, bias=bias), nn.GELU())
+        self.move = nn.Linear(feature_dim, self.horizon * len(MOVE_DIRECTIONS), bias=bias)
+        self.camera_dx = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS), bias=bias)
+        self.camera_dy = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS), bias=bias)
+        self.buttons = nn.Linear(feature_dim, self.horizon * 6, bias=bias)
         # Duration is a bounded scalar in frames; sigmoid is mapped to 1..30.
-        self.duration = nn.Linear(feature_dim, self.horizon)
-        self.confidence = nn.Linear(feature_dim, 1)
-        self.stop = nn.Linear(feature_dim, 1)
+        self.duration = nn.Linear(feature_dim, self.horizon, bias=bias)
+        self.confidence = nn.Linear(feature_dim, 1, bias=bias)
+        self.stop = nn.Linear(feature_dim, 1, bias=bias)
         # Auxiliary intent prediction used only for fast/slow consistency.
-        self.intent_context = nn.Linear(feature_dim, len(INTENTS))
+        self.intent_context = nn.Linear(feature_dim, len(INTENTS), bias=bias)
         self.history_action_dim = max(0, int(history_action_dim))
 
     def forward(self, temporal_feature: torch.Tensor,
@@ -206,12 +212,12 @@ class VisualActionExpert(nn.Module):
             raise ValueError("frame_feature_dim/temporal_dim/horizon 必须为正数")
         self.frame_feature_dim = int(frame_feature_dim)
         self.temporal_dim = int(temporal_dim)
-        self.trunk = nn.Sequential(
-            nn.Linear(self.frame_feature_dim * 2, self.temporal_dim), nn.GELU(),
-            nn.Linear(self.temporal_dim, self.temporal_dim), nn.GELU(),
-        )
-        self.fast = FastVLAHead(self.temporal_dim, history_action_dim=0, horizon=horizon)
-        self.slow = SlowVLAHead(self.temporal_dim)
+        self.pair_dim = self.frame_feature_dim * 2
+        self.register_buffer("input_center", torch.zeros(self.pair_dim), persistent=True)
+        self.input_norm = nn.LayerNorm(self.frame_feature_dim * 2, elementwise_affine=False)
+        self.fast = FastVLAHead(self.pair_dim, history_action_dim=0, horizon=horizon,
+                                bias=False, direct=True)
+        self.slow = SlowVLAHead(self.pair_dim, bias=False, direct=True)
 
     @staticmethod
     def _valid_indices(frame_features: torch.Tensor,
@@ -238,9 +244,36 @@ class VisualActionExpert(nn.Module):
             frame_features = frame_features.unsqueeze(0)
         if frame_features.ndim != 3 or frame_features.shape[-1] != self.frame_feature_dim:
             raise ValueError(f"frame_features 必须是 [B,L,{self.frame_feature_dim}]")
+        feature = self.normalized_pair_features(frame_features, valid_mask=valid_mask).float()
+        # The direct 8192 -> logits path is intentionally kept in FP32.  On
+        # Turing GPUs, FP16 autocast can overflow its reduction/linear
+        # gradients even though LayerNorm's output is finite.
+        with torch.autocast(device_type=feature.device.type, enabled=False):
+            fast = self.fast(feature)
+            slow = self.slow(feature)
+        return VisualExpertOutput(fast=fast, slow=slow, feature=feature)
+
+    def pair_features(self, frame_features: torch.Tensor,
+                      valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return raw ``[last, last-first]`` features for train-center calibration."""
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        if frame_features.ndim != 3 or frame_features.shape[-1] != self.frame_feature_dim:
+            raise ValueError(f"frame_features 必须是 [B,L,{self.frame_feature_dim}]")
         first_index, last_index = self._valid_indices(frame_features, valid_mask)
         rows = torch.arange(frame_features.shape[0], device=frame_features.device)
         first = frame_features[rows, first_index]
         last = frame_features[rows, last_index]
-        feature = self.trunk(torch.cat((last, last - first), dim=-1))
-        return VisualExpertOutput(fast=self.fast(feature), slow=self.slow(feature), feature=feature)
+        return torch.cat((last, last - first), dim=-1)
+
+    def set_input_center(self, center: torch.Tensor) -> None:
+        center = center.detach().reshape(-1).to(device=self.input_center.device,
+                                                 dtype=self.input_center.dtype)
+        if center.shape != self.input_center.shape or not bool(torch.isfinite(center).all()):
+            raise ValueError(f"visual input center 必须是有限 [{self.pair_dim}] Tensor")
+        self.input_center.copy_(center)
+
+    def normalized_pair_features(self, frame_features: torch.Tensor,
+                                 valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        pair = self.pair_features(frame_features, valid_mask=valid_mask)
+        return self.input_norm(pair - self.input_center.to(pair))

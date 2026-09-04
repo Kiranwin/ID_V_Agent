@@ -12,8 +12,9 @@ from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import (
-    _bounded_subset, _dataset_paths, _load_act_base_backbone, _model_inputs,
+    _dataset_paths, _evaluation_stratified_subset, _load_act_base_backbone, _model_inputs,
     _scheduled_condition, encode_batch,
 )
 from idv_agent.training.feature_activity import feature_activity_gate, summarize_feature_activity
@@ -41,17 +42,20 @@ def _decision_pass(adapter, core: SharedFastSlowVLA, batch: dict[str, Any], *,
                    image_transform: Callable[[Image.Image], Image.Image] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the deployed slow→fast decision path and expose final GRU state."""
     model_batch = _model_inputs(batch, device)
-    features = encode_batch(adapter, batch, device=device, image_transform=image_transform)
+    features, visual_features = encode_batch(
+        adapter, batch, device=device, image_transform=image_transform, return_visual=True)
     condition = core.initial_condition(features.shape[0], device=device, mode_id=0)
     condition.mode_id = model_batch["mode_id"]
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
         slow_pass = core(features, condition, valid_mask=model_batch["frame_valid_mask"],
+                         visual_frame_features=visual_features,
                          history_actions=model_batch["history_actions"], run_slow=True)
         if slow_pass.slow is None:
             raise RuntimeError("feature activity 需要 slow output")
         next_condition = _scheduled_condition(core, slow_pass.slow, model_batch,
                                               teacher_forcing_ratio=0.0)
         fast_pass = core(features, next_condition, valid_mask=model_batch["frame_valid_mask"],
+                         visual_frame_features=visual_features,
                          history_actions=model_batch["history_actions"], run_slow=False,
                          detach_slow_condition=False)
     fast = fast_pass.fast
@@ -65,7 +69,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(args.device)
     amp_enabled = device.type == "cuda"
     dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
-    dataset = _bounded_subset(dataset, int(args.max_samples))
+    dataset = _evaluation_stratified_subset(dataset, int(args.max_samples))
     if len(dataset) < 2:
         raise ValueError("feature activity 至少需要两个验证场景")
     loader = DataLoader(dataset, batch_size=max(1, min(int(args.batch_size), 2)), shuffle=False,
@@ -76,17 +80,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     adapter, _ = _load_act_base_backbone(
         args.model_path, dtype=torch.float16 if amp_enabled else torch.float32, device=device)
     temporal_dim = int(saved.get("manifest", {}).get("training", {}).get("temporal_dim", args.temporal_dim))
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=temporal_dim,
+    core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
     first = next(iter(loader))
     with torch.no_grad():
         encode_batch(adapter, first, device=device)
-    adapter.visual_projection.load_state_dict(saved["adapter"]["visual_projection"])
-    adapter.condition_projection.load_state_dict(saved["adapter"]["condition_projection"])
-    if "spatial_agg" in saved["adapter"]:
-        aggregate = saved["adapter"]["spatial_agg"]
-        adapter._ensure_spatial_agg(int(aggregate["position"].shape[-1])).load_state_dict(aggregate)
-    core.load_state_dict(saved["core"])
+    load_visual_grounded_act_checkpoint(adapter, core, saved)
     adapter.eval(); core.eval()
     values: dict[str, list[torch.Tensor]] = {key: [] for key in
                                               ("normal", "repeat", "left", "right",

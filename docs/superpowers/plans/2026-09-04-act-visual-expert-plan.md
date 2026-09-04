@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make every deployed ACT action head include a separately supervised, history-free visual prediction path.
+**Goal:** Make every deployed ACT action head include a separately supervised, history-free visual prediction path while preserving the frozen Qwen spatial signal through a deterministic raw-grid representation.
 
-**Architecture:** `VisualActionExpert` receives last-frame and first-to-last visual change vectors, predicts fast/slow outputs independently, and is added to bounded temporal/history prior logits. The loss supervises both visual outputs and fused outputs with the same masks and per-head weights.
+**Architecture:** Deterministically pool frozen Qwen `[8,8,1024]` cells to `[2,2,1024]` and flatten to 4096. `VisualActionExpert` receives last-frame and first-to-last visual change vectors, predicts fast/slow outputs independently, and is added to bounded temporal/history prior logits. The loss supervises both visual outputs and fused outputs with the same masks and per-head weights.
 
 **Tech Stack:** PyTorch 2.6, CUDA FP16 + GradScaler on RTX 2080 Ti, frozen Qwen3-VL, pytest.
 
@@ -12,14 +12,14 @@
 
 ## Global Constraints
 
-- Do not load M2; all new ACT checkpoints use `m7_act.visual_expert.v1` and reject previous schemas.
+- Do not load M2; all new ACT checkpoints use `m13_act.visual_camera_prior.v1` and reject previous schemas.
 - Keep v5: 8 frames, stride 3, 8 action history steps, 6-frame action duration, 30 FPS, `time_deltas=None`.
 - Preserve cache/augmentation separation; augmented image features are never retained in raw or inference caches.
 - A checkpoint is deployable only after the specified feature, visual-dependency, and classification gates pass.
 
 ---
 
-### Task 1: Visual expert and bounded output fusion
+### Task 1: Direct raw-grid ACT input and existing visual expert
 
 **Files:**
 - Modify: `idv_agent/model/vla_heads.py`
@@ -65,7 +65,7 @@ git add idv_agent/model/vla_heads.py idv_agent/model/fast_slow_vla.py tests/test
 git commit -m "feat: add bounded visual action expert"
 ```
 
-### Task 2: Explicit visual supervision and m7 checkpoint contract
+### Task 2: Explicit visual supervision and m8 checkpoint contract
 
 **Files:**
 - Modify: `idv_agent/training/vla_loss.py`
@@ -80,7 +80,7 @@ git commit -m "feat: add bounded visual action expert"
 
 ```python
 assert losses["total"] == fused_total + weights.visual_aux * visual_total
-with pytest.raises(ValueError, match="m7_act"):
+with pytest.raises(ValueError, match="m13_act"):
     load_visual_grounded_act_checkpoint(adapter, core, m6_checkpoint)
 ```
 
@@ -92,7 +92,7 @@ Run: `python -m pytest tests/test_visual_action_expert.py tests/test_act_visual_
 
 Apply exactly the existing fast/slow masks and class weights to visual heads. Keep the consistency loss fused-only. Send `output.visual.fast` and `output.visual.slow` from both slow/fast train passes into loss.
 
-- [ ] **Step 4: Bump schema to m7 and preserve fail-closed restore behavior.**
+- [ ] **Step 4: Bump schema to m13 and preserve fail-closed restore behavior.**
 
 `core.load_state_dict` must load the visual expert state strictly; adapter state contract remains raster-only.
 
@@ -115,7 +115,7 @@ git commit -m "feat: supervise ACT visual expert"
 
 - [ ] **Step 1: Run full unit and integration suite before training.**
 
-Run: `python -m pytest -q --basetemp .pytest-tmp-m7-pretrain`
+Run: `python -m pytest -q --basetemp .pytest-tmp-m8-pretrain`
 
 - [ ] **Step 2: Train 60 steps on all 480 decorrelated train chunks and all 118 held-out chunks.**
 
@@ -127,11 +127,11 @@ Use their fixed stratified 32-sample cohort for the visual gates and record nonz
 
 - [ ] **Step 4: Run full regression suite and diff check.**
 
-Run: `python -m pytest -q --basetemp .pytest-tmp-m7-final` and `git diff --check`.
+Run: `python -m pytest -q --basetemp .pytest-tmp-m8-final` and `git diff --check`.
 
 - [ ] **Step 5: Record measured outcomes without promoting failed checkpoints. Commit docs.**
 
 ```powershell
 git add docs/00-当前状态.md docs/18-架构变更历史.md
-git commit -m "docs: record m7 visual expert validation"
+git commit -m "docs: record m8 raw-grid visual validation"
 ```

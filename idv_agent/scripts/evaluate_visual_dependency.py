@@ -21,9 +21,10 @@ from PIL import Image, ImageFilter
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import (
-    _contiguous_subset,
     _dataset_paths,
+    _evaluation_stratified_subset,
     _load_act_base_backbone,
     _model_inputs,
     _scheduled_condition,
@@ -77,14 +78,30 @@ def _finite_metric(value: Any, name: str) -> float | None:
     return value
 
 
+def _macro_recall(confusion: list[list[int]]) -> float | None:
+    """Macro recall over observed classes; ignore classes absent from targets."""
+    recalls = []
+    for index, row in enumerate(confusion):
+        total = sum(int(value) for value in row)
+        if total:
+            recalls.append(float(row[index]) / total)
+    return sum(recalls) / len(recalls) if recalls else None
+
+
 def _dependency_gate(normal: dict[str, Any], degraded: dict[str, Any],
                      required_metrics: Iterable[str] = REQUIRED_METRICS) -> dict[str, Any]:
     """Check that every degraded metric drops by max(0.05, 15% of normal)."""
     metrics: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
+    metric_alias = {
+        "move_accuracy": "balanced_move_accuracy",
+        "camera_accuracy": "balanced_camera_accuracy",
+        "intent_accuracy": "balanced_intent_accuracy",
+    }
     for name in required_metrics:
-        baseline = _finite_metric(normal.get(name), f"normal.{name}")
-        observed = _finite_metric(degraded.get(name), f"degraded.{name}")
+        selected = metric_alias.get(name, name)
+        baseline = _finite_metric(normal.get(selected, normal.get(name)), f"normal.{selected}")
+        observed = _finite_metric(degraded.get(selected, degraded.get(name)), f"degraded.{selected}")
         if baseline is None or observed is None:
             failures.append(name)
             metrics[name] = {"normal": baseline, "degraded": observed,
@@ -99,6 +116,23 @@ def _dependency_gate(normal: dict[str, Any], degraded: dict[str, Any],
                          "drop": drop, "threshold": threshold, "pass": passed}
     return {"pass": not failures, "metrics": metrics, "failures": failures,
             "rule": "drop >= max(0.05, normal * 0.15)"}
+
+
+def _output_change_summary(normal: dict[str, torch.Tensor],
+                           changed: dict[str, torch.Tensor]) -> dict[str, dict[str, float]]:
+    """Measure actual decision changes before accuracy hides them behind ties."""
+    if set(normal) != set(changed):
+        raise ValueError("normal/changed output heads 必须一致")
+    summary = {}
+    for name, baseline in normal.items():
+        degraded = changed[name]
+        if baseline.shape != degraded.shape or baseline.ndim < 2:
+            raise ValueError(f"{name} logits shape 不一致或缺少类别维")
+        summary[name] = {
+            "mean_abs_logit_delta": float((baseline - degraded).abs().mean().cpu()),
+            "argmax_flip_rate": float((baseline.argmax(dim=-1) != degraded.argmax(dim=-1)).float().mean().cpu()),
+        }
+    return summary
 
 
 def _copy_samples(samples: list[dict[str, Any]], *, frame_paths: list[list[Path | None]] | None = None,
@@ -124,20 +158,42 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
     loader = DataLoader(samples, batch_size=max(1, min(batch_size, 2)), shuffle=False,
                         collate_fn=VLASequenceCollator(max_frames=8))
     counts = {"move_correct": 0, "move_total": 0, "dx_correct": 0, "dy_correct": 0,
-              "camera_total": 0, "intent_correct": 0, "intent_total": 0}
+              "camera_total": 0, "intent_correct": 0, "intent_total": 0,
+              "visual_move_correct": 0, "visual_dx_correct": 0, "visual_dy_correct": 0,
+              "visual_intent_correct": 0, "prior_move_correct": 0, "prior_dx_correct": 0,
+              "prior_dy_correct": 0, "prior_intent_correct": 0}
+    confusions = {"move": [[0] * 9 for _ in range(9)],
+                  "camera_dx": [[0] * 5 for _ in range(5)],
+                  "camera_dy": [[0] * 5 for _ in range(5)],
+                  "intent": [[0] * 8 for _ in range(8)]}
+    visual_abs_sum = 0.0
+    visual_logit_sum = 0.0
+    visual_count = 0
+    visual_input_norm_sum = 0.0
+    visual_input_abs_sum = 0.0
+    visual_input_count = 0
+    output_vectors: dict[str, list[torch.Tensor]] = {name: [] for name in
+                                                       ("move", "camera_dx", "camera_dy", "intent")}
     with torch.no_grad():
         for batch in loader:
             model_batch = _model_inputs(batch, device)
             if condition == "history_zero":
                 model_batch["history_actions"] = torch.zeros_like(model_batch["history_actions"])
-            features = encode_batch(adapter, batch, device=device,
-                                    image_transform=image_transform,
-                                    frame_stats={"hits": 0, "encoded": 0})
+            features, visual_features = encode_batch(
+                adapter, batch, device=device, image_transform=image_transform,
+                frame_stats={"hits": 0, "encoded": 0}, return_visual=True)
+            valid_indices = model_batch["frame_valid_mask"].long().sum(dim=1).clamp_min(1) - 1
+            rows = torch.arange(visual_features.shape[0], device=device)
+            last_visual_input = visual_features[rows, valid_indices].float()
+            visual_input_norm_sum += float(last_visual_input.norm(dim=-1).sum().cpu())
+            visual_input_abs_sum += float(last_visual_input.abs().sum().cpu())
+            visual_input_count += int(last_visual_input.shape[0])
             condition_state = core.initial_condition(features.shape[0], device=device, mode_id=0)
             condition_state.mode_id = model_batch["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 slow_pass = core(features, condition_state,
                                  valid_mask=model_batch["frame_valid_mask"],
+                                 visual_frame_features=visual_features,
                                  history_actions=model_batch["history_actions"], run_slow=True)
                 if slow_pass.slow is None:
                     raise RuntimeError("slow pass 未产生 SlowVLAOutput")
@@ -145,6 +201,7 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
                                                       teacher_forcing_ratio=0.0)
                 fast_pass = core(features, next_condition,
                                  valid_mask=model_batch["frame_valid_mask"],
+                                 visual_frame_features=visual_features,
                                  history_actions=model_batch["history_actions"], run_slow=False,
                                  detach_slow_condition=False)
             sample_mask = model_batch["fast_loss_mask"] > 0
@@ -159,8 +216,49 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
             counts["camera_total"] += int(mask.sum())
             intent_mask = sample_mask & (model_batch["intent_target"] >= 0)
             intent_pred = slow_pass.slow.intent_logits.argmax(-1)
+            output_vectors["move"].append(fast_pass.fast.move_logits.detach().float().cpu())
+            output_vectors["camera_dx"].append(fast_pass.fast.camera_dx_logits.detach().float().cpu())
+            output_vectors["camera_dy"].append(fast_pass.fast.camera_dy_logits.detach().float().cpu())
+            output_vectors["intent"].append(slow_pass.slow.intent_logits.detach().float().cpu())
             counts["intent_correct"] += int(((intent_pred == model_batch["intent_target"]) & intent_mask).sum())
             counts["intent_total"] += int(intent_mask.sum())
+            for target, prediction in zip(model_batch["move_target"][mask].detach().cpu().reshape(-1).tolist(),
+                                          move_pred[mask].detach().cpu().reshape(-1).tolist()):
+                confusions["move"][int(target)][int(prediction)] += 1
+            for key, target_key, prediction in (("camera_dx", "camera_dx_target", dx_pred),
+                                                 ("camera_dy", "camera_dy_target", dy_pred)):
+                for target, prediction_value in zip(model_batch[target_key][mask].detach().cpu().reshape(-1).tolist(),
+                                                    prediction[mask].detach().cpu().reshape(-1).tolist()):
+                    confusions[key][int(target)][int(prediction_value)] += 1
+            for target, prediction_value in zip(model_batch["intent_target"][intent_mask].detach().cpu().reshape(-1).tolist(),
+                                                intent_pred[intent_mask].detach().cpu().reshape(-1).tolist()):
+                confusions["intent"][int(target)][int(prediction_value)] += 1
+            visual = fast_pass.visual
+            prior = fast_pass.prior_fast
+            if visual is None or prior is None:
+                raise RuntimeError("visual dependency 需要 visual/prior branch output")
+            visual_abs_sum += float(visual.feature.abs().sum().cpu())
+            visual_logit_sum += float(visual.fast.move_logits.abs().sum().cpu())
+            visual_count += int(visual.feature.numel())
+            visual_move = visual.fast.move_logits.argmax(-1)
+            visual_dx = visual.fast.camera_dx_logits.argmax(-1)
+            visual_dy = visual.fast.camera_dy_logits.argmax(-1)
+            prior_move = prior.move_logits.argmax(-1)
+            prior_dx = prior.camera_dx_logits.argmax(-1)
+            prior_dy = prior.camera_dy_logits.argmax(-1)
+            counts["visual_move_correct"] += int(((visual_move == model_batch["move_target"]) & mask).sum())
+            counts["visual_dx_correct"] += int(((visual_dx == model_batch["camera_dx_target"]) & mask).sum())
+            counts["visual_dy_correct"] += int(((visual_dy == model_batch["camera_dy_target"]) & mask).sum())
+            counts["prior_move_correct"] += int(((prior_move == model_batch["move_target"]) & mask).sum())
+            counts["prior_dx_correct"] += int(((prior_dx == model_batch["camera_dx_target"]) & mask).sum())
+            counts["prior_dy_correct"] += int(((prior_dy == model_batch["camera_dy_target"]) & mask).sum())
+            counts["visual_intent_correct"] += int(((visual.slow.intent_logits.argmax(-1) ==
+                                                        model_batch["intent_target"]) & intent_mask).sum())
+            prior_slow = slow_pass.prior_slow
+            if prior_slow is None:
+                raise RuntimeError("visual dependency 需要 prior slow branch output")
+            counts["prior_intent_correct"] += int(((prior_slow.intent_logits.argmax(-1) ==
+                                                      model_batch["intent_target"]) & intent_mask).sum())
 
     def ratio(n: int, d: int) -> float | None:
         return n / d if d else None
@@ -176,7 +274,31 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
         "camera_accuracy": ((dx_accuracy + dy_accuracy) / 2
                              if dx_accuracy is not None and dy_accuracy is not None else None),
         "intent_accuracy": ratio(counts["intent_correct"], counts["intent_total"]),
+        "balanced_move_accuracy": _macro_recall(confusions["move"]),
+        "balanced_camera_accuracy": ((
+            (_macro_recall(confusions["camera_dx"]) or 0.0) +
+            (_macro_recall(confusions["camera_dy"]) or 0.0)
+        ) / 2),
+        "balanced_intent_accuracy": _macro_recall(confusions["intent"]),
+        "confusion": confusions,
         "counts": counts,
+        "branches": {
+            "visual": {"move_accuracy": ratio(counts["visual_move_correct"], counts["move_total"]),
+                        "camera_accuracy": ratio(counts["visual_dx_correct"] + counts["visual_dy_correct"],
+                                                  counts["camera_total"] * 2),
+                        "intent_accuracy": ratio(counts["visual_intent_correct"], counts["intent_total"])},
+            "prior": {"move_accuracy": ratio(counts["prior_move_correct"], counts["move_total"]),
+                      "camera_accuracy": ratio(counts["prior_dx_correct"] + counts["prior_dy_correct"],
+                                                counts["camera_total"] * 2),
+                      "intent_accuracy": ratio(counts["prior_intent_correct"], counts["intent_total"])},
+        },
+        "visual_signatures": {
+            "feature_abs_mean": visual_abs_sum / max(1, visual_count),
+            "move_logit_abs_mean": visual_logit_sum / max(1, counts["move_total"] * 9),
+            "last_visual_input_norm_mean": visual_input_norm_sum / max(1, visual_input_count),
+            "last_visual_input_abs_mean": visual_input_abs_sum / max(1, visual_input_count * visual_features.shape[-1]),
+        },
+        "_output_vectors": {name: torch.cat(values, dim=0) for name, values in output_vectors.items()},
     }
 
 
@@ -186,7 +308,7 @@ def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dic
     amp_enabled = device.type == "cuda"
     dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
     if args.max_samples > 0:
-        dataset = _contiguous_subset(dataset, args.max_samples)
+        dataset = _evaluation_stratified_subset(dataset, args.max_samples)
     samples = [dataset[index] for index in range(len(dataset))]
     if len(samples) < 2:
         raise ValueError("visual dependency gate 至少需要两个样本")
@@ -196,22 +318,19 @@ def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dic
     act_manifest = load_manifest(Path(checkpoint).parent / "manifest.json", require_artifacts=True)
     if act_manifest["stage"] != "M3_ACT":
         raise ValueError(f"评估 checkpoint 必须是 M3_ACT，收到 {act_manifest['stage']}")
-    for name in ("visual_projection", "condition_projection"):
-        getattr(adapter, name).to(device=device, dtype=torch.float32)
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
+    adapter.condition_projection.to(device=device, dtype=torch.float32)
+    core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
+    if getattr(args, "camera_prior_scale", None) is not None:
+        value = float(args.camera_prior_scale)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("camera-prior-scale 必须在 [0,1]")
+        core.camera_prior_scale = value
     first_loader = DataLoader(samples[:1], batch_size=1, collate_fn=VLASequenceCollator(max_frames=8))
     with torch.no_grad():
         encode_batch(adapter, next(iter(first_loader)), device=device)
     saved = torch.load(checkpoint, map_location=device, weights_only=False)
-    if "adapter" not in saved or "core" not in saved:
-        raise ValueError(f"ACT checkpoint 缺少 adapter/core: {checkpoint}")
-    adapter.visual_projection.load_state_dict(saved["adapter"]["visual_projection"])
-    adapter.condition_projection.load_state_dict(saved["adapter"]["condition_projection"])
-    if "spatial_agg" in saved["adapter"]:
-        agg_state = saved["adapter"]["spatial_agg"]
-        adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
-    core.load_state_dict(saved["core"])
+    load_visual_grounded_act_checkpoint(adapter, core, saved)
     adapter.eval()
     core.eval()
 
@@ -230,6 +349,13 @@ def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dic
             device=device, amp_enabled=amp_enabled, batch_size=batch_size,
             image_transform=_image_transform(condition),
         )
+    output_changes = {
+        condition: _output_change_summary(metrics["normal"]["_output_vectors"],
+                                          metrics[condition]["_output_vectors"])
+        for condition in ("image_zero", "image_shuffle", "history_zero")
+    }
+    for values in metrics.values():
+        values.pop("_output_vectors")
     normal = metrics["normal"]
     image_gates = {
         condition: _dependency_gate(normal, metrics[condition])
@@ -238,9 +364,11 @@ def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dic
     return {
         "checkpoint": str(Path(checkpoint).resolve()),
         "checkpoint_step": int(saved.get("step", -1)),
+        "camera_prior_scale": float(core.camera_prior_scale),
         "initialization": "base_without_m2",
         "data": [str(args.data)],
         "metrics": metrics,
+        "output_changes": output_changes,
         "image_dependency_gates": image_gates,
         "visual_dependency_gate_pass": all(gate["pass"] for gate in image_gates.values()),
     }
@@ -270,6 +398,8 @@ def main(argv=None) -> int:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=256)
     parser.add_argument("--temporal-dim", type=int, default=256)
+    parser.add_argument("--camera-prior-scale", type=float, default=None,
+                        help="诊断时覆盖 camera prior 权重；默认使用模型配置")
     parser.add_argument("--output", default="reports/visual_dependency_gate.json")
     args = parser.parse_args(argv)
     results = [evaluate_checkpoint(path, args) for path in _checkpoint_paths(args)]

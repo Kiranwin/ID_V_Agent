@@ -47,6 +47,97 @@ def test_history_zero_clears_only_history_tensor():
     assert torch.equal(batch["history_actions"], torch.ones(2, 72))
 
 
+def test_episode_diverse_subset_uses_distinct_episode_representatives_first():
+    from idv_agent.scripts.train_vla import _episode_diverse_subset
+
+    class TinyDataset:
+        rows = [
+            {"episode_id": "a", "anchor_frame": 21},
+            {"episode_id": "a", "anchor_frame": 33},
+            {"episode_id": "a", "anchor_frame": 45},
+            {"episode_id": "b", "anchor_frame": 21},
+            {"episode_id": "b", "anchor_frame": 33},
+            {"episode_id": "b", "anchor_frame": 45},
+            {"episode_id": "c", "anchor_frame": 21},
+            {"episode_id": "c", "anchor_frame": 33},
+            {"episode_id": "c", "anchor_frame": 45},
+        ]
+
+        def __len__(self):
+            return len(self.rows)
+
+        def __getitem__(self, index):
+            return self.rows[index]
+
+    selected = _episode_diverse_subset(TinyDataset(), 3)
+
+    assert [selected[index]["episode_id"] for index in range(len(selected))] == ["a", "b", "c"]
+    assert [selected[index]["anchor_frame"] for index in range(len(selected))] == [33, 33, 33]
+
+
+def test_evaluation_stratified_subset_keeps_rare_intent_and_camera_targets():
+    from idv_agent.scripts.train_vla import _evaluation_stratified_subset
+
+    def row(episode, anchor, intent, dx, dy):
+        return {
+            "episode_id": episode,
+            "anchor_frame": anchor,
+            "intent_target": torch.tensor(intent),
+            "move_target": torch.tensor([1, 1, 1, 1]),
+            "camera_dx_target": torch.tensor([dx, dx, dx, dx]),
+            "camera_dy_target": torch.tensor([dy, dy, dy, dy]),
+        }
+
+    class TinyDataset:
+        rows = [
+            *[row(f"travel_{i}", i, 4, 2, 2) for i in range(8)],
+            row("decipher", 99, 0, 0, 4),
+            row("turn_left", 100, 4, 1, 1),
+        ]
+
+        def __len__(self):
+            return len(self.rows)
+
+        def __getitem__(self, index):
+            return self.rows[index]
+
+    selected = _evaluation_stratified_subset(TinyDataset(), 4)
+    rows = [selected[index] for index in range(len(selected))]
+
+    assert {int(row["intent_target"]) for row in rows} == {0, 4}
+    assert {int(value) for row in rows for value in row["camera_dx_target"]} >= {0, 1, 2}
+    assert {int(value) for row in rows for value in row["camera_dy_target"]} >= {1, 2, 4}
+
+
+def test_evaluation_stratified_subset_reserves_four_examples_per_available_intent():
+    from idv_agent.scripts.train_vla import _evaluation_stratified_subset
+
+    class TinyDataset:
+        rows = []
+        for index in range(12):
+            intent = 0 if index < 4 else 4
+            rows.append({
+                "episode_id": f"episode_{index}", "anchor_frame": index,
+                "intent_target": torch.tensor(intent),
+                "move_target": torch.tensor([1 if intent == 0 else index, 1, 1, 1]),
+                "camera_dx_target": torch.tensor([2 if intent == 0 else index % 5, 2, 2, 2]),
+                "camera_dy_target": torch.tensor([2 if intent == 0 else (index + 1) % 5, 2, 2, 2]),
+            })
+
+        def __len__(self):
+            return len(self.rows)
+
+        def __getitem__(self, index):
+            return self.rows[index]
+
+    selected = _evaluation_stratified_subset(TinyDataset(), 8)
+    counts = {intent: 0 for intent in (0, 4)}
+    for index in range(len(selected)):
+        counts[int(selected[index]["intent_target"])] += 1
+
+    assert counts == {0: 4, 4: 4}
+
+
 def test_dependency_gate_requires_each_image_metric_to_drop_by_fixed_threshold():
     from idv_agent.scripts.evaluate_visual_dependency import _dependency_gate
 
@@ -73,6 +164,40 @@ def test_dependency_gate_fails_closed_for_missing_metric():
 
     assert result["pass"] is False
     assert "intent_accuracy" in result["failures"]
+
+
+def test_output_change_summary_reports_logit_shift_and_argmax_flip_per_head():
+    from idv_agent.scripts.evaluate_visual_dependency import _output_change_summary
+
+    normal = {
+        "move": torch.tensor([[[3.0, 1.0], [0.0, 2.0]]]),
+        "camera_dx": torch.tensor([[[1.0, 0.0]]]),
+        "camera_dy": torch.tensor([[[0.0, 1.0]]]),
+        "intent": torch.tensor([[2.0, 0.0]]),
+    }
+    changed = {
+        "move": torch.tensor([[[1.0, 3.0], [0.0, 2.0]]]),
+        "camera_dx": torch.tensor([[[0.0, 1.0]]]),
+        "camera_dy": torch.tensor([[[0.1, 0.9]]]),
+        "intent": torch.tensor([[0.0, 2.0]]),
+    }
+    result = _output_change_summary(normal, changed)
+
+    assert result["move"]["argmax_flip_rate"] == pytest.approx(0.5)
+    assert result["camera_dx"]["argmax_flip_rate"] == pytest.approx(1.0)
+    assert result["camera_dy"]["argmax_flip_rate"] == pytest.approx(0.0)
+    assert result["intent"]["argmax_flip_rate"] == pytest.approx(1.0)
+    assert result["move"]["mean_abs_logit_delta"] > 0
+
+
+def test_macro_recall_reveals_majority_class_collapse_hidden_by_accuracy():
+    from idv_agent.scripts.evaluate_visual_dependency import _macro_recall
+
+    # Same number of correct predictions can hide a complete rare-class loss.
+    confusion_normal = [[8, 2], [1, 9]]
+    confusion_black = [[10, 0], [10, 0]]
+    assert _macro_recall(confusion_normal) == pytest.approx(0.85)
+    assert _macro_recall(confusion_black) == pytest.approx(0.5)
 
 
 def test_cli_returns_nonzero_when_any_checkpoint_fails(tmp_path, monkeypatch):

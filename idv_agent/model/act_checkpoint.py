@@ -2,61 +2,50 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import torch
 
-from idv_agent.model.spatial_cell_projector import SpatialCellProjector
-
-
-ACT_CHECKPOINT_SCHEMA = "m7_act.visual_expert.v1"
-_ACT_ADAPTER_KEYS = frozenset({"spatial_cell_projector", "condition_projection"})
+ACT_CHECKPOINT_SCHEMA = "m13_act.visual_camera_prior.v1"
+_ACT_ADAPTER_KEYS = frozenset({"condition_projection"})
 
 
 def act_adapter_state(adapter: torch.nn.Module) -> dict[str, dict[str, torch.Tensor]]:
-    """Serialize exactly the ACT visual-grounding modules, never legacy poolers."""
-    projector = getattr(adapter, "spatial_cell_projector", None)
-    if projector is None:
-        raise RuntimeError("ACT checkpoint 需要已 materialize 的 SpatialCellProjector")
-    return {
-        "spatial_cell_projector": projector.state_dict(),
-        "condition_projection": adapter.condition_projection.state_dict(),
-    }
+    """Serialize only the task-condition projection.
+
+    The visual feature is deterministic raw-grid pooling, so no learned
+    spatial projector is allowed in an m8 checkpoint.
+    """
+    projection = getattr(adapter, "condition_projection", None)
+    if projection is None or not hasattr(projection, "weight"):
+        raise RuntimeError("ACT checkpoint 需要已 materialize 的 condition_projection")
+    return {"condition_projection": projection.state_dict()}
 
 
 def load_act_adapter_state(adapter: torch.nn.Module, state: dict[str, Any]) -> None:
-    """Restore only m4 raster modules and reject every legacy ACT contract."""
+    """Restore the m8 adapter contract and reject all learned raster states."""
     supplied = set(state)
-    if "spatial_agg" in supplied or "visual_projection" in supplied:
-        raise ValueError("旧 SpatialAgg/visual_projection ACT checkpoint 不兼容")
+    if "spatial_cell_projector" in supplied or "spatial_agg" in supplied or "visual_projection" in supplied:
+        raise ValueError("m7/M2/legacy visual projector checkpoint 不兼容 m13")
     if supplied != _ACT_ADAPTER_KEYS:
-        raise ValueError(f"ACT adapter state 必须恰好包含 {sorted(_ACT_ADAPTER_KEYS)}，收到 {sorted(supplied)}")
-    projector_state = state["spatial_cell_projector"]
+        raise ValueError(f"m13 ACT adapter state 必须恰好包含 {sorted(_ACT_ADAPTER_KEYS)}，收到 {sorted(supplied)}")
+    projection_state = state["condition_projection"]
     try:
-        cell_dim, raw_dim = projector_state["cell_projection.weight"].shape
-        n_cells = int(projector_state["position"].shape[1])
-        output_dim, fusion_width = projector_state["fusion_projection.weight"].shape
+        output_dim, input_dim = projection_state["weight"].shape
     except (KeyError, ValueError) as exc:
-        raise ValueError("SpatialCellProjector state 不完整") from exc
-    k = math.isqrt(n_cells)
-    if k * k != n_cells or fusion_width != n_cells * cell_dim:
-        raise ValueError("SpatialCellProjector state 的 raster shape 非法")
-    if int(output_dim) != int(adapter.hidden_size):
-        raise ValueError("SpatialCellProjector output_dim 与 backbone hidden_size 不匹配")
-    projector = SpatialCellProjector(dim=int(raw_dim), k=k, cell_dim=int(cell_dim),
-                                     output_dim=int(output_dim)).to(adapter.device)
-    projector.load_state_dict(projector_state)
-    adapter.spatial_k = k
-    adapter.spatial_cell_projector = projector
-    adapter.condition_projection.load_state_dict(state["condition_projection"])
+        raise ValueError("condition_projection state 不完整") from exc
+    if int(input_dim) != int(adapter.hidden_size) * 2:
+        raise ValueError("condition_projection 输入维度与 text hidden_size 不匹配")
+    if int(output_dim) != int(getattr(adapter, "act_feature_dim", -1)):
+        raise ValueError("condition_projection 输出维度与 act_feature_dim 不匹配")
+    adapter.condition_projection.load_state_dict(projection_state)
 
 
 def load_visual_grounded_act_checkpoint(adapter: torch.nn.Module, core: torch.nn.Module,
                                         checkpoint: dict[str, Any]) -> None:
-    """Restore a complete m7 ACT checkpoint or fail before partial loading."""
+    """Restore a complete m8 ACT checkpoint or fail before partial loading."""
     if checkpoint.get("checkpoint_schema_version") != ACT_CHECKPOINT_SCHEMA:
-        raise ValueError("旧 ACT checkpoint 不兼容；需要 m7_act.visual_expert.v1")
+        raise ValueError("旧 ACT checkpoint 不兼容；需要 m13_act.visual_camera_prior.v1")
     if not isinstance(checkpoint.get("adapter"), dict) or not isinstance(checkpoint.get("core"), dict):
         raise ValueError("ACT checkpoint 缺少 adapter/core")
     load_act_adapter_state(adapter, checkpoint["adapter"])

@@ -68,6 +68,7 @@ class ACTPolicy:
             instruction, mode, task_id=f"act:{id(self)}")
         self.window_span = (self.history_frames - 1) * self.history_stride + 1
         self.features = FrameFeatureCache(max_length=self.window_span)
+        self.visual_features = FrameFeatureCache(max_length=self.window_span)
         # ACT cold start is travel/observe, unlike the generic model default.
         self.condition = core.initial_condition(1, device=self.device,
                                                 mode_id=self.mode_id,
@@ -108,19 +109,29 @@ class ACTPolicy:
     def observe(self, image: Any, *, frame_index: int, timestamp_ns: int) -> bool:
         """Encode and cache one frame; return whether the history is warm."""
         with torch.inference_mode():
-            feature = self.adapter.encode_frame(image, self.task_cache)
+            encode_pair = getattr(self.adapter, "encode_frames_with_visual", None)
+            if encode_pair is not None:
+                feature, visual_feature = encode_pair([image], self.task_cache)
+                feature, visual_feature = feature[0], visual_feature[0]
+            else:
+                feature = self.adapter.encode_frame(image, self.task_cache)
+                visual_feature = feature
         feature = feature.to(device=self.device, dtype=torch.float32).reshape(-1)
+        visual_feature = visual_feature.to(device=self.device, dtype=torch.float32).reshape(-1)
         self.features.append(frame_index, timestamp_ns, feature)
+        self.visual_features.append(frame_index, timestamp_ns, visual_feature)
         return self.ready
 
     def _run_slow_if_due(self, now: float) -> None:
         if not self.ready or now - self._last_slow < self.slow_period:
             return
         values, deltas, valid = self._temporal_inputs()
+        visual_values, _, visual_valid = self._visual_temporal_inputs()
         history = torch.zeros_like(self.history_actions) if self.zero_history else self.history_actions
         with torch.inference_mode():
             output = self.core(values.unsqueeze(0), self.condition,
                                valid_mask=valid.unsqueeze(0), time_deltas=None if deltas is None else deltas.unsqueeze(0),
+                               visual_frame_features=visual_values.unsqueeze(0),
                                history_actions=history, run_slow=True)
         self.condition = self.core.condition_from_slow_output(output.slow,
                                                                self.condition.mode_id)
@@ -131,10 +142,12 @@ class ACTPolicy:
 
     def _predict_chunk(self, _feature: object) -> list[ACTActionStep]:
         values, deltas, valid = self._temporal_inputs()
+        visual_values, _, visual_valid = self._visual_temporal_inputs()
         history = torch.zeros_like(self.history_actions) if self.zero_history else self.history_actions
         with torch.inference_mode():
             output = self.core(values.unsqueeze(0), self.condition,
                                valid_mask=valid.unsqueeze(0), time_deltas=None if deltas is None else deltas.unsqueeze(0),
+                               visual_frame_features=visual_values.unsqueeze(0),
                                history_actions=history, run_slow=False)
         fast = output.fast
         moves = fast.move_logits.argmax(-1)[0].tolist()
@@ -171,6 +184,10 @@ class ACTPolicy:
         # Keep this explicit so future protocol changes cannot silently alter
         # the deployed input distribution.
         return values, deltas, valid
+
+    def _visual_temporal_inputs(self):
+        values, timestamps, valid = self.visual_features.window(self.history_frames, self.history_stride)
+        return values, None, valid
 
     def tick(self, *, now: float | None = None) -> bool:
         """Run due slow/fast ticks. ``now`` is a monotonic seconds timestamp."""

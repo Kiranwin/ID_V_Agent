@@ -67,34 +67,36 @@ class FastSlowVLAOutput:
 
 
 def fuse_fast_outputs(visual: FastVLAOutput, prior: FastVLAOutput,
-                      prior_scale: float = 0.5) -> FastVLAOutput:
+                      prior_scale: float = 0.5, *, bound_prior: bool = False) -> FastVLAOutput:
     """Bound history/temporal prior so it cannot erase visual logits."""
     scale = float(prior_scale)
     if not 0.0 <= scale <= 1.0:
         raise ValueError("prior_scale 必须在 [0,1]")
+    prior_logits = (lambda value: torch.tanh(value) if bound_prior else value)
     return FastVLAOutput(
-        move_logits=visual.move_logits + scale * prior.move_logits,
-        camera_dx_logits=visual.camera_dx_logits + scale * prior.camera_dx_logits,
-        camera_dy_logits=visual.camera_dy_logits + scale * prior.camera_dy_logits,
-        button_logits=visual.button_logits + scale * prior.button_logits,
+        move_logits=visual.move_logits + scale * prior_logits(prior.move_logits),
+        camera_dx_logits=visual.camera_dx_logits + scale * prior_logits(prior.camera_dx_logits),
+        camera_dy_logits=visual.camera_dy_logits + scale * prior_logits(prior.camera_dy_logits),
+        button_logits=visual.button_logits + scale * prior_logits(prior.button_logits),
         duration=(visual.duration + scale * (prior.duration - 6.0)).clamp(1.0, 30.0),
         confidence=(visual.confidence + scale * (prior.confidence - 0.5)).clamp(0.0, 1.0),
         stop_or_replan=(visual.stop_or_replan + scale * (prior.stop_or_replan - 0.5)).clamp(0.0, 1.0),
-        intent_context_logits=visual.intent_context_logits + scale * prior.intent_context_logits,
+        intent_context_logits=visual.intent_context_logits + scale * prior_logits(prior.intent_context_logits),
     )
 
 
 def fuse_slow_outputs(visual: SlowVLAOutput, prior: SlowVLAOutput,
-                      prior_scale: float = 0.5) -> SlowVLAOutput:
+                      prior_scale: float = 0.5, *, bound_prior: bool = False) -> SlowVLAOutput:
     """Fuse tactical logits while retaining visual evidence as the base path."""
     scale = float(prior_scale)
     if not 0.0 <= scale <= 1.0:
         raise ValueError("prior_scale 必须在 [0,1]")
+    prior_logits = (lambda value: torch.tanh(value) if bound_prior else value)
     return SlowVLAOutput(
-        intent_logits=visual.intent_logits + scale * prior.intent_logits,
-        subgoal_logits=visual.subgoal_logits + scale * prior.subgoal_logits,
+        intent_logits=visual.intent_logits + scale * prior_logits(prior.intent_logits),
+        subgoal_logits=visual.subgoal_logits + scale * prior_logits(prior.subgoal_logits),
         context_embedding=visual.context_embedding + scale * prior.context_embedding,
-        refresh_logits=visual.refresh_logits + scale * prior.refresh_logits,
+        refresh_logits=visual.refresh_logits + scale * prior_logits(prior.refresh_logits),
     )
 
 
@@ -132,6 +134,12 @@ class SharedFastSlowVLA(nn.Module):
         self.slow_head = SlowVLAHead(temporal_dim)
         self.fast_head = FastVLAHead(temporal_dim, history_action_dim=history_action_dim)
         self.visual_expert = VisualActionExpert(frame_feature_dim, temporal_dim)
+        self.prior_scale = 0.1
+        self.camera_prior_scale = 0.1
+        # ACT deployment consumes the directly supervised visual branch.  The
+        # temporal/history branch remains exposed for diagnostics, but does
+        # not form a second copy of the deployed logits.
+        self.visual_only_deployment = True
 
     @staticmethod
     def initial_condition(batch_size: int, device: torch.device | str = "cpu",
@@ -158,6 +166,7 @@ class SharedFastSlowVLA(nn.Module):
         valid_mask: Optional[torch.Tensor] = None,
         time_deltas: Optional[torch.Tensor] = None,
         history_actions: Optional[torch.Tensor] = None,
+        visual_frame_features: Optional[torch.Tensor] = None,
         run_slow: bool = False,
         detach_slow_condition: bool = True,
     ) -> FastSlowVLAOutput:
@@ -171,6 +180,12 @@ class SharedFastSlowVLA(nn.Module):
         """
         if frame_features.ndim == 2:
             frame_features = frame_features.unsqueeze(0)
+        if visual_frame_features is None:
+            visual_frame_features = frame_features
+        elif visual_frame_features.ndim == 2:
+            visual_frame_features = visual_frame_features.unsqueeze(0)
+        if visual_frame_features.shape != frame_features.shape:
+            raise ValueError("visual_frame_features shape 必须与 frame_features 一致")
         condition = slow_condition.detached() if detach_slow_condition else slow_condition
         conditioned = self.conditioner(
             frame_features,
@@ -183,7 +198,7 @@ class SharedFastSlowVLA(nn.Module):
         indices = self._last_valid_indices(frame_features, valid_mask)
         rows = torch.arange(frame_features.shape[0], device=frame_features.device)
         current_visual = frame_features[rows, indices]
-        visual = self.visual_expert(frame_features, valid_mask=valid_mask)
+        visual = self.visual_expert(visual_frame_features, valid_mask=valid_mask)
         slow_temporal = None
         if run_slow:
             slow_temporal = (self.slow_temporal(conditioned, valid_mask=valid_mask,
@@ -194,13 +209,28 @@ class SharedFastSlowVLA(nn.Module):
                          + self.fast_visual_residual(current_visual))
 
         prior_fast = self.fast_head(fast_temporal, history_actions=history_actions)
-        fast = fuse_fast_outputs(visual.fast, prior_fast)
+        # m11 deployment is deliberately visual-only.  The temporal/history
+        # prior remains observable for diagnostics but cannot replace image
+        # evidence at inference time.
+        camera_prior = float(self.camera_prior_scale)
+        fast = FastVLAOutput(
+            move_logits=visual.fast.move_logits,
+            camera_dx_logits=visual.fast.camera_dx_logits + camera_prior *
+                              torch.tanh(prior_fast.camera_dx_logits),
+            camera_dy_logits=visual.fast.camera_dy_logits + camera_prior *
+                              torch.tanh(prior_fast.camera_dy_logits),
+            button_logits=visual.fast.button_logits,
+            duration=visual.fast.duration,
+            confidence=visual.fast.confidence,
+            stop_or_replan=visual.fast.stop_or_replan,
+            intent_context_logits=visual.fast.intent_context_logits,
+        )
         prior_slow = self.slow_head(slow_temporal) if run_slow and slow_temporal is not None else None
-        slow = fuse_slow_outputs(visual.slow, prior_slow) if prior_slow is not None else None
+        slow = visual.slow if prior_slow is not None else None
 
         # The deployment decision feature must include the independent visual
         # expert; diagnostics therefore cannot certify a prior-only GRU path.
-        decision_feature = visual.feature + 0.5 * fast_temporal
+        decision_feature = visual.feature
         return FastSlowVLAOutput(temporal_feature=decision_feature, fast=fast, slow=slow,
                                  prior_temporal_feature=fast_temporal,
                                  visual=visual, prior_fast=prior_fast, prior_slow=prior_slow)
