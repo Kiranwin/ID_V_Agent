@@ -257,6 +257,7 @@ def _slow_label_for_frame(frame_idx: int, segments: list[dict], states: dict[int
 
 
 def build(session: Path, output: Path, *, stride: int = 3,
+          anchor_stride: int | None = None, history_stride: int | None = None,
           history: int = HISTORY_FRAMES, horizon: int = ACTION_CHUNK_HORIZON,
           macro_frames: int = MACRO_FRAMES, action_delay_frames: int = DEFAULT_ACTION_DELAY_FRAMES,
           outcome: str = "unknown", schema_version: str = VLA_SCHEMA_VERSION,
@@ -271,7 +272,17 @@ def build(session: Path, output: Path, *, stride: int = 3,
         raise ValueError(f"不支持 schema_version={schema_version!r}")
     if slow_period_s <= 0:
         raise ValueError("slow_period_s 必须为正数")
-    if stride < 1 or macro_frames < 1 or action_delay_frames < 0:
+    # ``stride`` remains a compatibility alias.  New callers must be able to
+    # decorrelate neighboring anchors without changing the temporal spacing
+    # inside each observation/history window.
+    if anchor_stride is None:
+        # v5's canonical sampling separates anchor decorrelation from the
+        # temporal spacing inside the observation window.  Legacy v3/v4
+        # callers retain the old ``stride`` alias behavior.
+        anchor_stride = 12 if schema_version == VLA_SCHEMA_VERSION_V5 else stride
+    if history_stride is None:
+        history_stride = stride
+    if anchor_stride < 1 or history_stride < 1 or macro_frames < 1 or action_delay_frames < 0:
         raise ValueError("stride/macro_frames 必须为正数")
     try:
         frames = sorted((session / "frames").glob("*.jpg"), key=lambda p: int(p.stem))
@@ -369,11 +380,11 @@ def build(session: Path, output: Path, *, stride: int = 3,
     rows = []
     last_slow_ts = None
     last_slow_segment = None
-    for anchor in range((history - 1) * stride,
-                        len(frames) - action_delay_frames - total_future, stride):
+    for anchor in range((history - 1) * history_stride,
+                        len(frames) - action_delay_frames - total_future, anchor_stride):
         history_frames = []
         for offset in range(history - 1, -1, -1):
-            idx = anchor - offset * stride
+            idx = anchor - offset * history_stride
             frame = frames[idx]
             ts = _num(actions[idx].get("timestamp_ns"), field=f"action[{idx}].timestamp_ns")
             item = {"path": frame.relative_to(session).as_posix(),
@@ -395,7 +406,7 @@ def build(session: Path, output: Path, *, stride: int = 3,
         action_end_ts = int(_num(actions[action_end_frame].get("timestamp_ns"), field=f"action[{action_end_frame}].timestamp_ns"))
         history_actions = []
         for offset in range(history - 1, -1, -1):
-            idx = anchor - offset * stride
+            idx = anchor - offset * history_stride
             if idx in actions:
                 history_actions.append(_history_action(
                     actions[idx], pixel_camera=schema_version == VLA_SCHEMA_VERSION_V5))
@@ -457,7 +468,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("session", type=Path)
     parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--stride", type=int, default=3)
+    parser.add_argument("--stride", type=int, default=3,
+                        help="兼容旧调用：同时设置 anchor/history stride")
+    parser.add_argument("--anchor-stride", type=int, default=None,
+                        help="相邻训练样本 anchor 的帧间隔")
+    parser.add_argument("--history-stride", type=int, default=None,
+                        help="同一观测窗口内历史帧的帧间隔")
     parser.add_argument("--history", type=int, default=None,
                         help="历史帧数；v3 默认 3，v4 默认 8（范围 3..8）")
     parser.add_argument("--macro-frames", type=int, default=MACRO_FRAMES)
@@ -473,6 +489,7 @@ def main(argv=None):
     )
     output = args.output or args.session / "vla_chunks.jsonl"
     build(args.session, output, stride=args.stride,
+          anchor_stride=args.anchor_stride, history_stride=args.history_stride,
           history=history,
           macro_frames=args.macro_frames,
           action_delay_frames=args.action_delay_frames,

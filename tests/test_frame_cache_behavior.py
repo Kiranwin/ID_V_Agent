@@ -106,6 +106,30 @@ def test_encode_batch_uses_batched_vision_encoder_for_uncached_frames():
     assert torch.equal(features[0, :, 0], torch.tensor([1.0, 2.0, 3.0]))
 
 
+def test_encode_batch_applies_one_augmentation_draw_to_one_history_window(tmp_path, monkeypatch):
+    from idv_agent.scripts.train_vla import encode_batch
+    import idv_agent.scripts.train_vla as train_vla
+
+    adapter = _BatchAdapter()
+    paths = [tmp_path / f"frame-{index}.png" for index in range(3)]
+    seen = []
+
+    def capture(image, params):
+        seen.append(params)
+        return image
+
+    params = object()
+    monkeypatch.setattr(train_vla, "_sample_image_augmentation_params", lambda: params)
+    monkeypatch.setattr(train_vla, "_augment_image", capture)
+    for path in paths:
+        Image.new("RGB", (1, 1), (1, 0, 0)).save(path)
+    encode_batch(adapter, {"frame_paths": [paths], "task_instruction": ["same"],
+                           "mode_id": torch.zeros(1, dtype=torch.long)},
+                 device=torch.device("cpu"), augment_images=True)
+
+    assert seen == [params, params, params]
+
+
 def test_qwen_batch_singleton_keeps_batch_dimension():
     from types import SimpleNamespace
     from idv_agent.model.qwen_backbone_adapter import Qwen3VLBackboneAdapter

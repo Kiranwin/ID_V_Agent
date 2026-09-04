@@ -123,6 +123,44 @@ def test_build_v5_buckets_camera_from_raw_pixel_displacement(tmp_path: Path):
     assert record["action_chunk"][0]["camera_dx"] == 1
 
 
+def test_v5_separates_anchor_sampling_from_history_sampling(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(80):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text("timestamp_ns,kind,code,value\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(80)),
+        encoding="utf-8",
+    )
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(80)),
+        encoding="utf-8",
+    )
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,79,travel\n",
+        encoding="utf-8",
+    )
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 80, "target_fps": 30}), encoding="utf-8")
+    output = tmp_path / "vla_v5.jsonl"
+
+    build(session, output, anchor_stride=12, history_stride=3, history=3,
+          macro_frames=6, schema_version=VLA_SCHEMA_VERSION_V5)
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+
+    assert [row["anchor_frame"] for row in records] == [6, 18, 30, 42, 54]
+    assert [frame["frame_index"] for frame in records[0]["observations"]["frames"]] == [0, 3, 6]
+    assert [frame["frame_index"] for frame in records[1]["observations"]["frames"]] == [12, 15, 18]
+
+
+def test_build_rejects_nonpositive_sampling_steps(tmp_path: Path):
+    with pytest.raises(ValueError, match="stride"):
+        build(tmp_path / "missing", tmp_path / "vla.jsonl", anchor_stride=0)
+
+
 def test_build_rejects_missing_per_frame_action_after_extraction(tmp_path: Path, monkeypatch):
     """A missing source action must not be converted to a synthetic stop label."""
     session = tmp_path / "ep"

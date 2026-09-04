@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 from PIL import Image
+from PIL import ImageEnhance
 from torch.utils.data import DataLoader, Subset
 
 from idv_agent.model.fast_slow_vla import FastSlowVLAOutput, SharedFastSlowVLA
@@ -71,17 +72,52 @@ def _load_act_backbone(model_path: str | Path, init_checkpoint: str | Path,
     if "visual_projection" not in saved:
         raise ValueError(f"M2_VG grounding checkpoint 缺少 visual_projection: {projection_path}")
     adapter.visual_projection.load_state_dict(saved["visual_projection"])
+    # 阶段二：若父 checkpoint 是 k×k 空间 (M2_VG_spatial)，则把同 checkpoint 训出
+    # 的可训 spatial_agg 一并载入并开启 spatial 编码通道；旧 M2_VG(mean) 保持现役。
+    if "spatial_agg" in saved:
+        sp_k = int(parent_manifest.get("training", {}).get("spatial_k", 8))
+        adapter.enable_spatial_agg(k=sp_k, state=saved["spatial_agg"], dim=1024)
+        print(f"[_load_act_backbone] 已启用 spatial k={sp_k} (从 {init_dir.name} 载入 aggregate)", flush=True)
     return adapter, processor, parent_manifest
 
 
-def _load_images(paths: list[Path | None]) -> list[Image.Image | None]:
+def _sample_image_augmentation_params() -> tuple[float, float, float, float, int, int]:
+    """Sample one photometric/translation transform for one history window."""
+    return (random.uniform(-0.05, 0.05), random.uniform(0.8, 1.2),
+            random.uniform(0.8, 1.2), random.uniform(0.8, 1.2),
+            random.randint(-8, 8), random.randint(-8, 8))
+
+
+def _augment_image(image: Image.Image, params: tuple[float, float, float, float, int, int]) -> Image.Image:
+    """Apply label-preserving training augmentation to one RGB image."""
+    hue, saturation, brightness, contrast, tx, ty = params
+    # PIL's Color enhancer changes saturation; hue is implemented in HSV so
+    # the perturbation remains bounded and does not alter geometry.
+    hsv = image.convert("HSV")
+    h, s, v = hsv.split()
+    h = h.point(lambda value: int((value + hue * 255.0) % 256))
+    image = Image.merge("HSV", (h, s, v)).convert("RGB")
+    image = ImageEnhance.Color(image).enhance(saturation)
+    image = ImageEnhance.Brightness(image).enhance(brightness)
+    image = ImageEnhance.Contrast(image).enhance(contrast)
+    if tx or ty:
+        image = image.transform(image.size, Image.Transform.AFFINE,
+                                (1, 0, -tx, 0, 1, -ty),
+                                resample=Image.Resampling.BILINEAR,
+                                fillcolor=(0, 0, 0))
+    return image
+
+
+def _load_images(paths: list[Path | None], *, augmentation_params=None) -> list[Image.Image | None]:
     images: list[Image.Image | None] = []
     for path in paths:
         if path is None:
             images.append(None)
         else:
             with Image.open(path) as image:
-                images.append(image.convert("RGB"))
+                loaded = image.convert("RGB")
+                images.append(_augment_image(loaded, augmentation_params)
+                              if augmentation_params is not None else loaded)
     return images
 
 
@@ -217,7 +253,8 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
                  frame_cache: dict[tuple[str, int, str], torch.Tensor] | None = None,
                  frame_stats: dict[str, int] | None = None,
                  vision_micro_batch_size: int = 8,
-                 raw_feature_cache: Any | None = None) -> torch.Tensor:
+                 raw_feature_cache: Any | None = None,
+                 augment_images: bool = False) -> torch.Tensor:
     """Encode real images in vision micro-batches and return ``[B, L, D]`` features.
 
     ``frame_cache`` deduplicates vision-tower forwards across calls by task and
@@ -234,15 +271,17 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
     """
     if vision_micro_batch_size < 1:
         raise ValueError("vision_micro_batch_size 必须为正数")
+    if augment_images and raw_feature_cache is not None:
+        raise ValueError("augment_images 与 raw_feature_cache 不兼容；增强必须在原始图像上执行")
     features = []
     cache_by_task: dict[tuple[str, int], Any] = {}
     # Per-batch cache deliberately keeps graph-connected tensors.  This is
     # safe for training and preserves gradient accumulation when duplicate
     # frame/task pairs occur within one batch; persistent ``frame_cache``
     # remains detached and is therefore restricted to inference.
-    batch_frame_cache: dict[tuple[str, int, str], torch.Tensor] = {}
-    pending: dict[tuple[str, int], list[tuple[int, int, Any, Any, tuple[str, int, str]]]] = defaultdict(list)
-    pending_refs: dict[tuple[str, int, str], list[tuple[int, int]]] = defaultdict(list)
+    batch_frame_cache: dict[tuple[Any, ...], torch.Tensor] = {}
+    pending: dict[tuple[str, int], list[tuple[int, int, Any, Any, tuple[Any, ...]]]] = defaultdict(list)
+    pending_refs: dict[tuple[Any, ...], list[tuple[int, int]]] = defaultdict(list)
     for row_index, (paths, instruction, mode_id) in enumerate(zip(
         batch["frame_paths"], batch["task_instruction"], batch["mode_id"].tolist()
     )):
@@ -252,21 +291,36 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
         if task_key not in cache_by_task:
             cache_by_task[task_key] = adapter.encode_task_once(instruction, mode, task_id=f"{instruction}:{mode}")
         cache = cache_by_task[task_key]
+        augmentation_params = (_sample_image_augmentation_params() if augment_images else None)
         row = [None] * len(paths)
         images = []
         load_paths = []
         for path in paths:
             path_key = (instruction, int(mode_id), str(path) if path is not None else "<pad>")
-            if path is None or path_key in batch_frame_cache or (frame_cache is not None and path_key in frame_cache) or (raw_feature_cache is not None and path in raw_feature_cache):
+            cache_key = path_key if not augment_images else (*path_key, row_index)
+            if (path is None or cache_key in batch_frame_cache or
+                    (frame_cache is not None and cache_key in frame_cache) or
+                    (raw_feature_cache is not None and path in raw_feature_cache)):
                 images.append(None)
             else:
                 images.append("__LOAD__")
                 load_paths.append(path)
-        loaded = iter(_load_images(load_paths))
+        try:
+            loaded_images = _load_images(load_paths, augmentation_params=augmentation_params)
+        except TypeError as exc:
+            # Keep lightweight third-party/test loaders that implement the
+            # old one-argument hook working when augmentation is disabled.
+            if augmentation_params is not None:
+                raise
+            if "augmentation_params" not in str(exc):
+                raise
+            loaded_images = _load_images(load_paths)
+        loaded = iter(loaded_images)
         images = [next(loaded) if image == "__LOAD__" else image for image in images]
         for col_index, (path, image) in enumerate(zip(paths, images)):
-            cache_key = (instruction, int(mode_id),
-                         str(path) if path is not None else "<pad>")
+            path_key = (instruction, int(mode_id),
+                        str(path) if path is not None else "<pad>")
+            cache_key = path_key if not augment_images else (*path_key, row_index)
             if path is not None and cache_key in batch_frame_cache:
                 row[col_index] = batch_frame_cache[cache_key]
                 if frame_stats is not None:
@@ -378,7 +432,9 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
                  teacher_forcing_ratio: float = 0.0,
                  frame_cache: dict | None = None, frame_stats: dict[str, int] | None = None,
                  vision_micro_batch_size: int = 8,
-                 raw_feature_cache: Any | None = None):
+                 raw_feature_cache: Any | None = None,
+                 ablate_frame_avg: bool = False, no_history: bool = False,
+                 augment_images: bool = False):
     """Forward + loss for one batch.
 
     ``frame_cache``/``frame_stats`` are passed through to ``encode_batch``.
@@ -389,10 +445,35 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
     ``_slow_accuracy``) may pass a cache.
     """
     model_batch = _model_inputs(batch, device)
+    if no_history:
+        # 时序/历史剥离：把 fast 头消费的上一动作条件 history_actions 置零，
+        # 使模型无法凭“上一步动作的自相关”去拟合，只留(可选的)画面与时序帧结构。
+        model_batch["history_actions"] = torch.zeros_like(model_batch["history_actions"])
     frame_features = encode_batch(adapter, batch, device=device,
                                   frame_cache=frame_cache, frame_stats=frame_stats,
                                   vision_micro_batch_size=vision_micro_batch_size,
-                                  raw_feature_cache=raw_feature_cache)
+                                  raw_feature_cache=raw_feature_cache,
+                                  augment_images=augment_images)
+    if ablate_frame_avg:
+        # 画面边际贡献 ablation：把 (B,L,D) 里区分不同帧/不同画面(multi-session batch)
+        # 的可分辨分量中和——把所有 **valid(真实)帧** 替换为其全局均值特征。
+        # 跨画面的均值使模型看不到“这帧是 A 地图/这帧是 B 地图”的身份，只剩共同画面
+        # 轮廓与时序结构；均值是可导(自动梯度按平均方向)，保留与原始同 shape 供
+        # valid_mask/history 的时序语义不变，从而 loss 能直接反映是否依赖画面差异。
+        vm = model_batch.get("frame_valid_mask", None)
+        if vm is not None:
+            valid_rows = vm.reshape(-1).bool()
+            flat = frame_features.reshape(-1, frame_features.shape[-1])
+            has = valid_rows.any()
+            if has and valid_rows.all():
+                mean_feat = flat.mean(dim=0, keepdim=True)
+            elif has:
+                mean_feat = flat[valid_rows].mean(dim=0, keepdim=True)
+            else:  # 无 valid——退化为全均值以免 NaN(不应发生)
+                mean_feat = flat.mean(dim=0, keepdim=True)
+        else:
+            mean_feat = frame_features.mean(dim=(0, 1), keepdim=True)
+        frame_features = mean_feat.reshape(1, 1, -1).expand_as(frame_features).clone()
     condition = core.initial_condition(frame_features.shape[0], device=device,
                                        mode_id=0)
     # Keep the per-record mode conditioning from v4 (normally all rows in the
@@ -455,6 +536,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     # selecting a size that fits the available GPU memory.
     batch_size = max(1, int(args.batch_size))
     vision_micro_batch_size = max(1, int(getattr(args, "vision_micro_batch_size", 8)))
+    _ablate_frame = bool(getattr(args, "ablate_frame_avg", False))
+    _no_history = bool(getattr(args, "no_history", False))
     raw_feature_cache = None
     if getattr(args, "raw_feature_cache", ""):
         from idv_agent.training.raw_feature_cache import RawFeatureCache
@@ -524,7 +607,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                       vision_micro_batch_size=vision_micro_batch_size,
                                       raw_feature_cache=raw_feature_cache,
                                       loss_weights=loss_weights,
-                                      teacher_forcing_ratio=_teacher_forcing_ratio(args, 0))
+                                      teacher_forcing_ratio=_teacher_forcing_ratio(args, 0),
+                                      ablate_frame_avg=_ablate_frame, no_history=_no_history,
+                                      augment_images=True)
     baseline = float(baseline_losses["total"].detach().cpu())
     history: list[float] = []
     component_history: list[dict[str, float]] = []
@@ -544,7 +629,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                       vision_micro_batch_size=vision_micro_batch_size,
                                       raw_feature_cache=raw_feature_cache,
                                       loss_weights=loss_weights,
-                                      teacher_forcing_ratio=_teacher_forcing_ratio(args, step - 1))
+                                      teacher_forcing_ratio=_teacher_forcing_ratio(args, step - 1),
+                                      ablate_frame_avg=_ablate_frame, no_history=_no_history,
+                                      augment_images=True)
         total = losses["total"]
         if not torch.isfinite(total):
             raise FloatingPointError(f"step {step}: loss 非有限值")
@@ -813,6 +900,10 @@ def main(argv=None) -> int:
     parser.add_argument("--overfit-slow-mask", action="store_true",
                         help="小数据过拟合验证时将每条样本 slow_loss_mask 置 1")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ablate-frame-avg", action="store_true",
+                        help="画面边际贡献 ablation：训练时把 frame_features 替换为整个 batch 的平均特征(抹掉帧身份)，用于与正常训练对照损失曲线")
+    parser.add_argument("--no-history", action="store_true",
+                        help="时序/历史剥离：将 fast 头接入的上一动作条件 history_actions 置零（不再凭上步动作自相关拟合）")
     parser.add_argument("--log-interval", type=int, default=25,
                         help="训练过程分量日志间隔（步）")
     parser.add_argument("--checkpoint", default="checkpoints/vla_minimal.pt")

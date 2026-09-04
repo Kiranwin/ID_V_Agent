@@ -116,3 +116,23 @@ def test_v4_contract_requires_action_end_frame():
         assert "action_end_frame" in str(exc)
     else:
         raise AssertionError("missing action_end_frame must be rejected")
+
+
+def test_v5_build_audit_records_sampling_configuration(tmp_path, monkeypatch):
+    from idv_agent.scripts import train_vla_chunks_v5
+
+    monkeypatch.setattr(train_vla_chunks_v5, "build", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(train_vla_chunks_v5, "audit", lambda *args, **kwargs: {"gate_pass": True})
+
+    report = train_vla_chunks_v5.build_train(
+        tmp_path / "session", tmp_path / "vla_chunks_v5.jsonl",
+        anchor_stride=12, history_stride=3, history=8,
+    )
+
+    assert report["sampling"] == {
+        "anchor_stride": 12,
+        "history_stride": 3,
+        "history": 8,
+        "horizon": 4,
+        "macro_frames": 6,
+    }
