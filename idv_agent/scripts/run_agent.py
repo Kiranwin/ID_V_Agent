@@ -50,6 +50,7 @@ def build_policy(args, device):
             instruction=args.instruction, mode=args.game_mode, device=device,
             capture_fps=args.fps, fast_hz=args.fast_hz, slow_hz=args.slow_hz,
             history_frames=args.history_frames,
+            history_stride=args.history_stride,
             use_time_deltas=args.use_time_deltas,
             zero_history=args.zero_history,
             max_feature_age_s=args.max_feature_age_s,
@@ -139,7 +140,9 @@ def main(argv=None) -> int:
     p.add_argument("--game-mode", choices=["standard", "joint_hunt", "blackjack"], default="standard")
     p.add_argument("--fast-hz", type=float, default=15.0)
     p.add_argument("--slow-hz", type=float, default=1.0)
-    p.add_argument("--history-frames", type=int, default=3)
+    p.add_argument("--history-frames", type=int, default=8)
+    p.add_argument("--history-stride", type=int, default=3,
+                   help="ACT 视觉窗口采样间隔；v5 固定为 3 帧")
     p.add_argument("--use-time-deltas", action="store_true",
                    help="将真实帧时间差送入 temporal GRU；默认关闭以对齐训练/离线评估")
     p.add_argument("--zero-history", action="store_true",

@@ -268,6 +268,8 @@ def build(session: Path, output: Path, *, stride: int = 3,
         raise ValueError("VLA v3 要求固定 history=3")
     if schema_version in {VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5} and not 3 <= history <= 8:
         raise ValueError("VLA v4/v5 要求 history 在 3..8")
+    if schema_version == VLA_SCHEMA_VERSION_V5 and history != 8:
+        raise ValueError("v5 必须使用 history=8")
     if schema_version not in {VLA_SCHEMA_VERSION, VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5}:
         raise ValueError(f"不支持 schema_version={schema_version!r}")
     if slow_period_s <= 0:
@@ -282,6 +284,10 @@ def build(session: Path, output: Path, *, stride: int = 3,
         anchor_stride = 12 if schema_version == VLA_SCHEMA_VERSION_V5 else stride
     if history_stride is None:
         history_stride = stride
+    if schema_version == VLA_SCHEMA_VERSION_V5 and history_stride != 3:
+        raise ValueError("v5 history_stride 必须固定为 3")
+    if schema_version == VLA_SCHEMA_VERSION_V5 and macro_frames != MACRO_FRAMES:
+        raise ValueError(f"v5 macro_frames 必须固定为 {MACRO_FRAMES}")
     if anchor_stride < 1 or history_stride < 1 or macro_frames < 1 or action_delay_frames < 0:
         raise ValueError("stride/macro_frames 必须为正数")
     try:
@@ -380,7 +386,14 @@ def build(session: Path, output: Path, *, stride: int = 3,
     rows = []
     last_slow_ts = None
     last_slow_segment = None
-    for anchor in range((history - 1) * history_stride,
+    # v5 history is made of the same fixed six-frame macro actions that the
+    # executor stores.  The visual stride still controls only the image
+    # window; it must not change action-history semantics.
+    history_action_span = (history * MACRO_FRAMES
+                           if schema_version == VLA_SCHEMA_VERSION_V5 else 0)
+    first_anchor = max((history - 1) * history_stride,
+                       history_action_span - 1 if history_action_span else 0)
+    for anchor in range(first_anchor,
                         len(frames) - action_delay_frames - total_future, anchor_stride):
         history_frames = []
         for offset in range(history - 1, -1, -1):
@@ -405,11 +418,21 @@ def build(session: Path, output: Path, *, stride: int = 3,
         action_start_ts = int(_num(actions[action_start_frame].get("timestamp_ns"), field=f"action[{action_start_frame}].timestamp_ns"))
         action_end_ts = int(_num(actions[action_end_frame].get("timestamp_ns"), field=f"action[{action_end_frame}].timestamp_ns"))
         history_actions = []
-        for offset in range(history - 1, -1, -1):
-            idx = anchor - offset * history_stride
-            if idx in actions:
-                history_actions.append(_history_action(
-                    actions[idx], pixel_camera=schema_version == VLA_SCHEMA_VERSION_V5))
+        if schema_version == VLA_SCHEMA_VERSION_V5:
+            history_start = anchor - history_action_span + 1
+            for history_step in range(history):
+                first = history_start + history_step * MACRO_FRAMES
+                indices = list(range(first, first + MACRO_FRAMES))
+                history_action = _action(
+                    [actions[i] for i in indices], indices, pixel_camera=True)
+                history_action.pop("duration_frames", None)
+                history_actions.append(history_action)
+        else:
+            for offset in range(history - 1, -1, -1):
+                idx = anchor - offset * history_stride
+                if idx in actions:
+                    history_actions.append(_history_action(
+                        actions[idx], pixel_camera=False))
         record = {
             "schema_version": schema_version,
             "episode_id": session.name,

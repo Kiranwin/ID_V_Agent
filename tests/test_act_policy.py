@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from idv_agent.agent.action_executor import ActionExecutor
@@ -17,28 +18,61 @@ class _Adapter:
         return torch.ones(4) * float(image)
 
 
-def test_act_policy_cold_start_uses_travel_and_waits_for_three_frames():
+def test_act_policy_cold_start_uses_travel_and_waits_for_full_strided_window():
     core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
     policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
                        device="cpu", send=lambda _commands: None)
     assert int(policy.condition.intent_id[0]) == INTENTS.index("travel")
     assert torch.count_nonzero(policy.history_actions).item() == 0
-    assert policy.observe(1, frame_index=0, timestamp_ns=1) is False
-    assert policy.observe(1, frame_index=1, timestamp_ns=2) is False
+    for i in range(21):
+        assert policy.observe(1, frame_index=i, timestamp_ns=i + 1) is False
+    assert policy.observe(1, frame_index=21, timestamp_ns=22) is True
 
 
 def test_act_policy_alignment_controls_window_and_time_deltas():
     core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
     policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
-                       device="cpu", history_frames=8, use_time_deltas=False)
+                       device="cpu", history_frames=8, history_stride=3,
+                       use_time_deltas=False)
     assert policy.history_frames == 8
+    assert policy.history_stride == 3
     assert policy.use_time_deltas is False
-    for i in range(8):
-        policy.observe(1, frame_index=i, timestamp_ns=i + 1)
+    for i in range(22):
+        policy.observe(i, frame_index=i, timestamp_ns=i + 1)
     features, deltas, valid = policy._temporal_inputs()
     assert features.shape == (8, 4)
+    assert features[:, 0].tolist() == [0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0]
     assert deltas is None
     assert valid.shape == (8,)
+
+
+def test_act_policy_rejects_untrained_time_deltas():
+    core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
+    try:
+        ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
+                  device="cpu", use_time_deltas=True)
+    except ValueError as exc:
+        assert "time_deltas" in str(exc)
+    else:
+        raise AssertionError("v5 ACT must reject time_deltas until retrained")
+
+
+def test_act_policy_rejects_noncanonical_capture_fps():
+    core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
+    with pytest.raises(ValueError, match="capture_fps"):
+        ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
+                  device="cpu", capture_fps=20.0)
+
+
+def test_act_policy_emits_fixed_v5_duration():
+    core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
+    policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
+                       device="cpu")
+    for i in range(22):
+        policy.observe(1, frame_index=i, timestamp_ns=i + 1)
+    steps = policy._predict_chunk(None)
+
+    assert [step.duration_frames for step in steps] == [6, 6, 6, 6]
 
 
 def test_act_policy_zero_history_diagnostic_does_not_consume_executor_history():
@@ -53,7 +87,7 @@ def test_act_policy_logs_action_chunk_metadata(capsys):
     core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
     policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
                        device="cpu", send=lambda _commands: None)
-    for i in range(3):
+    for i in range(22):
         policy.observe(1, frame_index=i, timestamp_ns=i + 1)
     policy.tick(now=0.0)
     output = capsys.readouterr().out
@@ -74,7 +108,7 @@ def test_act_policy_uses_real_history_after_executor_starts_a_step():
     sent = []
     policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
                        device="cpu", send=lambda commands: sent.extend(commands))
-    for i in range(3):
+    for i in range(22):
         policy.observe(1, frame_index=i, timestamp_ns=i + 1)
     policy.tick(now=0.0)
     assert policy.history_actions.shape == (1, 72)

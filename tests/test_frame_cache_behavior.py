@@ -326,3 +326,16 @@ def test_encode_batch_uses_raw_cache_and_keeps_projection_gradient(tmp_path):
     assert adapter.frames == 0
     features.sum().backward()
     assert float(adapter.scale.grad) == 4.0
+
+
+def test_frame_feature_cache_window_supports_training_stride():
+    from idv_agent.model.temporal import FrameFeatureCache
+
+    cache = FrameFeatureCache(max_length=22)
+    for index in range(22):
+        cache.append(index, index + 1, torch.tensor([float(index)]))
+    features, timestamps, valid = cache.window(length=8, stride=3)
+
+    assert features[:, 0].tolist() == [0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0]
+    assert timestamps.tolist() == [1, 4, 7, 10, 13, 16, 19, 22]
+    assert valid.tolist() == [True] * 8

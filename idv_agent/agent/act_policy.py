@@ -13,7 +13,7 @@ from idv_agent.agent.act_action_executor import ACTActionChunkExecutor
 from idv_agent.agent.act_scheduler import ACTChunkScheduler
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA, SlowCondition
 from idv_agent.model.temporal import FrameFeatureCache, TaskConditionCache
-from idv_agent.vla.action_chunk import BUTTON_NAMES, CAMERA_BUCKETS, INTENTS, MOVE_DIRECTIONS
+from idv_agent.vla.action_chunk import BUTTON_NAMES, CAMERA_BUCKETS, INTENTS, MACRO_FRAMES, MOVE_DIRECTIONS
 from idv_agent.configs.game_mode import GAME_MODE_CHOICES
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
 
@@ -39,15 +39,21 @@ class ACTPolicy:
                  mode: str = "standard", device: torch.device | str = "cpu",
                  send: Callable[[Iterable[Any]], None] | None = None,
                  capture_fps: float = 30.0, fast_hz: float = 15.0,
-                 slow_hz: float = 1.0, history_frames: int = 3,
+                 slow_hz: float = 1.0, history_frames: int = 8, history_stride: int = 3,
                  max_feature_age_s: float = 0.5,
                  use_time_deltas: bool = False, zero_history: bool = False):
         if mode not in GAME_MODE_CHOICES:
             raise ValueError(f"未知模式: {mode}")
         if not instruction.strip():
             raise ValueError("instruction 不能为空")
-        if history_frames < 3:
-            raise ValueError("history_frames 必须至少为 3")
+        if history_frames != 8:
+            raise ValueError("当前 v5 ACT 必须使用 history_frames=8")
+        if history_stride != 3:
+            raise ValueError("当前 v5 ACT 必须使用 history_stride=3")
+        if float(capture_fps) != 30.0:
+            raise ValueError("当前 v5 ACT 必须使用 capture_fps=30 以保持 duration_frames 的时间语义")
+        if use_time_deltas:
+            raise ValueError("当前 v5 ACT 未训练 time_deltas，必须保持关闭")
         self.adapter = adapter
         self.core = core
         self.device = torch.device(device)
@@ -55,13 +61,13 @@ class ACTPolicy:
         self.mode_id = GAME_MODE_CHOICES.index(mode)
         self.instruction = instruction
         self.history_frames = int(history_frames)
-        if self.history_frames > 8:
-            raise ValueError("history_frames 不能超过 8")
+        self.history_stride = int(history_stride)
         self.use_time_deltas = bool(use_time_deltas)
         self.zero_history = bool(zero_history)
         self.task_cache: TaskConditionCache = adapter.encode_task_once(
             instruction, mode, task_id=f"act:{id(self)}")
-        self.features = FrameFeatureCache(max_length=max(8, self.history_frames))
+        self.window_span = (self.history_frames - 1) * self.history_stride + 1
+        self.features = FrameFeatureCache(max_length=self.window_span)
         # ACT cold start is travel/observe, unlike the generic model default.
         self.condition = core.initial_condition(1, device=self.device,
                                                 mode_id=self.mode_id,
@@ -98,7 +104,7 @@ class ACTPolicy:
 
     @property
     def ready(self) -> bool:
-        return len(self.features) >= self.history_frames
+        return len(self.features) >= self.window_span
 
     def observe(self, image: Any, *, frame_index: int, timestamp_ns: int) -> bool:
         """Encode and cache one frame; return whether the history is warm."""
@@ -136,7 +142,9 @@ class ACTPolicy:
         dxs = fast.camera_dx_logits.argmax(-1)[0].tolist()
         dys = fast.camera_dy_logits.argmax(-1)[0].tolist()
         buttons = (fast.button_logits.sigmoid() >= 0.5)[0]
-        durations = fast.duration[0].round().clamp(1, 30).to(torch.int64).tolist()
+        # v5 labels and executor history are fixed six-frame macro actions.
+        # Do not expose the untrained variable-duration head to deployment.
+        durations = [MACRO_FRAMES] * len(moves)
         steps = [ACTActionStep(int(move), CAMERA_BUCKETS[int(dxs[i])], CAMERA_BUCKETS[int(dys[i])],
                                tuple(int(v) for v in buttons[i].tolist()), int(durations[i]))
                  for i, move in enumerate(moves)]
@@ -158,10 +166,11 @@ class ACTPolicy:
         return steps
 
     def _temporal_inputs(self):
-        values, timestamps, valid = self.features.window(self.history_frames)
+        values, timestamps, valid = self.features.window(self.history_frames, self.history_stride)
         deltas = None
-        if self.use_time_deltas:
-            deltas = (timestamps - timestamps[-1]).to(values.dtype) / 1_000_000_000.0
+        # v5 was trained with the temporal encoder's zero-delta default.
+        # Keep this explicit so future protocol changes cannot silently alter
+        # the deployed input distribution.
         return values, deltas, valid
 
     def tick(self, *, now: float | None = None) -> bool:

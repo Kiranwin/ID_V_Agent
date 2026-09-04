@@ -90,16 +90,23 @@ class FrameFeatureCache:
         with self._lock:
             return len(self._items)
 
-    def window(self, length: int = 8) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the newest ``length`` items as features, timestamps, mask.
+    def window(self, length: int = 8, stride: int = 1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return newest items sampled every ``stride`` frames.
 
         Short windows are returned short (3..8 is valid by the VLA v4
         contract); callers that batch variable lengths can pad using the mask.
+        The newest item is always included.  A stride of 3 and length 8
+        therefore needs 22 cached frames and returns indices ``[-21,-18,...,0]``
+        relative to the newest item, matching the v5 data builder.
         """
         if length < 1:
             raise ValueError("length 必须为正数")
+        if stride < 1:
+            raise ValueError("stride 必须为正数")
         with self._lock:
-            items = list(self._items)[-int(length):]
+            all_items = list(self._items)
+            items = list(reversed(all_items))[::int(stride)][:int(length)]
+            items.reverse()
         if not items:
             raise RuntimeError("FrameFeatureCache 为空")
         shape = items[0].feature.shape

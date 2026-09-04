@@ -10,10 +10,9 @@ def _step(move=0, dx=0, dy=0, buttons=(0, 0, 0, 0, 0, 0), duration=2):
 def test_chunk_executor_repeats_step_for_duration_and_releases_on_end():
     calls = []
     executor = ACTActionChunkExecutor(send=lambda cmds: calls.extend(cmds), dry_run=True)
-    executor.submit([_step(move=1, duration=2), _step(duration=1)])
-    executor.tick()
-    executor.tick()
-    executor.tick()
+    executor.submit([_step(move=1, duration=6), _step(duration=6)])
+    for _ in range(7):
+        executor.tick()
     executor.shutdown()
     assert any(getattr(c, "kind", None) == "press" and c.code == "key:w" for c in calls)
     assert sum(getattr(c, "kind", None) == "release" for c in calls) >= 1
@@ -26,6 +25,23 @@ def test_chunk_executor_rejects_invalid_duration():
     except ValueError:
         return
     raise AssertionError("duration=0 must be rejected")
+
+
+def test_chunk_executor_rejects_non_v5_duration_and_fps():
+    try:
+        ACTActionChunkExecutor(send=lambda _: None, capture_fps=20)
+    except ValueError as exc:
+        assert "capture_fps" in str(exc)
+    else:
+        raise AssertionError("v5 executor must use capture_fps=30")
+
+    executor = ACTActionChunkExecutor(send=lambda _: None)
+    try:
+        executor.submit([_step(duration=5)])
+    except ValueError as exc:
+        assert "duration_frames" in str(exc)
+    else:
+        raise AssertionError("v5 executor must use duration_frames=6")
 
 
 def test_chunk_executor_holds_step_across_fast_ticks():
@@ -61,7 +77,7 @@ def test_scheduler_keeps_latest_prediction_until_active_chunk_finishes():
     executor = ACTActionChunkExecutor(send=lambda cmds: calls.extend(cmds), capture_fps=30, tick_hz=15)
     requested = []
     scheduler = ACTChunkScheduler(
-        predict=lambda payload: requested.append(payload) or [_step(move=len(requested), duration=1)],
+        predict=lambda payload: requested.append(payload) or [_step(move=len(requested), duration=6)],
         executor=executor, fast_hz=15, max_feature_age_s=1.0,
     )
     scheduler.update_feature("f", timestamp=0.0)
@@ -70,7 +86,7 @@ def test_scheduler_keeps_latest_prediction_until_active_chunk_finishes():
     scheduler.tick(now=0.067)  # prediction is refreshed, but block is active
     assert requested == ["f", "g"]
     assert executor.active
-    scheduler.tick(now=0.134)  # active block completes; latest block is used
+    scheduler.tick(now=0.201)  # active block completes; latest block is used
     assert executor.active
     assert len(requested) == 3
 
