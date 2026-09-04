@@ -135,7 +135,7 @@ class SharedFastSlowVLA(nn.Module):
         self.fast_head = FastVLAHead(temporal_dim, history_action_dim=history_action_dim)
         self.visual_expert = VisualActionExpert(frame_feature_dim, temporal_dim)
         self.prior_scale = 0.1
-        self.camera_prior_scale = 0.1
+        self.camera_prior_scale = 0.5
         # ACT deployment consumes the directly supervised visual branch.  The
         # temporal/history branch remains exposed for diagnostics, but does
         # not form a second copy of the deployed logits.
