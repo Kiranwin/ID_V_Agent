@@ -12,6 +12,7 @@ import torch
 from idv_agent.model.spatial_grid_feature import (
     _spans,
     grid_spatial_pool,
+    grid_spatial_pool_batch,
     per_image_rows_and_geo,
 )
 
@@ -39,6 +40,20 @@ def test_grid_spatial_pool_value_math():
     assert out[1, 0].item() == pytest.approx(4.5)   # cols2..4           → {2,3,6,7}
     assert out[2, 0].item() == pytest.approx(10.5)  # rows2..4,cols0..2  → {8,9,12,13}
     assert out[3, 0].item() == pytest.approx(12.5)  # → {10,11,14,15}
+
+
+def test_grid_spatial_pool_batch_matches_per_image_pooling_exactly():
+    """Same-geometry batch pooling must preserve the existing cell values."""
+    batch = torch.arange(3 * 5 * 7 * 2, dtype=torch.float32).reshape(3, 5, 7, 2)
+    expected = torch.stack([
+        grid_spatial_pool(image.reshape(-1, 2), 35, 5, 7, 3)
+        for image in batch
+    ])
+
+    actual = grid_spatial_pool_batch(batch, k=3)
+
+    assert actual.shape == (3, 9, 2)
+    assert torch.equal(actual, expected)
 
 
 def test_grid_spatial_pool_rows_mismatch_raises():

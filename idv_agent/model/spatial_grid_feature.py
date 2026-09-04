@@ -89,6 +89,18 @@ def grid_spatial_pool(tokens: torch.Tensor, rows: int, gh: int, gw: int,
     return torch.stack(cells, dim=0)          # [k*k, D]
 
 
+def grid_spatial_pool_batch(grids: torch.Tensor, k: int) -> torch.Tensor:
+    """Pool a same-geometry image batch ``[N,H,W,D]`` into ``[N,k*k,D]``."""
+    if grids.ndim != 4:
+        raise ValueError("batch grids 必须是 [N,H,W,D]")
+    _, gh, gw, _ = grids.shape
+    cells = []
+    for (h0, h1) in _spans(gh, k):
+        for (w0, w1) in _spans(gw, k):
+            cells.append(grids[:, h0:h1, w0:w1].mean(dim=(1, 2)))
+    return torch.stack(cells, dim=1)
+
+
 def _spans(length: int, k: int) -> list[tuple[int, int]]:
     """把 [0,length) 切成 k 段（整除边界，余量给前段）。"""
     if k <= 0:
@@ -201,6 +213,11 @@ class SpatialGridEncoder(nn.Module):
 
     def _from_flattened(self, tok, grids, dev):
         rows_per, geo = per_image_rows_and_geo(grids, self.merge_size, tok.shape[0])
+        if len(set(rows_per)) == 1 and len(set(geo)) == 1:
+            gh, gw = geo[0]
+            return grid_spatial_pool_batch(
+                tok.reshape(len(rows_per), gh, gw, tok.shape[-1]), self.k
+            ).to(dev)
         outs = []
         s = 0
         for rows, (gh, gw) in zip(rows_per, geo):
