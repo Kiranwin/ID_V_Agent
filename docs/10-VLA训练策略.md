@@ -67,7 +67,7 @@ YOLO 框可作为标注工具和辅助字段，但模型推理不能强依赖 YO
 
 ### 阶段 ACT · VLA 动作块监督
 
-ACT 必须加载 VG 阶段输出的 `M2_VG`，继承 `lora_wk` 与 VG 语义能力；第一轮冻结 Qwen 主干和两阶段 LoRA，只训练 `slow_temporal`/`fast_temporal`（分离时序编码器，见 [18-架构变更历史.md](18-架构变更历史.md)）、FiLM、Slow Head 和 Fast Head。完整继承链见 [17-三阶段训练继承协议.md](17-三阶段训练继承协议.md)。
+ACT 长期协议应加载 VG 阶段输出的 `M2_VG`；但现行临时协议因 M2_VG 已知问题从基础 Qwen 初始化，禁止加载 M2，并将 `initialization=base_without_m2` 写入 manifest。训练仍只优化 `slow_temporal`/`fast_temporal`、FiLM、Slow Head 和 Fast Head。完整协议见 [17-三阶段训练继承协议.md](17-三阶段训练继承协议.md)。
 
 在继承后的模型上训练因果动作块：
 

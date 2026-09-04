@@ -130,6 +130,16 @@ def test_encode_batch_applies_one_augmentation_draw_to_one_history_window(tmp_pa
     assert seen == [params, params, params]
 
 
+def test_encode_batch_rejects_persistent_feature_cache_when_augmenting(tmp_path):
+    from idv_agent.scripts.train_vla import encode_batch
+
+    path = tmp_path / "frame.png"
+    Image.new("RGB", (1, 1), (1, 0, 0)).save(path)
+    with pytest.raises(ValueError, match="frame_cache"):
+        encode_batch(_Adapter(), _batch(path, ["same"]), device=torch.device("cpu"),
+                     frame_cache={}, augment_images=True)
+
+
 def test_qwen_batch_singleton_keeps_batch_dimension():
     from types import SimpleNamespace
     from idv_agent.model.qwen_backbone_adapter import Qwen3VLBackboneAdapter

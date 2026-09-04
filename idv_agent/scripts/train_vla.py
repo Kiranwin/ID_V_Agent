@@ -9,6 +9,7 @@ short 20--100 step smoke run on the real session data.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 import random
@@ -19,14 +20,17 @@ from typing import Any, Callable
 
 import torch
 from PIL import Image
-from PIL import ImageEnhance
 from torch.utils.data import DataLoader, Subset
 
 from idv_agent.model.fast_slow_vla import FastSlowVLAOutput, SharedFastSlowVLA
-from idv_agent.model.qwen_backbone_adapter import Qwen3VLBackboneAdapter, load_qwen3vl_backbone
-from idv_agent.training.checkpoint_manifest import build_manifest, load_manifest, sha256_file, write_manifest
+from idv_agent.model.qwen_backbone_adapter import load_qwen3vl_backbone
+from idv_agent.training.checkpoint_manifest import build_manifest, write_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
-from idv_agent.training.vla_loss import compute_vla_loss
+from idv_agent.training.image_augmentation import (
+    apply_window_augmentation as _augment_image,
+    sample_window_augmentation as _sample_image_augmentation_params,
+)
+from idv_agent.training.vla_loss import VLALossWeights, balanced_class_weights, compute_vla_loss
 from idv_agent.training.utils import set_seed
 from idv_agent.configs.subgoal import SUBGOAL_NAMES
 from idv_agent.vla.action_chunk import INTENTS, VLA_SCHEMA_VERSION_V5
@@ -45,69 +49,12 @@ def _device_dtype(device: torch.device) -> tuple[torch.dtype, bool]:
     return (torch.float16 if use_amp else torch.float32), use_amp
 
 
-def _load_act_backbone(model_path: str | Path, init_checkpoint: str | Path,
-                       *, dtype: torch.dtype, device: torch.device):
-    """Load M2_VG's M1_WK parent and reuse its trained visual projection."""
-    from peft import PeftModel
-    from transformers import AutoModelForImageTextToText, AutoProcessor
-
-    init_dir = Path(init_checkpoint)
-    parent_manifest = load_manifest(init_dir / "manifest.json", require_artifacts=True)
-    if parent_manifest["stage"] != "M2_VG":
-        raise ValueError(f"ACT 初始化必须使用 M2_VG，收到 {parent_manifest['stage']}")
-    base = str(model_path or parent_manifest["base_model"])
-    processor = AutoProcessor.from_pretrained(base)
-    base_model = AutoModelForImageTextToText.from_pretrained(base, dtype=dtype, device_map=None).to(device)
-    # M2_VG itself keeps lora_wk in its parent M1_WK checkpoint.
-    parent_path = Path(parent_manifest["parent"])
-    if not parent_path.is_absolute():
-        parent_path = init_dir / parent_path
-    wk_manifest = load_manifest(parent_path / "manifest.json", require_artifacts=True)
-    model = PeftModel.from_pretrained(
-        base_model, str(parent_path / wk_manifest["artifacts"]["adapter"]), is_trainable=False,
-    ).to(device)
-    adapter = Qwen3VLBackboneAdapter(model, processor=processor).to(device)
-    projection_path = init_dir / parent_manifest["artifacts"]["grounding_head"]
-    saved = torch.load(projection_path, map_location="cpu", weights_only=False)
-    if "visual_projection" not in saved:
-        raise ValueError(f"M2_VG grounding checkpoint 缺少 visual_projection: {projection_path}")
-    adapter.visual_projection.load_state_dict(saved["visual_projection"])
-    # 阶段二：若父 checkpoint 是 k×k 空间 (M2_VG_spatial)，则把同 checkpoint 训出
-    # 的可训 spatial_agg 一并载入并开启 spatial 编码通道；旧 M2_VG(mean) 保持现役。
-    if "spatial_agg" in saved:
-        sp_k = int(parent_manifest.get("training", {}).get("spatial_k", 8))
-        agg_state = saved["spatial_agg"]
-        agg_dim = int(agg_state["position"].shape[-1])
-        adapter.enable_spatial_agg(k=sp_k, state=agg_state, dim=agg_dim)
-        print(f"[_load_act_backbone] 已启用 spatial k={sp_k} (从 {init_dir.name} 载入 aggregate)", flush=True)
-    return adapter, processor, parent_manifest
-
-
-def _sample_image_augmentation_params() -> tuple[float, float, float, float, int, int]:
-    """Sample one photometric/translation transform for one history window."""
-    return (random.uniform(-0.05, 0.05), random.uniform(0.8, 1.2),
-            random.uniform(0.8, 1.2), random.uniform(0.8, 1.2),
-            random.randint(-8, 8), random.randint(-8, 8))
-
-
-def _augment_image(image: Image.Image, params: tuple[float, float, float, float, int, int]) -> Image.Image:
-    """Apply label-preserving training augmentation to one RGB image."""
-    hue, saturation, brightness, contrast, tx, ty = params
-    # PIL's Color enhancer changes saturation; hue is implemented in HSV so
-    # the perturbation remains bounded and does not alter geometry.
-    hsv = image.convert("HSV")
-    h, s, v = hsv.split()
-    h = h.point(lambda value: int((value + hue * 255.0) % 256))
-    image = Image.merge("HSV", (h, s, v)).convert("RGB")
-    image = ImageEnhance.Color(image).enhance(saturation)
-    image = ImageEnhance.Brightness(image).enhance(brightness)
-    image = ImageEnhance.Contrast(image).enhance(contrast)
-    if tx or ty:
-        image = image.transform(image.size, Image.Transform.AFFINE,
-                                (1, 0, -tx, 0, 1, -ty),
-                                resample=Image.Resampling.BILINEAR,
-                                fillcolor=(0, 0, 0))
-    return image
+def _load_act_base_backbone(model_path: str | Path, *, dtype: torch.dtype,
+                            device: torch.device | str):
+    """Load the ACT base backbone without the known-bad M2 projection/LoRA."""
+    adapter, processor = load_qwen3vl_backbone(
+        model_path, dtype=dtype, device_map=None, apply_lora=False)
+    return adapter.to(device), processor
 
 
 def _load_images(paths: list[Path | None], *, augmentation_params=None,
@@ -277,6 +224,8 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
     """
     if vision_micro_batch_size < 1:
         raise ValueError("vision_micro_batch_size 必须为正数")
+    if augment_images and frame_cache is not None:
+        raise ValueError("augment_images 与 frame_cache 不兼容；持久特征缓存不能保存随机增强结果")
     if augment_images and raw_feature_cache is not None:
         raise ValueError("augment_images 与 raw_feature_cache 不兼容；增强必须在原始图像上执行")
     features = []
@@ -537,12 +486,51 @@ def _mask_comparison(losses, adapter, core, batch, device, amp_enabled):
             "mask1_slow": float((o["slow_intent"] + o["slow_subgoal"]).detach().cpu())}
 
 
+def _class_balance_statistics(dataset) -> dict[str, torch.Tensor]:
+    """Count exactly the train-subset labels consumed by each weighted head."""
+    counts = {
+        "move": torch.zeros(9, dtype=torch.float32),
+        "camera_dx": torch.zeros(5, dtype=torch.float32),
+        "camera_dy": torch.zeros(5, dtype=torch.float32),
+        "intent": torch.zeros(len(INTENTS), dtype=torch.float32),
+    }
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        counts["move"] += torch.bincount(sample["move_target"].reshape(-1), minlength=9).to(torch.float32)
+        counts["camera_dx"] += torch.bincount(sample["camera_dx_target"].reshape(-1), minlength=5).to(torch.float32)
+        counts["camera_dy"] += torch.bincount(sample["camera_dy_target"].reshape(-1), minlength=5).to(torch.float32)
+        if int(sample["slow_loss_mask"]) and int(sample["intent_target"]) >= 0:
+            counts["intent"][int(sample["intent_target"])] += 1
+    return counts
+
+
+def _class_balance_manifest(statistics: dict[str, torch.Tensor], *, data_paths: list[str],
+                            sample_count: int | None = None, sampling: str | None = None,
+                            max_samples: int | None = None) -> dict[str, object]:
+    """Make the exact balance table and its source reproducible in a checkpoint."""
+    return {
+        "method": "inverse_sqrt_clamped_mean1",
+        "clamp": [0.35, 3.0],
+        "normalized_per_head": True,
+        "computed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": {"schema": VLA_SCHEMA_VERSION_V5,
+                   "paths": [str(Path(path).resolve()) for path in data_paths],
+                   "sample_count": sample_count,
+                   "sampling": sampling,
+                   "max_samples": max_samples},
+        "heads": {
+            name: {"counts": values.tolist(), "weights": balanced_class_weights(values).tolist()}
+            for name, values in statistics.items()
+        },
+    }
+
+
 def train(args: argparse.Namespace) -> dict[str, Any]:
     set_seed(int(getattr(args, "seed", 0)))
     device = torch.device(args.device)
     dtype, amp_enabled = _device_dtype(device)
-    if not args.init_checkpoint and not args.allow_base_init:
-        raise ValueError("ACT 训练必须提供 --init-checkpoint M2_VG；仅兼容测试可加 --allow-base-init")
+    if args.init_checkpoint:
+        raise ValueError("M2_VG 初始化当前已禁用；请不要传 --init-checkpoint")
     dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
     sampling = getattr(args, "sampling", "uniform")
     if sampling not in ("uniform", "stratified"):
@@ -556,10 +544,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     vision_micro_batch_size = max(1, int(getattr(args, "vision_micro_batch_size", 8)))
     _ablate_frame = bool(getattr(args, "ablate_frame_avg", False))
     _no_history = bool(getattr(args, "no_history", False))
+    image_augmentation = bool(getattr(args, "image_augmentation", True))
     raw_feature_cache = None
     if getattr(args, "raw_feature_cache", ""):
         from idv_agent.training.raw_feature_cache import RawFeatureCache
         raw_feature_cache = RawFeatureCache(args.raw_feature_cache, spatial_k=8)
+    if image_augmentation and raw_feature_cache is not None:
+        raise ValueError("--image-augmentation 与 --raw-feature-cache 不兼容；请关闭其中之一")
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                         collate_fn=VLASequenceCollator(max_frames=8))
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
@@ -573,16 +564,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                              collate_fn=VLASequenceCollator(max_frames=8))
                   if val_dataset is not None else None)
 
-    if args.init_checkpoint:
-        adapter, _, parent_manifest = _load_act_backbone(
-            args.model_path, args.init_checkpoint, dtype=dtype, device=device)
-    elif args.allow_base_init:
-        adapter, _ = load_qwen3vl_backbone(args.model_path, dtype=dtype, device_map=args.device,
-                                           apply_lora=False)
-        adapter.to(device=device)
-        parent_manifest = None
-    else:
-        raise ValueError("ACT 训练必须提供 --init-checkpoint M2_VG；仅兼容测试可加 --allow-base-init")
+    # M2_VG has known grounding defects; ACT currently starts from the base
+    # backbone without loading its projection/adapter weights.
+    adapter, _ = load_qwen3vl_backbone(args.model_path, dtype=dtype, device_map=args.device,
+                                       apply_lora=False)
+    adapter.to(device=device)
+    parent_manifest = None
     _freeze_qwen(adapter)
     if raw_feature_cache is not None and getattr(adapter, "spatial_k", None) is not None:
         expected = f"spatial_grid_k{int(adapter.spatial_k)}_v1"
@@ -594,13 +581,20 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         getattr(adapter, name).to(device=device, dtype=torch.float32)
     core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
-    from idv_agent.training.vla_loss import VLALossWeights
     global_counts = None
+    class_balance_statistics = None
+    class_balance_manifest = None
     button_global_counts = None
     if args.move_direction_balance:
         global_counts = torch.zeros(9, dtype=torch.float32)
         for index in range(len(dataset)):
             global_counts += torch.bincount(dataset[index]["move_target"], minlength=9).to(torch.float32)
+    if getattr(args, "class_balance", True):
+        class_balance_statistics = _class_balance_statistics(dataset)
+        class_balance_manifest = _class_balance_manifest(
+            class_balance_statistics, data_paths=_dataset_paths(args.data),
+            sample_count=len(dataset), sampling=sampling,
+            max_samples=int(getattr(args, "max_samples", 0) or 0))
     if getattr(args, "button_global_balance", False):
         button_global_counts = torch.zeros((6, 2), dtype=torch.float32)
         for index in range(len(dataset)):
@@ -610,7 +604,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     loss_weights = VLALossWeights(move_stop_weight=args.move_stop_weight,
                                    button_positive_weight=args.button_positive_weight,
                                    move_direction_balance=args.move_direction_balance,
-                                   move_global_counts=global_counts,
+                                   move_global_counts=(class_balance_statistics["move"]
+                                                        if class_balance_statistics else global_counts),
+                                   class_balance=bool(getattr(args, "class_balance", True)),
+                                   camera_dx_global_counts=(class_balance_statistics["camera_dx"]
+                                                            if class_balance_statistics else None),
+                                   camera_dy_global_counts=(class_balance_statistics["camera_dy"]
+                                                            if class_balance_statistics else None),
+                                   intent_global_counts=(class_balance_statistics["intent"]
+                                                         if class_balance_statistics else None),
                                    button_global_counts=button_global_counts)
 
     # Materialize LazyLinear before constructing the optimizer/checkpoint.
@@ -631,7 +633,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                       loss_weights=loss_weights,
                                       teacher_forcing_ratio=_teacher_forcing_ratio(args, 0),
                                       ablate_frame_avg=_ablate_frame, no_history=_no_history,
-                                      augment_images=True)
+                                      augment_images=image_augmentation)
     baseline = float(baseline_losses["total"].detach().cpu())
     history: list[float] = []
     component_history: list[dict[str, float]] = []
@@ -653,7 +655,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                       loss_weights=loss_weights,
                                       teacher_forcing_ratio=_teacher_forcing_ratio(args, step - 1),
                                       ablate_frame_avg=_ablate_frame, no_history=_no_history,
-                                      augment_images=True)
+                                      augment_images=image_augmentation)
         total = losses["total"]
         if not torch.isfinite(total):
             raise FloatingPointError(f"step {step}: loss 非有限值")
@@ -724,9 +726,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     after, _ = forward_loss(adapter, core, first_batch, device=device, amp_enabled=False)
     elapsed = time.perf_counter() - started
     manifest = build_manifest(
-        stage="M3_ACT", parent=str(Path(args.init_checkpoint).resolve()) if args.init_checkpoint else None,
-        base_model=args.model_path, adapters=["lora_wk", "visual_projection", "spatial_agg", "act_heads"],
-        frozen=["qwen_vision_tower", "lora_wk"],
+        stage="M3_ACT", parent=None,
+        base_model=args.model_path, adapters=["visual_projection", "spatial_agg", "act_heads"],
+        frozen=["qwen_language_vision_backbone"],
         trainable=["visual_projection", "condition_projection", "spatial_agg",
                    "shared_temporal_encoder", "slow_head", "fast_head"],
         data={"act": str(Path(args.data)).replace("\\", "/"), "act_glob": VLA_SCHEMA_VERSION_V5},
@@ -739,6 +741,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "seed": int(getattr(args, "seed", 0)), "move_stop_weight": args.move_stop_weight,
                   "button_positive_weight": args.button_positive_weight,
                   "move_direction_balance": args.move_direction_balance,
+                  "class_balance": class_balance_manifest,
+                  "image_augmentation": image_augmentation,
                   "global_move_counts": global_counts.tolist() if global_counts is not None else None,
                   "global_button_counts": button_global_counts.tolist() if button_global_counts is not None else None,
                   "teacher_forcing_start": args.teacher_forcing_start,
@@ -746,7 +750,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "teacher_forcing_decay_steps": args.teacher_forcing_decay_steps},
         schema_versions=[VLA_SCHEMA_VERSION_V5],
         artifacts={"act_checkpoint": str(checkpoint.name)},
-        extra={"parent_stage": parent_manifest["stage"] if parent_manifest else None,
+        extra={"initialization": "base_without_m2", "parent_stage": None,
                "val_data": [str(Path(path)).replace("\\", "/") for path in val_paths]},
     )
     manifest_path = checkpoint.parent / "manifest.json"
@@ -755,6 +759,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     # human-readable sidecar.  This prevents later experiments in the same
     # directory from making a checkpoint's provenance ambiguous.
     torch.save({**saved, "manifest": manifest}, checkpoint)
+    val_result = (_evaluate(adapter, core, val_loader, device, amp_enabled,
+                            raw_feature_cache=raw_feature_cache)
+                  if val_loader is not None else None)
+    baseline_result = None
+    baseline_path = str(getattr(args, "acceptance_baseline", "") or "")
+    if baseline_path:
+        baseline_result = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
+    acceptance = _balance_acceptance(val_result or {}, baseline_result)
+    if getattr(args, "require_acceptance", False) and acceptance["status"] != "pass":
+        raise ValueError(f"类别平衡验收未通过: {json.dumps(acceptance, ensure_ascii=False)}")
     result = {"samples": len(dataset), "val_samples": len(val_dataset) if val_dataset is not None else 0,
             "steps": args.steps, "baseline_loss": baseline,
             "final_loss": history[-1] if history else baseline,
@@ -765,9 +779,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "checkpoint_manifest_embedded": True,
             "slow_accuracy": _slow_accuracy(adapter, core, eval_loader, device, amp_enabled,
                                              raw_feature_cache=raw_feature_cache),
-            "val": (_evaluate(adapter, core, val_loader, device, amp_enabled,
-                              raw_feature_cache=raw_feature_cache)
-                    if val_loader is not None else None)}
+            "val": val_result, "class_balance_acceptance": acceptance}
     (checkpoint.parent / "metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return result
@@ -802,6 +814,69 @@ def _slow_accuracy(adapter, core, loader, device, amp_enabled, *, max_samples: i
     return (float(correct / total) if total else None)
 
 
+def _classification_metrics(confusion: list[list[int]], *, zero_class: int | None = None) -> dict[str, object]:
+    """Return target-oriented recall and explicit no-turn false-action rate."""
+    recalls = []
+    for target, row in enumerate(confusion):
+        total = sum(row)
+        recalls.append((row[target] / total) if total else None)
+    result: dict[str, object] = {"confusion": confusion, "recall": recalls}
+    if zero_class is not None:
+        zero_total = sum(confusion[zero_class])
+        result["zero_false_turn_rate"] = (
+            (zero_total - confusion[zero_class][zero_class]) / zero_total if zero_total else None
+        )
+    return result
+
+
+def _balance_acceptance(current: dict[str, Any], baseline: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Compare held-out class recalls without confusing observability with proof.
+
+    A checkpoint only gets a pass when a supplied baseline proves the rare
+    classes improved by at least five points while majority recalls decline by
+    at most five points.  The no-turn false-action limit applies regardless.
+    """
+    rule = {"rare_recall_delta_min": 0.05, "majority_recall_drop_max": 0.05,
+            "zero_false_turn_rate_max": 0.15}
+    classification = current.get("classification", {})
+    zero_rates = [classification.get(head, {}).get("zero_false_turn_rate")
+                  for head in ("camera_dx", "camera_dy")]
+    zero_failures = [head for head, value in zip(("camera_dx", "camera_dy"), zero_rates)
+                     if value is None or float(value) > rule["zero_false_turn_rate_max"]]
+    if baseline is None:
+        return {"status": "not_comparable", "rule": rule, "zero_bucket_failures": zero_failures,
+                "reason": "没有 --acceptance-baseline，不能声明稀有类 recall 显著提升"}
+    baseline_classification = baseline.get("classification", {})
+    if not baseline_classification and isinstance(baseline.get("val"), dict):
+        baseline_classification = baseline["val"].get("classification", {})
+    groups = {
+        "rare": (("camera_dx", (0, 1, 3, 4)), ("camera_dy", (0, 1, 3, 4)),
+                 ("intent", (INTENTS.index("decipher"),))),
+        "majority": (("move", (0,)), ("camera_dx", (2,)), ("camera_dy", (2,)), ("intent", (4,))),
+    }
+    comparisons: dict[str, list[dict[str, Any]]] = {name: [] for name in groups}
+    failures = list(zero_failures)
+    for group, specs in groups.items():
+        for head, indices in specs:
+            now_values = classification.get(head, {}).get("recall", [])
+            old_values = baseline_classification.get(head, {}).get("recall", [])
+            for index in indices:
+                now = now_values[index] if index < len(now_values) else None
+                old = old_values[index] if index < len(old_values) else None
+                delta = (float(now) - float(old)) if now is not None and old is not None else None
+                passed = (delta is not None and
+                          (delta >= rule["rare_recall_delta_min"] if group == "rare"
+                           else delta >= -rule["majority_recall_drop_max"]))
+                entry = {"head": head, "class_index": index, "baseline": old,
+                         "current": now, "delta": delta, "pass": passed}
+                comparisons[group].append(entry)
+                if not passed:
+                    failures.append(f"{head}[{index}]")
+    return {"status": "pass" if not failures else "fail", "rule": rule,
+            "zero_bucket_failures": zero_failures, "comparisons": comparisons,
+            "failures": failures}
+
+
 def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: Any | None = None):
     """Evaluate a bounded validation loader without updating model parameters."""
     if loader is None:
@@ -813,6 +888,10 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
     move_target = [0] * 9
     intent_pred = [0] * 8
     intent_target = [0] * 8
+    move_confusion = [[0] * 9 for _ in range(9)]
+    camera_dx_confusion = [[0] * 5 for _ in range(5)]
+    camera_dy_confusion = [[0] * 5 for _ in range(5)]
+    intent_confusion = [[0] * 8 for _ in range(8)]
     button_pred = [0] * 6
     button_target = [0] * 6
     non_stop_pred = 0
@@ -841,6 +920,9 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
                 move_target[int(value)] += 1
             target_tensor = batch["move_target"].to(output_device)[mask]
             pred_tensor = output.fast.move_logits.argmax(-1)[mask]
+            for target, prediction in zip(target_tensor.detach().cpu().reshape(-1).tolist(),
+                                          pred_tensor.detach().cpu().reshape(-1).tolist()):
+                move_confusion[int(target)][int(prediction)] += 1
             non_stop = target_tensor != 0
             non_stop_total += int(non_stop.sum())
             non_stop_pred += int(((pred_tensor != 0) & non_stop).sum())
@@ -850,12 +932,25 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
             for i in range(button_pred_tensor.shape[-1]):
                 button_pred[i] += int(button_pred_tensor[..., i].sum())
                 button_target[i] += int((button_targets[..., i] > 0).sum())
+            for logits, target_key, confusion in (
+                (getattr(output.fast, "camera_dx_logits", None), "camera_dx_target", camera_dx_confusion),
+                (getattr(output.fast, "camera_dy_logits", None), "camera_dy_target", camera_dy_confusion),
+            ):
+                if logits is not None and target_key in batch:
+                    predictions = logits.argmax(-1)[mask].detach().cpu().reshape(-1).tolist()
+                    targets = batch[target_key].to(output_device)[mask].detach().cpu().reshape(-1).tolist()
+                    for target, prediction in zip(targets, predictions):
+                        confusion[int(target)][int(prediction)] += 1
             if output.slow is not None:
                 valid = (batch["intent_target"].to(output_device) >= 0)
-                for value in output.slow.intent_logits.argmax(-1)[valid].detach().cpu().tolist():
+                slow_predictions = output.slow.intent_logits.argmax(-1)[valid].detach().cpu().tolist()
+                slow_targets = batch["intent_target"].to(output_device)[valid].detach().cpu().tolist()
+                for value in slow_predictions:
                     intent_pred[int(value)] += 1
-                for value in batch["intent_target"].to(output_device)[valid].detach().cpu().tolist():
+                for value in slow_targets:
                     intent_target[int(value)] += 1
+                for target, prediction in zip(slow_targets, slow_predictions):
+                    intent_confusion[int(target)][int(prediction)] += 1
     # Slow-accuracy pass reuses the same cache (and stats) so its forward
     # re-encodes nothing the loss pass above already encoded; the reported
     # hits therefore cover BOTH traversals of this bounded loader (loss pass +
@@ -877,6 +972,12 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
             },
             "move_pred_counts": move_pred, "move_target_counts": move_target,
             "intent_pred_counts": intent_pred, "intent_target_counts": intent_target,
+            "classification": {
+                "move": _classification_metrics(move_confusion),
+                "camera_dx": _classification_metrics(camera_dx_confusion, zero_class=2),
+                "camera_dy": _classification_metrics(camera_dy_confusion, zero_class=2),
+                "intent": _classification_metrics(intent_confusion),
+            },
             "button_pred_positive_counts": button_pred, "button_target_positive_counts": button_target,
             "interact_pred_positive": button_pred[0], "interact_target_positive": button_target[0],
             "move_nonstop_prediction_rate": (non_stop_pred / non_stop_total if non_stop_total else None)}
@@ -900,8 +1001,8 @@ def main(argv=None) -> int:
     parser.add_argument("--max-val-samples", type=int, default=64,
                         help="验证集最多编码的样本数，0 表示整集")
     parser.add_argument("--model-path", required=True, help="本地 Qwen3-VL checkpoint")
-    parser.add_argument("--init-checkpoint", default="", help="M2_VG checkpoint 目录（ACT 必填）")
-    parser.add_argument("--allow-base-init", action="store_true", help="仅兼容测试：允许从原始 Qwen 初始化")
+    parser.add_argument("--init-checkpoint", default="", help="已废弃：ACT 不加载 M2_VG")
+    parser.add_argument("--allow-base-init", action="store_true", help="已废弃：ACT 默认从基础模型初始化")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--vision-micro-batch-size", type=int, default=8,
@@ -915,6 +1016,10 @@ def main(argv=None) -> int:
     parser.add_argument("--move-stop-weight", type=float, default=0.5)
     parser.add_argument("--move-direction-balance", action="store_true",
                         help="batch>=4 时按 batch 频率；batch<4 时按采样训练集全局频率做 inverse-sqrt balance")
+    parser.add_argument("--class-balance", action=argparse.BooleanOptionalAction, default=True,
+                        help="对 move/camera dx/camera dy/intent 使用训练子集全局有界 inverse-sqrt 权重")
+    parser.add_argument("--image-augmentation", action=argparse.BooleanOptionalAction, default=True,
+                        help="训练窗口共享色彩/平移增强；验证和缓存路径始终关闭")
     parser.add_argument("--button-positive-weight", type=float, default=4.0)
     parser.add_argument("--button-global-balance", action="store_true",
                         help="按训练子集每个 button 的全局正/负计数计算 BCE 权重")
@@ -935,6 +1040,10 @@ def main(argv=None) -> int:
                         help="时序/历史剥离：将 fast 头接入的上一动作条件 history_actions 置零（不再凭上步动作自相关拟合）")
     parser.add_argument("--log-interval", type=int, default=25,
                         help="训练过程分量日志间隔（步）")
+    parser.add_argument("--acceptance-baseline", default="",
+                        help="可选：旧 metrics.json，用于类别 recall 改善验收")
+    parser.add_argument("--require-acceptance", action="store_true",
+                        help="提供 baseline 后，验收失败则以错误退出")
     parser.add_argument("--checkpoint", default="checkpoints/vla_minimal.pt")
     args = parser.parse_args(argv)
     result = train(args)

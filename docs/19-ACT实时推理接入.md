@@ -18,7 +18,7 @@
 python -m idv_agent.scripts.run_agent `
   --mode act `
   --act-checkpoint checkpoints/M3_ACT/act_mvp_b8_mb8_300.pt `
-  --act-init-checkpoint checkpoints/M2_VG `
+  --model-path models/Qwen3-VL-4B-Instruct `
   --device cuda `
   --duration 30
 ```
@@ -33,6 +33,8 @@ python -m idv_agent.scripts.run_agent `
 - `--history-stride` 固定为 3；其它值会被拒绝。
 - `--use-time-deltas` 已禁止。当前 checkpoint 未用真实时间差训练，不能通过参数注入负时间差。
 - `--zero-history`：诊断模式，每次推理都用全零 history，不读取执行器历史（可单独观察自回归 history 的影响）。
+- ACT 训练、离线评估和实时部署当前均从基础 Qwen 模型初始化，不加载有问题的 M2_VG；旧的
+  `--init-checkpoint/--act-init-checkpoint` 参数仅为命令兼容保留，不参与模型加载。
 
 对齐复现：直接使用默认参数，不传 `--use-time-deltas`、不传 `--zero-history`；观察完整 4-step `chunk=` 序列与 logits 差异。
 

@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 from idv_agent.scripts.train_vla import (_contiguous_subset, _bounded_subset, _stratified_subset, _dataset_paths,
-                                          _load_act_backbone, _model_inputs,
+                                          _load_act_base_backbone, _model_inputs,
                                           encode_batch, _scheduled_condition)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
@@ -29,9 +29,8 @@ from idv_agent.configs.subgoal import SUBGOAL_NAMES
 def _load(args):
     device = torch.device(args.device)
     amp = device.type == "cuda"
-    adapter, _, parent = _load_act_backbone(
-        args.model_path, args.init_checkpoint,
-        dtype=torch.float16 if amp else torch.float32, device=device)
+    adapter, _ = _load_act_base_backbone(
+        args.model_path, dtype=torch.float16 if amp else torch.float32, device=device)
     manifest = load_manifest(Path(args.checkpoint).parent / "manifest.json", require_artifacts=True)
     core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
@@ -51,7 +50,7 @@ def _load(args):
         adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
     core.load_state_dict(saved["core"])
     adapter.eval(); core.eval()
-    return device, amp, adapter, core, parent, manifest
+    return device, amp, adapter, core, {"stage": "base_without_m2"}, manifest
 
 
 def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int, cache: dict[tuple[str, int, str], torch.Tensor], sampling: str = "uniform", seed: int = 0, force_slow_mask: bool = False):
@@ -134,7 +133,7 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True); p.add_argument("--val-data", required=True)
-    p.add_argument("--model-path", required=True); p.add_argument("--init-checkpoint", required=True)
+    p.add_argument("--model-path", required=True); p.add_argument("--init-checkpoint", default="", help="已废弃：不会加载 M2")
     p.add_argument("--checkpoint", required=True); p.add_argument("--device", default="cuda")
     p.add_argument("--temporal-dim", type=int, default=256)
     p.add_argument("--max-samples", type=int, default=256,

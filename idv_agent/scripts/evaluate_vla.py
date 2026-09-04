@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
-from idv_agent.scripts.train_vla import (_contiguous_subset, _dataset_paths, _load_act_backbone,
+from idv_agent.scripts.train_vla import (_contiguous_subset, _dataset_paths, _load_act_base_backbone,
                                           encode_batch, _model_inputs, _scheduled_condition)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
@@ -32,9 +32,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     loader = DataLoader(dataset, batch_size=max(1, min(args.batch_size, 2)), shuffle=False,
                         collate_fn=VLASequenceCollator(max_frames=8))
 
-    adapter, _, parent_manifest = _load_act_backbone(
-        args.model_path, args.init_checkpoint,
-        dtype=torch.float16 if amp_enabled else torch.float32, device=device)
+    adapter, _ = _load_act_base_backbone(
+        args.model_path, dtype=torch.float16 if amp_enabled else torch.float32, device=device)
     act_manifest = load_manifest(Path(args.checkpoint).parent / "manifest.json",
                                  require_artifacts=True)
     if act_manifest["stage"] != "M3_ACT":
@@ -145,7 +144,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "data": [str(args.data)], "samples": records,
         "checkpoint": str(Path(args.checkpoint).resolve()),
-        "parent_stage": parent_manifest["stage"],
+        "initialization": "base_without_m2",
         "unique_frames_encoded": len(frame_cache),
         "frame_cache": {
             "hits": frame_stats["hits"], "misses": frame_stats["encoded"],
@@ -178,7 +177,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True, help="一个或多个 vla_chunks_v5.jsonl（逗号/分号分隔）")
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--init-checkpoint", required=True, help="M2_VG 目录")
+    parser.add_argument("--init-checkpoint", default="", help="已废弃：仅为旧命令兼容，不会加载 M2")
     parser.add_argument("--checkpoint", required=True, help="M3_ACT act_*.pt")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=1)

@@ -24,7 +24,7 @@ from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 from idv_agent.scripts.train_vla import (
     _contiguous_subset,
     _dataset_paths,
-    _load_act_backbone,
+    _load_act_base_backbone,
     _model_inputs,
     _scheduled_condition,
     encode_batch,
@@ -191,9 +191,8 @@ def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dic
     if len(samples) < 2:
         raise ValueError("visual dependency gate 至少需要两个样本")
     batch_size = max(1, int(args.batch_size))
-    adapter, _, parent_manifest = _load_act_backbone(
-        args.model_path, args.init_checkpoint,
-        dtype=torch.float16 if amp_enabled else torch.float32, device=device)
+    adapter, _ = _load_act_base_backbone(
+        args.model_path, dtype=torch.float16 if amp_enabled else torch.float32, device=device)
     act_manifest = load_manifest(Path(checkpoint).parent / "manifest.json", require_artifacts=True)
     if act_manifest["stage"] != "M3_ACT":
         raise ValueError(f"评估 checkpoint 必须是 M3_ACT，收到 {act_manifest['stage']}")
@@ -239,7 +238,7 @@ def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dic
     return {
         "checkpoint": str(Path(checkpoint).resolve()),
         "checkpoint_step": int(saved.get("step", -1)),
-        "parent_stage": parent_manifest["stage"],
+        "initialization": "base_without_m2",
         "data": [str(args.data)],
         "metrics": metrics,
         "image_dependency_gates": image_gates,
@@ -264,7 +263,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True, help="v5 JSONL 或逗号/分号分隔的 JSONL")
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--init-checkpoint", required=True, help="M2_VG checkpoint 目录")
+    parser.add_argument("--init-checkpoint", default="", help="已废弃：仅为旧命令兼容，不会加载 M2")
     parser.add_argument("--checkpoint", action="append", default=[], help="M3_ACT checkpoint，可重复")
     parser.add_argument("--checkpoint-dir", default="", help="批量评估目录下的 *.pt")
     parser.add_argument("--device", default="cuda")

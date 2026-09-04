@@ -85,17 +85,16 @@ class ACTPolicy:
 
     @classmethod
     def from_checkpoint(cls, checkpoint: str | Path, *, model_path: str | Path | None,
-                        init_checkpoint: str | Path, instruction: str,
+                        init_checkpoint: str | Path | None = None, instruction: str = "",
                         mode: str = "standard", device: torch.device | str = "cuda",
                         **kwargs) -> "ACTPolicy":
-        """Load an M3_ACT checkpoint with its M2_VG/M1_WK inheritance chain."""
+        """Load an M3_ACT checkpoint from the current base-without-M2 protocol."""
         from idv_agent.scripts.benchmark_act_realtime import _load_model
         device_obj = torch.device(device)
         class Args:
             pass
         args = Args()
         args.model_path = str(model_path) if model_path else ""
-        args.init_checkpoint = str(init_checkpoint)
         args.checkpoint = str(checkpoint)
         args.temporal_dim = int(kwargs.pop("temporal_dim", 256))
         adapter, core, _manifest = _load_model(args, device_obj)

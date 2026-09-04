@@ -18,7 +18,7 @@ import torch
 
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA, SlowCondition
-from idv_agent.scripts.train_vla import _load_act_backbone
+from idv_agent.scripts.train_vla import _load_act_base_backbone
 from idv_agent.vla.action_chunk import BUTTON_NAMES, MOVE_DIRECTIONS, CAMERA_BUCKETS
 
 
@@ -136,8 +136,7 @@ def _sync(device: torch.device) -> None:
 
 def _load_model(args: argparse.Namespace, device: torch.device):
     amp_dtype = torch.float16 if device.type == "cuda" else torch.float32
-    adapter, _, parent_manifest = _load_act_backbone(
-        args.model_path, args.init_checkpoint, dtype=amp_dtype, device=device)
+    adapter, _ = _load_act_base_backbone(args.model_path, dtype=amp_dtype, device=device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if "adapter" not in checkpoint or "core" not in checkpoint:
         raise ValueError("ACT checkpoint 缺少 adapter/core")
@@ -152,7 +151,7 @@ def _load_model(args: argparse.Namespace, device: torch.device):
     core.load_state_dict(checkpoint["core"])
     adapter.eval()
     core.eval()
-    return adapter, core, parent_manifest
+    return adapter, core, {"stage": "base_without_m2"}
 
 
 def _predict(core: SharedFastSlowVLA, window: RealtimeWindow, condition: SlowCondition,
@@ -306,7 +305,7 @@ def run(args: argparse.Namespace) -> dict:
     result = {"captures": captures, "encoded": encoded, "fast_ticks": fast_ticks,
               "slow_ticks": slow_ticks, "device": str(device),
               "checkpoint": str(Path(args.checkpoint).resolve()),
-              "parent_stage": parent_manifest["stage"],
+              "initialization": parent_manifest["stage"],
               "latency": {key: summarize(value) for key, value in timings.items()}}
     print(result)
     return result
@@ -315,7 +314,6 @@ def run(args: argparse.Namespace) -> dict:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model-path", required=True)
-    p.add_argument("--init-checkpoint", required=True)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--device", default="cuda")
     p.add_argument("--title", default="第五人格")
