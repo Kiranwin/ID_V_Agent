@@ -58,15 +58,83 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def format_example(record: dict[str, Any]) -> tuple[str, str]:
     """Return prompt and answer strings; mode is an explicit condition token."""
+    prompt = format_user_content(record) + "\n答案："
+    return prompt, str(record["answer"]).strip()
+
+
+def format_user_content(record: dict[str, Any]) -> str:
+    """Return the user-side WK content shared by training and inference."""
     mode = str(record["mode"]).strip()
     question = str(record["question"]).strip()
-    answer = str(record["answer"]).strip()
-    prompt = f"<mode:{mode}>\n问题：{question}\n答案："
-    return prompt, answer
+    return f"<mode:{mode}>\n问题：{question}"
+
+
+def _coerce_token_ids(value: Any) -> list[int]:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().reshape(-1).tolist()
+    if isinstance(value, (tuple, list)):
+        if value and isinstance(value[0], (tuple, list)):
+            value = value[0]
+        return [int(item) for item in value]
+    raise TypeError("tokenizer 必须返回 token id 列表")
+
+
+def build_semantic_eval_records(records: list[dict[str, Any]], variants_per_record: int = 2) -> list[dict[str, Any]]:
+    """Build deterministic, train-source semantic prompts for inference QA."""
+    if variants_per_record < 1:
+        raise ValueError("variants_per_record 必须 >= 1")
+    templates = (
+        "请说明：{question}",
+        "请简要回答：{question}",
+        "换一种说法，请回答：{question}",
+        "请问，{question}",
+    )
+    output: list[dict[str, Any]] = []
+    for record in records:
+        question = str(record["question"]).strip()
+        for index in range(variants_per_record):
+            output.append({
+                **record,
+                "id": f"{record['id']}::variant_{index + 1}",
+                "source_id": str(record["id"]),
+                "question": templates[index % len(templates)].format(question=question),
+            })
+    return output
+
+
+def _encode_wk_record(record: dict[str, Any], tokenizer_or_processor: Any,
+                      max_length: int) -> tuple[list[int], list[int]]:
+    """Encode a WK example, preferring Qwen ChatML and always supervising EOS."""
+    tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
+    apply_chat_template = getattr(tokenizer_or_processor, "apply_chat_template", None)
+    if apply_chat_template is None:
+        apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if apply_chat_template is not None:
+        user = {"role": "user", "content": format_user_content(record)}
+        assistant = {"role": "assistant", "content": str(record["answer"]).strip()}
+        full_ids = _coerce_token_ids(apply_chat_template(
+            [user, assistant], tokenize=True, add_generation_prompt=False))
+        prompt_ids = _coerce_token_ids(apply_chat_template(
+            [user], tokenize=True, add_generation_prompt=True))
+    else:
+        prompt, answer = format_example(record)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        token_max = max_length - 1 if eos_id is not None else max_length
+        full_ids = _coerce_token_ids(tokenizer(
+            prompt + answer, add_special_tokens=True,
+            truncation=True, max_length=token_max)["input_ids"])
+        if eos_id is not None and (not full_ids or full_ids[-1] != int(eos_id)):
+            full_ids.append(int(eos_id))
+        prompt_ids = _coerce_token_ids(tokenizer(
+            prompt, add_special_tokens=True, truncation=False)["input_ids"])
+    if len(full_ids) > max_length:
+        full_ids = full_ids[:max_length]
+    return full_ids, prompt_ids
 
 
 class WKTextDataset(Dataset):
-    def __init__(self, records: list[dict[str, Any]], tokenizer: Any, max_length: int):
+    def __init__(self, records: list[dict[str, Any]], tokenizer: Any, max_length: int,
+                 *, processor: Any | None = None):
         self.items: list[dict[str, torch.Tensor | str]] = []
         if max_length < 32:
             raise ValueError("max_length 必须 >= 32")
@@ -74,10 +142,7 @@ class WKTextDataset(Dataset):
         if pad_id is None:
             pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
         for record in records:
-            prompt, answer = format_example(record)
-            prompt_ids = tokenizer(prompt, add_special_tokens=True, truncation=False)["input_ids"]
-            full_ids = tokenizer(prompt + answer, add_special_tokens=True,
-                                 truncation=True, max_length=max_length)["input_ids"]
+            full_ids, prompt_ids = _encode_wk_record(record, processor or tokenizer, max_length)
             # Ensure the answer remains supervised when a long sample is cut.
             if len(full_ids) <= len(prompt_ids):
                 continue
@@ -152,7 +217,7 @@ def _split_records(records: list[dict[str, Any]], val_fraction: float, seed: int
 
 def _write_manifest(output_dir: Path, *, model_path: str | Path, data: Path,
                     train_count: int, val_count: int, steps: int, parent: str | None = None,
-                    args: argparse.Namespace | None = None):
+                    args: argparse.Namespace | None = None, semantic_variants: int = 2):
     training = {
         "method": "causal_sft",
         "steps": steps,
@@ -161,6 +226,8 @@ def _write_manifest(output_dir: Path, *, model_path: str | Path, data: Path,
         "max_length": getattr(args, "max_length", None),
         "seed": getattr(args, "seed", None),
         "gradient_checkpointing": bool(getattr(args, "gradient_checkpointing", False)),
+        "validation_method": "train_semantic_transform",
+        "semantic_variants": semantic_variants,
     }
     manifest = build_manifest(
         stage="M1_WK", parent=parent, base_model=model_path,
@@ -186,10 +253,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     overlap = train_ids & {str(row["id"]) for row in val_records}
     if overlap:
         raise ValueError(f"WK train/val ID 重叠: {sorted(overlap)[:5]}")
+    semantic_variants = max(1, int(getattr(args, "semantic_variants", 2)))
+    semantic_eval_records = len(build_semantic_eval_records(records, semantic_variants))
     if args.dry_run:
         preview = [format_example(row) for row in train_records[:3]]
         return {"stage": "M1_WK", "train_records": len(train_records),
-                "val_records": len(val_records), "preview": preview}
+                "val_records": len(val_records), "semantic_eval_records": semantic_eval_records,
+                "preview": preview}
 
     device = torch.device(args.device)
     if not args.model_path:
@@ -201,8 +271,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-    train_ds = WKTextDataset(train_records, tokenizer, args.max_length)
-    val_ds = WKTextDataset(val_records, tokenizer, args.max_length) if val_records else None
+    train_ds = WKTextDataset(train_records, tokenizer, args.max_length, processor=processor)
+    val_ds = WKTextDataset(val_records, tokenizer, args.max_length, processor=processor) if val_records else None
     loader = DataLoader(train_ds, batch_size=max(1, args.batch_size), shuffle=True,
                         collate_fn=lambda x: collate_wk(x, pad_id))
     val_loader = (DataLoader(val_ds, batch_size=max(1, args.batch_size), shuffle=False,
@@ -247,11 +317,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     processor.save_pretrained(output_dir / "processor")
     manifest = _write_manifest(output_dir, model_path=args.model_path, data=Path(args.data),
                                train_count=len(train_ds), val_count=len(val_ds) if val_ds else 0,
-                               steps=args.steps, args=args)
+                               steps=args.steps, args=args, semantic_variants=semantic_variants)
     result = {"stage": "M1_WK", "train_records": len(train_ds),
               "val_records": len(val_ds) if val_ds else 0, "steps": args.steps,
               "initial_loss": history[0] if history else None,
               "final_loss": history[-1] if history else None, "val_loss": val_loss,
+              "semantic_eval_records": semantic_eval_records,
               "checkpoint": str(output_dir.resolve()),
               "elapsed_sec": time.perf_counter() - started, "manifest": manifest}
     (output_dir / "metrics.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -273,6 +344,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--semantic-variants", type=int, default=2,
+                        help="每条训练样本生成的确定性语义验证变体数")
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
     try:
