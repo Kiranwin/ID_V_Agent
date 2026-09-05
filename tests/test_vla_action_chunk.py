@@ -151,9 +151,9 @@ def test_v5_separates_anchor_sampling_from_history_sampling(tmp_path: Path):
           macro_frames=6, schema_version=VLA_SCHEMA_VERSION_V5)
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
 
-    assert [row["anchor_frame"] for row in records] == [47, 59, 71, 83, 95, 107]
-    assert [frame["frame_index"] for frame in records[0]["observations"]["frames"]] == [26, 29, 32, 35, 38, 41, 44, 47]
-    assert [frame["frame_index"] for frame in records[1]["observations"]["frames"]] == [38, 41, 44, 47, 50, 53, 56, 59]
+    assert [row["anchor_frame"] for row in records] == [21, 33, 45, 57, 69, 81, 93, 105]
+    assert [frame["frame_index"] for frame in records[0]["observations"]["frames"]] == [0, 3, 6, 9, 12, 15, 18, 21]
+    assert [frame["frame_index"] for frame in records[1]["observations"]["frames"]] == [12, 15, 18, 21, 24, 27, 30, 33]
     assert len(records[0]["observations"]["history_actions"]) == 8
     assert all("duration_frames" not in action
                for action in records[0]["observations"]["history_actions"])
@@ -188,11 +188,84 @@ def test_v5_default_anchor_stride_prevents_future_action_window_overlap(tmp_path
           schema_version=VLA_SCHEMA_VERSION_V5)
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
 
-    assert [row["anchor_frame"] for row in records] == [47, 83]
+    assert [row["anchor_frame"] for row in records] == [21, 45, 69, 93]
     assert all(
         left["alignment"]["action_end_frame"] < right["alignment"]["action_start_frame"]
         for left, right in zip(records, records[1:])
     )
+
+
+def test_v5_includes_cold_start_with_zero_padded_history(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(100):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n"
+        "40000,key_down,key:q,1\n"
+        "41000,key_up,key:q,0\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(100)),
+        encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(100)),
+        encoding="utf-8")
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,99,travel\n",
+        encoding="utf-8")
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 100, "target_fps": 30}), encoding="utf-8")
+    output = tmp_path / "vla_v5.jsonl"
+
+    build(session, output, history_stride=3, history=8, macro_frames=6,
+          schema_version=VLA_SCHEMA_VERSION_V5)
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+
+    assert records[0]["anchor_frame"] == 21
+    assert all(
+        action["camera_dx"] == 0 and action["camera_dy"] == 0
+        and not any(action["buttons"])
+        for action in records[0]["observations"]["history_actions"]
+    )
+    pulse_actions = [
+        action for action in records[0]["action_chunk"] if action["buttons"][0]
+    ]
+    assert len(pulse_actions) == 1
+
+
+def test_v5_default_stride_covers_q_between_future_windows(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(100):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    # Frame 52 is in the gap left by the old 36-frame anchor stride:
+    # [23,46], [59,82].  The canonical 24-frame stride must include it.
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n"
+        "52000,key_down,key:q,1\n"
+        "53000,key_up,key:q,0\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(100)),
+        encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(100)),
+        encoding="utf-8")
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,99,travel\n",
+        encoding="utf-8")
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 100, "target_fps": 30}), encoding="utf-8")
+    output = tmp_path / "vla_v5.jsonl"
+
+    build(session, output, history_stride=3, history=8, macro_frames=6,
+          schema_version=VLA_SCHEMA_VERSION_V5)
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+
+    assert any(action["buttons"][0] for record in records for action in record["action_chunk"])
 
 
 def test_v5_history_actions_are_six_frame_macro_summaries(tmp_path: Path):
@@ -221,9 +294,9 @@ def test_v5_history_actions_are_six_frame_macro_summaries(tmp_path: Path):
 
     build(session, output, anchor_stride=12, history_stride=3, history=8,
           macro_frames=6, schema_version=VLA_SCHEMA_VERSION_V5)
-    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[3])
     history = record["observations"]["history_actions"]
-    assert record["anchor_frame"] == 47
+    assert record["anchor_frame"] == 57
     assert [action["camera_dx_px"] for action in history] == [18.0] * 8
     assert [action["camera_dx"] for action in history] == [1] * 8
 
@@ -239,8 +312,8 @@ def test_v5_interact_is_one_shot_pulse_at_q_trigger(tmp_path: Path):
     # repeat the interaction button for every later macro step.
     (session / "events.csv").write_text(
         "timestamp_ns,kind,code,value\n"
-        "50000,key_down,key:q,1\n"
-        "51000,key_up,key:q,0\n", encoding="utf-8")
+        "40000,key_down,key:q,1\n"
+        "41000,key_up,key:q,0\n", encoding="utf-8")
     (session / "frame_timestamps.csv").write_text(
         "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(140)),
         encoding="utf-8")

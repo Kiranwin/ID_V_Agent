@@ -285,11 +285,10 @@ def build(session: Path, output: Path, *, stride: int = 3,
         # v5's canonical sampling separates anchor decorrelation from the
         # temporal spacing inside the observation window.  Legacy v3/v4
         # callers retain the old ``stride`` alias behavior.
-        # Four six-frame future macro actions occupy 24 frames.  A 36-frame
-        # anchor interval leaves a 12-frame gap after that label horizon, so
-        # adjacent default samples cannot share either target frames or an
-        # observation inside the preceding sample's target horizon.
-        anchor_stride = 36 if schema_version == VLA_SCHEMA_VERSION_V5 else stride
+        # Four six-frame future macro actions occupy exactly 24 frames. Use
+        # that interval so every future frame belongs to a label window while
+        # adjacent default samples still have disjoint target ranges.
+        anchor_stride = 24 if schema_version == VLA_SCHEMA_VERSION_V5 else stride
     if history_stride is None:
         history_stride = stride
     if schema_version == VLA_SCHEMA_VERSION_V5 and history_stride != 3:
@@ -399,8 +398,13 @@ def build(session: Path, output: Path, *, stride: int = 3,
     # window; it must not change action-history semantics.
     history_action_span = (history * MACRO_FRAMES
                            if schema_version == VLA_SCHEMA_VERSION_V5 else 0)
-    first_anchor = max((history - 1) * history_stride,
-                       history_action_span - 1 if history_action_span else 0)
+    # The runtime can make a cold-start prediction once the eight-frame visual
+    # window is warm; its missing action history is explicitly zero padded.
+    # Do not delay the first v5 sample until eight historical macros exist, or
+    # early Q interactions cannot ever become training targets.
+    first_anchor = ((history - 1) * history_stride
+                    if schema_version != VLA_SCHEMA_VERSION_V5
+                    else (history - 1) * history_stride)
     for anchor in range(first_anchor,
                         len(frames) - action_delay_frames - total_future, anchor_stride):
         history_frames = []
@@ -427,14 +431,24 @@ def build(session: Path, output: Path, *, stride: int = 3,
         action_end_ts = int(_num(actions[action_end_frame].get("timestamp_ns"), field=f"action[{action_end_frame}].timestamp_ns"))
         history_actions = []
         if schema_version == VLA_SCHEMA_VERSION_V5:
-            history_start = anchor - history_action_span + 1
-            for history_step in range(history):
-                first = history_start + history_step * MACRO_FRAMES
-                indices = list(range(first, first + MACRO_FRAMES))
-                history_action = _action(
-                    [actions[i] for i in indices], indices, pixel_camera=True)
-                history_action.pop("duration_frames", None)
-                history_actions.append(history_action)
+            if anchor < history_action_span - 1:
+                # The deployed policy starts with an all-zero 72-D history.
+                # Preserve the complete v5 action shape, including pixel
+                # provenance, so collation and cache signatures are identical.
+                history_actions = [{
+                    "move_dir": 0, "camera_dx": 0, "camera_dy": 0,
+                    "buttons": [0] * len(BUTTON_NAMES),
+                    "camera_dx_px": 0.0, "camera_dy_px": 0.0,
+                } for _ in range(history)]
+            else:
+                history_start = anchor - history_action_span + 1
+                for history_step in range(history):
+                    first = history_start + history_step * MACRO_FRAMES
+                    indices = list(range(first, first + MACRO_FRAMES))
+                    history_action = _action(
+                        [actions[i] for i in indices], indices, pixel_camera=True)
+                    history_action.pop("duration_frames", None)
+                    history_actions.append(history_action)
         else:
             for offset in range(history - 1, -1, -1):
                 idx = anchor - offset * history_stride
