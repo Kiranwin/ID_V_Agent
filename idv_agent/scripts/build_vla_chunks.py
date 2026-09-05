@@ -80,7 +80,11 @@ def _buttons(rows):
     names = {str(r.get("category_name", "")).upper() for r in rows}
     held = "+".join(str(r.get("held_keys", "")) for r in rows).lower()
     values = [0] * len(BUTTON_NAMES)
-    values[0] = int(any(n.startswith("INTERACT_") for n in names) or "key:q" in held)
+    # Q starts automatic decoding with one edge-triggered tap.  The decoder
+    # remains active for many later frames, so INTERACT_HOLD is state metadata
+    # and must not become repeated physical Q presses.
+    values[0] = int(any(_num(r.get("decode_start"), 0.0) > 0 for r in rows)
+                    or any(n == "INTERACT_TAP" for n in names))
     values[1] = int("VAULT" in names or "key:space" in held)
     values[2] = int(any(n.startswith("ITEM_") for n in names) or "key:f" in held)
     values[3] = int("key:e" in held)

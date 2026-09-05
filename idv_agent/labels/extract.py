@@ -175,6 +175,7 @@ def build_frame_grid(
             "text_action": text_action,
             # P2：校准帧标记（后续视觉辅助标注用）
             "decode_calibration": int(status.calibration),
+            "decode_start": int(status.started),
         })
         prev_ts = ts
     return rows

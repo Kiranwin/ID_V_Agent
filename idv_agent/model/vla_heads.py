@@ -206,18 +206,32 @@ class VisualActionExpert(nn.Module):
     """
 
     def __init__(self, frame_feature_dim: int, temporal_dim: int,
-                 horizon: int = ACTION_CHUNK_HORIZON):
+                 horizon: int = ACTION_CHUNK_HORIZON, *, max_frames: int = 8):
         super().__init__()
         if frame_feature_dim < 1 or temporal_dim < 1 or horizon < 1:
             raise ValueError("frame_feature_dim/temporal_dim/horizon 必须为正数")
         self.frame_feature_dim = int(frame_feature_dim)
         self.temporal_dim = int(temporal_dim)
-        self.pair_dim = self.frame_feature_dim * 2
+        self.max_frames = int(max_frames)
+        if self.max_frames < 1:
+            raise ValueError("max_frames 必须为正数")
+        # Preserve the whole visual window.  The previous expert only kept
+        # first/last frames, which discarded the camera trajectory in the
+        # middle of the observation window.
+        self.sequence_dim = self.frame_feature_dim * self.max_frames
+        self.pair_dim = self.sequence_dim + self.frame_feature_dim
+        self.visual_feature_scale = 0.25
         self.register_buffer("input_center", torch.zeros(self.pair_dim), persistent=True)
-        self.input_norm = nn.LayerNorm(self.frame_feature_dim * 2, elementwise_affine=False)
+        self.input_norm = nn.LayerNorm(self.pair_dim, elementwise_affine=False)
         self.fast = FastVLAHead(self.pair_dim, history_action_dim=0, horizon=horizon,
                                 bias=False, direct=True)
         self.slow = SlowVLAHead(self.pair_dim, bias=False, direct=True)
+        self.camera_summary_dim = self.frame_feature_dim * 5
+        self.camera_summary_scale = 0.25
+        self.camera_visual_dx = nn.Linear(self.camera_summary_dim,
+                                          self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        self.camera_visual_dy = nn.Linear(self.camera_summary_dim,
+                                          self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
 
     @staticmethod
     def _valid_indices(frame_features: torch.Tensor,
@@ -244,18 +258,62 @@ class VisualActionExpert(nn.Module):
             frame_features = frame_features.unsqueeze(0)
         if frame_features.ndim != 3 or frame_features.shape[-1] != self.frame_feature_dim:
             raise ValueError(f"frame_features 必须是 [B,L,{self.frame_feature_dim}]")
-        feature = self.normalized_pair_features(frame_features, valid_mask=valid_mask).float()
+        feature = (self.normalized_pair_features(frame_features, valid_mask=valid_mask) *
+                   self.visual_feature_scale).float()
         # The direct 8192 -> logits path is intentionally kept in FP32.  On
         # Turing GPUs, FP16 autocast can overflow its reduction/linear
         # gradients even though LayerNorm's output is finite.
         with torch.autocast(device_type=feature.device.type, enabled=False):
             fast = self.fast(feature)
             slow = self.slow(feature)
+        camera = self.camera_summary(frame_features, valid_mask=valid_mask)
+        batch = camera.shape[0]
+        fast.camera_dx_logits = self.camera_visual_dx(camera).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        fast.camera_dy_logits = self.camera_visual_dy(camera).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
         return VisualExpertOutput(fast=fast, slow=slow, feature=feature)
+
+    def camera_summary(self, frame_features: torch.Tensor,
+                       valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Summarize camera-relevant visual trajectory without raw flattening."""
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        first_index, last_index = self._valid_indices(frame_features, valid_mask)
+        rows = torch.arange(frame_features.shape[0], device=frame_features.device)
+        first = frame_features[rows, first_index]
+        last = frame_features[rows, last_index]
+        if valid_mask is None:
+            valid = torch.ones(frame_features.shape[:2], dtype=torch.bool,
+                               device=frame_features.device)
+        else:
+            valid = valid_mask.bool()
+            if valid.ndim == 1:
+                valid = valid.unsqueeze(0)
+            if valid.shape != frame_features.shape[:2]:
+                raise ValueError("valid_mask shape 必须为 [B,L]")
+        mean = (frame_features * valid.unsqueeze(-1)).sum(dim=1) / valid.sum(dim=1, keepdim=True).clamp_min(1)
+        if frame_features.shape[1] > 1:
+            delta = frame_features[:, 1:] - frame_features[:, :-1]
+            delta_valid = valid[:, 1:] & valid[:, :-1]
+            delta_mean = (delta * delta_valid.unsqueeze(-1)).sum(dim=1) / delta_valid.sum(dim=1, keepdim=True).clamp_min(1)
+        else:
+            delta_mean = torch.zeros_like(last)
+        summary = torch.cat((first, last, mean, last - first, delta_mean), dim=-1)
+        sequence_dim = self.frame_feature_dim * self.max_frames
+        center = self.input_center[:sequence_dim]
+        center_first = center[:self.frame_feature_dim]
+        center_last = center[(self.max_frames - 1) * self.frame_feature_dim:self.max_frames * self.frame_feature_dim]
+        center_mean = center[:self.frame_feature_dim * self.max_frames].reshape(
+            self.max_frames, self.frame_feature_dim).mean(dim=0)
+        center_delta = self.input_center[sequence_dim:]
+        summary_center = torch.cat((center_first, center_last, center_mean,
+                                    center_last - center_first, center_delta), dim=-1)
+        return (summary - summary_center.to(summary)) * self.camera_summary_scale
 
     def pair_features(self, frame_features: torch.Tensor,
                       valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Return raw ``[last, last-first]`` features for train-center calibration."""
+        """Return raw ``[all_frames, last-first]`` features for calibration."""
         if frame_features.ndim == 2:
             frame_features = frame_features.unsqueeze(0)
         if frame_features.ndim != 3 or frame_features.shape[-1] != self.frame_feature_dim:
@@ -264,7 +322,13 @@ class VisualActionExpert(nn.Module):
         rows = torch.arange(frame_features.shape[0], device=frame_features.device)
         first = frame_features[rows, first_index]
         last = frame_features[rows, last_index]
-        return torch.cat((last, last - first), dim=-1)
+        if frame_features.shape[1] > self.max_frames:
+            raise ValueError(f"视觉窗口长度不能超过 {self.max_frames}")
+        sequence = torch.zeros((frame_features.shape[0], self.max_frames,
+                                self.frame_feature_dim), device=frame_features.device,
+                               dtype=frame_features.dtype)
+        sequence[:, :frame_features.shape[1]] = frame_features
+        return torch.cat((sequence.reshape(frame_features.shape[0], -1), last - first), dim=-1)
 
     def set_input_center(self, center: torch.Tensor) -> None:
         center = center.detach().reshape(-1).to(device=self.input_center.device,

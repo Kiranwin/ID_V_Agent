@@ -738,7 +738,8 @@ def _named_act_trainable(adapter: torch.nn.Module, core: torch.nn.Module) -> lis
 
 def _calibrate_visual_input_center(adapter: torch.nn.Module, core: SharedFastSlowVLA, dataset,
                                    *, device: torch.device, samples: int,
-                                   vision_micro_batch_size: int, seed: int) -> dict[str, object]:
+                                   vision_micro_batch_size: int, seed: int,
+                                   raw_feature_cache: Any | None = None) -> dict[str, object]:
     """Set the persistent raw-visual center from deterministic training examples.
 
     A frozen Qwen grid contains a large cross-image common direction.  The
@@ -761,6 +762,7 @@ def _calibrate_visual_input_center(adapter: torch.nn.Module, core: SharedFastSlo
             for batch in loader:
                 _, raw_visual = encode_batch(adapter, batch, device=device,
                                              vision_micro_batch_size=vision_micro_batch_size,
+                                             raw_feature_cache=raw_feature_cache,
                                              return_visual=True)
                 pairs = core.visual_expert.pair_features(
                     raw_visual, valid_mask=batch["frame_valid_mask"].to(device)).detach().double()
@@ -875,7 +877,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         # sampled chunk instead of simulating its low-frequency tick.
         first_batch["slow_loss_mask"] = torch.ones_like(first_batch["slow_loss_mask"])
     with torch.no_grad():
-        encode_batch(adapter, first_batch, device=device)
+        encode_batch(adapter, first_batch, device=device, raw_feature_cache=raw_feature_cache)
     if int(getattr(adapter, "act_feature_dim", 0)) < 1:
         raise RuntimeError("ACT raw-grid feature dim 未 materialize")
     core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
@@ -885,6 +887,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         samples=int(getattr(args, "visual_center_samples", 64)),
         vision_micro_batch_size=vision_micro_batch_size,
         seed=int(getattr(args, "seed", 0)),
+        raw_feature_cache=raw_feature_cache,
     )
     named_trainable = _named_act_trainable(adapter, core)
     trainable = [parameter for _name, parameter in named_trainable]
@@ -1012,6 +1015,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "prior_scale": float(core.prior_scale), "prior_logits_bounded": True,
                   "camera_prior_scale": float(core.camera_prior_scale),
                   "visual_input_center": visual_center,
+                  "visual_feature_scale": float(core.visual_expert.visual_feature_scale),
                   "button_positive_weight": args.button_positive_weight,
                   "move_direction_balance": args.move_direction_balance,
                   "class_balance": class_balance_manifest,

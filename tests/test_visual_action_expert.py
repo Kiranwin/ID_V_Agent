@@ -145,6 +145,21 @@ def test_visual_expert_changes_when_only_pure_visual_features_change():
     assert not torch.equal(first.visual.fast.move_logits, second.visual.fast.move_logits)
 
 
+def test_visual_expert_uses_middle_frames_not_only_first_and_last():
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+
+    torch.manual_seed(31)
+    core = SharedFastSlowVLA(8, temporal_dim=12, history_action_dim=0).eval()
+    frames = torch.randn(2, 8, 8)
+    changed = frames.clone()
+    changed[:, 3] += 2.0
+    condition = _condition(core, 2)
+    with torch.no_grad():
+        first = core(frames, condition, visual_frame_features=frames, run_slow=False)
+        second = core(frames, condition, visual_frame_features=changed, run_slow=False)
+    assert not torch.equal(first.visual.fast.move_logits, second.visual.fast.move_logits)
+
+
 def test_prior_correction_is_hard_bounded_when_fused_with_visual_logits():
     from idv_agent.model.fast_slow_vla import fuse_fast_outputs
     from idv_agent.model.vla_heads import FastVLAOutput
@@ -186,8 +201,8 @@ def test_visual_expert_class_heads_read_normalized_raw_pair_without_hidden_bottl
     from idv_agent.model.vla_heads import VisualActionExpert
 
     expert = VisualActionExpert(8, 12)
-    assert expert.fast.move.in_features == 16
-    assert expert.slow.intent.in_features == 16
+    assert expert.fast.move.in_features == 72
+    assert expert.slow.intent.in_features == 72
     assert isinstance(expert.fast.trunk, torch.nn.Identity)
 
 
@@ -217,6 +232,7 @@ def test_visual_expert_uses_persistent_training_center_before_normalization():
     expert.set_input_center(raw_pair[0])
     centered = expert.normalized_pair_features(frames)
 
+    assert expert.input_center.shape == raw_pair[0].shape
     assert torch.equal(expert.input_center, raw_pair[0])
     assert torch.equal(centered, torch.zeros_like(centered))
 
@@ -230,3 +246,48 @@ def test_visual_expert_keeps_large_raw_grid_forward_finite_under_autocast():
         output = expert(frames)
     assert bool(torch.isfinite(output.feature).all())
     assert bool(torch.isfinite(output.slow.intent_logits).all())
+
+
+def test_full_sequence_visual_feature_has_explicit_stable_scale():
+    from idv_agent.model.vla_heads import VisualActionExpert
+
+    expert = VisualActionExpert(8, 12)
+    assert expert.visual_feature_scale == 0.25
+    frames = torch.randn(1, 8, 8)
+    normalized = expert.normalized_pair_features(frames)
+    assert torch.allclose(expert(frames).feature, normalized * 0.25)
+
+
+def test_camera_visual_head_has_independent_temporal_summary():
+    from idv_agent.model.vla_heads import VisualActionExpert
+
+    expert = VisualActionExpert(8, 12)
+    assert expert.camera_summary_dim == 8 * 5
+    assert expert.camera_visual_dx.in_features == expert.camera_summary_dim
+    assert expert.camera_visual_dy.in_features == expert.camera_summary_dim
+
+
+def test_camera_visual_logits_respond_to_middle_frame_trajectory():
+    from idv_agent.model.vla_heads import VisualActionExpert
+
+    torch.manual_seed(53)
+    expert = VisualActionExpert(8, 12).eval()
+    frames = torch.randn(1, 8, 8)
+    changed = frames.clone()
+    changed[:, 3] += 4.0
+    with torch.no_grad():
+        first = expert(frames)
+        second = expert(changed)
+    assert not torch.equal(first.fast.camera_dx_logits, second.fast.camera_dx_logits)
+
+
+def test_camera_summary_uses_centered_scaled_visual_features():
+    from idv_agent.model.vla_heads import VisualActionExpert
+
+    expert = VisualActionExpert(8, 12)
+    frames = torch.full((1, 8, 8), 1000.0)
+    center = expert.pair_features(frames)[0]
+    expert.set_input_center(center)
+    summary = expert.camera_summary(frames)
+    assert float(summary.abs().max()) == 0.0
+    assert expert.camera_summary_scale == 0.25

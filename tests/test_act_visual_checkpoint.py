@@ -47,7 +47,7 @@ def test_act_checkpoint_schema_rejects_layernorm_cell_projector_contract():
     checkpoint = {"checkpoint_schema_version": "m4_act.visual_grounded.v1",
                   "adapter": {}, "core": {}}
 
-    with pytest.raises(ValueError, match="m14_act"):
+    with pytest.raises(ValueError, match="m17_act"):
         load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
 
 
@@ -60,7 +60,7 @@ def test_act_checkpoint_rejects_previous_m6_visual_residual_schema():
     checkpoint = {"checkpoint_schema_version": "m6_act.visual_decision_residual.v1",
                   "adapter": {}, "core": {}}
 
-    with pytest.raises(ValueError, match="m14_act"):
+    with pytest.raises(ValueError, match="m17_act"):
         load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
 
 
@@ -94,8 +94,9 @@ def test_visual_center_is_checkpointed_in_core_state():
     from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 
     core = SharedFastSlowVLA(frame_feature_dim=5, temporal_dim=4, history_action_dim=0)
-    core.visual_expert.set_input_center(torch.arange(10, dtype=torch.float32))
+    center = torch.arange(45, dtype=torch.float32)
+    core.visual_expert.set_input_center(center)
     restored = SharedFastSlowVLA(frame_feature_dim=5, temporal_dim=4, history_action_dim=0)
     restored.load_state_dict(core.state_dict())
     assert torch.equal(restored.visual_expert.input_center,
-                       torch.arange(10, dtype=torch.float32))
+                       center)

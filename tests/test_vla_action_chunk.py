@@ -228,6 +228,53 @@ def test_v5_history_actions_are_six_frame_macro_summaries(tmp_path: Path):
     assert [action["camera_dx"] for action in history] == [1] * 8
 
 
+def test_v5_interact_is_one_shot_pulse_at_q_trigger(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(140):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    # Q is pressed once around frame 50 and released immediately.  The
+    # decoder state remains active afterwards, but the action label must not
+    # repeat the interaction button for every later macro step.
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n"
+        "50000,key_down,key:q,1\n"
+        "51000,key_up,key:q,0\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(140)),
+        encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(140)),
+        encoding="utf-8")
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,139,travel\n",
+        encoding="utf-8")
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 140, "target_fps": 30}), encoding="utf-8")
+    output = tmp_path / "vla_v5.jsonl"
+
+    build(session, output, history_stride=3, history=8, macro_frames=6,
+          schema_version=VLA_SCHEMA_VERSION_V5)
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+
+    assert records
+    pulse_rows = [
+        record for record in records
+        if any(action["buttons"][0] for action in record["action_chunk"])
+    ]
+    assert len(pulse_rows) == 1
+    pulse_actions = [
+        action for action in pulse_rows[0]["action_chunk"] if action["buttons"][0]
+    ]
+    assert len(pulse_actions) == 1
+    assert all(
+        not any(action["buttons"][0] for action in record["action_chunk"])
+        for record in records if record is not pulse_rows[0]
+    )
+
+
 def test_v5_rejects_non_six_duration():
     from idv_agent.vla.action_chunk import validate_v5_record
 

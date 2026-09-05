@@ -61,7 +61,7 @@ def test_m8_checkpoint_rejects_m7_schema():
 
     adapter = _adapter(act_feature_dim=16)
     core = SharedFastSlowVLA(16, temporal_dim=4, history_action_dim=0)
-    with pytest.raises(ValueError, match="m14_act"):
+    with pytest.raises(ValueError, match="m17_act"):
         load_visual_grounded_act_checkpoint(
             adapter, core,
             {"checkpoint_schema_version": "m7_act.visual_expert.v1",

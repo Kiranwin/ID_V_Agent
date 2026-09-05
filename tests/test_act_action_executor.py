@@ -55,6 +55,18 @@ def test_chunk_executor_holds_step_across_fast_ticks():
     assert executor.active
 
 
+def test_chunk_executor_sends_interact_as_one_shot_tap_not_held_key():
+    calls = []
+    executor = ACTActionChunkExecutor(send=lambda cmds: calls.extend(cmds),
+                                      capture_fps=30, tick_hz=15)
+    executor.submit([_step(buttons=(1, 0, 0, 0, 0, 0), duration=6)])
+    executor.tick()
+
+    q_commands = [command for command in calls if getattr(command, "code", None) == "key:q"]
+    assert [(command.kind) for command in q_commands] == ["press", "release"]
+    assert "key:q" not in executor._held
+
+
 def test_scheduler_requests_chunks_at_fixed_rate_and_stops_stale_features():
     calls = []
     executor = ACTActionChunkExecutor(send=lambda cmds: calls.extend(cmds), capture_fps=30, tick_hz=15)

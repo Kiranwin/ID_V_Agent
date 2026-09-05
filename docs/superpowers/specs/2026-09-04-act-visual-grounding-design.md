@@ -31,7 +31,7 @@ final duration = clamp(visual_duration + 0.5*(prior_duration - 6), 1, 30)
 
 `compute_vla_loss` 接收可选 visual fast/slow 输出，新增逐头 `visual_*` 损失并以 `visual_aux=1.0` 加入 total。类别权重继续每头独立、bounded inverse-sqrt `[0.35, 3.0]`，训练图像增强与 history dropout=0.5 继续仅用于训练。
 
-当前 checkpoint schema 为 `m13_act.visual_camera_prior.v1`。旧 m12、m11、m10、m9、m8、m7、m6 与 M2 均 fail-closed。checkpoint core state 包含 visual expert 及其训练中心；adapter state 只允许 task condition projection，禁止 raster projector/SpatialAgg。M2 不加载。
+当前 checkpoint schema 为 `m17_act.camera_visual_summary.v1`。旧 m16/m15 及 m14、m13、m12、m11、m10、m9、m8、m7、m6 与 M2 均 fail-closed。checkpoint core state 包含完整视觉窗口 visual expert、camera 专属视觉时序摘要及训练中心；adapter state 只允许 task condition projection，禁止 raster projector/SpatialAgg。M2 不加载。
 
 raw feature cache 仍保存冻结 `[64,1024]`，训练/评估查缓存后统一经过同一个确定性 2×2 pooling 和 condition projection；不缓存 expert 或其随机增强输出。增强与 raw feature cache 仍互斥。当前 cache 与 decorrelated session 的覆盖不完整，因此本次带增强训练继续原图实时视觉路径，不能把不完整 cache 当作完整训练数据。
 

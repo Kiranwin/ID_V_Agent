@@ -149,6 +149,7 @@ class DecodeStatus:
     active: bool = False
     start_ts: int = 0
     calibration: bool = False   # P2：本帧是否处于校准（破译中按 Space）
+    started: bool = False       # 本帧是否刚由 Q 触发进入破译
 
 
 class DecodeStateTracker:
@@ -213,7 +214,7 @@ class DecodeStateTracker:
         # 3) 进入破译：Q 被按住，且未在等待释放、无退出键
         if (not st.active and not self._await_release
                 and not has_exit and self._q_pressed(frame)):
-            self._status = DecodeStatus(active=True, start_ts=ts)
+            self._status = DecodeStatus(active=True, start_ts=ts, started=True)
             return self._status
 
         # 4) 校准：破译中按 Space（保持破译态，标记校准）
@@ -223,4 +224,7 @@ class DecodeStateTracker:
         elif st.active:
             st.calibration = False
             self._status = st
+        # ``started`` is an edge, not a level state.  It must never leak into
+        # the following frame when the automatic decoder remains active.
+        self._status.started = False
         return self._status

@@ -84,7 +84,9 @@ class ACTActionChunkExecutor:
 
     def _target(self, step: object) -> tuple[set[str], float, float]:
         keys = {getattr(self.keymap, attr) for attr in _MOVE_KEYS[int(step.move_dir)]}
-        for pressed, attr in zip(step.buttons, _BUTTON_ATTRS):
+        # BUTTON_NAMES[0] is an edge-triggered Q interaction pulse, not a
+        # held key.  Other button channels retain their duration state.
+        for pressed, attr in zip(step.buttons[1:], _BUTTON_ATTRS[1:]):
             if pressed:
                 value = getattr(self.keymap, attr, None)
                 if value:
@@ -97,6 +99,11 @@ class ACTActionChunkExecutor:
         target, dx, dy = self._target(step)
         commands = [Command("release", code=code) for code in sorted(self._held - target)]
         commands.extend(Command("press", code=code) for code in sorted(target - self._held))
+        if bool(step.buttons[0]):
+            interact = getattr(self.keymap, _BUTTON_ATTRS[0], None)
+            if interact:
+                commands.extend((Command("press", code=interact),
+                                 Command("release", code=interact)))
         if dx or dy:
             commands.append(Command("mouse_move", dx_px=dx, dy_px=dy))
         if commands:

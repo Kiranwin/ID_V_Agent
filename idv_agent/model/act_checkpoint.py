@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-ACT_CHECKPOINT_SCHEMA = "m14_act.visual_camera_prior_0p5.v1"
+ACT_CHECKPOINT_SCHEMA = "m17_act.camera_visual_summary.v1"
 _ACT_ADAPTER_KEYS = frozenset({"condition_projection"})
 
 
@@ -26,9 +26,9 @@ def load_act_adapter_state(adapter: torch.nn.Module, state: dict[str, Any]) -> N
     """Restore the m8 adapter contract and reject all learned raster states."""
     supplied = set(state)
     if "spatial_cell_projector" in supplied or "spatial_agg" in supplied or "visual_projection" in supplied:
-        raise ValueError("m7/M2/legacy visual projector checkpoint 不兼容 m14")
+        raise ValueError("m7/M2/legacy visual projector checkpoint 不兼容 m17")
     if supplied != _ACT_ADAPTER_KEYS:
-        raise ValueError(f"m14 ACT adapter state 必须恰好包含 {sorted(_ACT_ADAPTER_KEYS)}，收到 {sorted(supplied)}")
+        raise ValueError(f"m17 ACT adapter state 必须恰好包含 {sorted(_ACT_ADAPTER_KEYS)}，收到 {sorted(supplied)}")
     projection_state = state["condition_projection"]
     try:
         output_dim, input_dim = projection_state["weight"].shape
@@ -45,7 +45,7 @@ def load_visual_grounded_act_checkpoint(adapter: torch.nn.Module, core: torch.nn
                                         checkpoint: dict[str, Any]) -> None:
     """Restore a complete m8 ACT checkpoint or fail before partial loading."""
     if checkpoint.get("checkpoint_schema_version") != ACT_CHECKPOINT_SCHEMA:
-        raise ValueError("旧 ACT checkpoint 不兼容；需要 m14_act.visual_camera_prior_0p5.v1")
+        raise ValueError("旧 ACT checkpoint 不兼容；需要 m17_act.camera_visual_summary.v1")
     if not isinstance(checkpoint.get("adapter"), dict) or not isinstance(checkpoint.get("core"), dict):
         raise ValueError("ACT checkpoint 缺少 adapter/core")
     load_act_adapter_state(adapter, checkpoint["adapter"])
