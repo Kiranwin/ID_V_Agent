@@ -19,7 +19,7 @@ from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import (_contiguous_subset, _bounded_subset, _stratified_subset, _dataset_paths,
                                           _load_act_base_backbone, _model_inputs,
-                                          encode_batch, _scheduled_condition)
+                                          encode_batch, _scheduled_condition, _interact_event_metrics)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
 from idv_agent.training.vla_loss import compute_vla_loss
@@ -44,6 +44,9 @@ def _load(args):
         encode_batch(adapter, next(iter(loader)), device=device)
     saved = torch.load(args.checkpoint, map_location=device, weights_only=False)
     load_visual_grounded_act_checkpoint(adapter, core, saved)
+    core.interact_event_threshold = float(
+        saved.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
+    )
     adapter.eval(); core.eval()
     return device, amp, adapter, core, {"stage": "base_without_m2"}, manifest
 
@@ -61,6 +64,7 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
         "slow_intent_loss_sum": 0.0, "slow_subgoal_loss_sum": 0.0, "slow_count": 0,
         "move_total": 0, "move_nonstop_pred": 0, "move_nonstop_total": 0,
         "button_pred_positive_counts": [0] * 6, "button_target_positive_counts": [0] * 6,
+        "event_logits": [], "event_targets": [], "event_masks": [],
     }
     with torch.no_grad():
         for batch in loader:
@@ -101,11 +105,20 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
                 if t != 0:
                     out["move_nonstop_total"] += 1
                     out["move_nonstop_pred"] += int(p != 0)
-            button_pred = (fast_pass.fast.button_logits[0] > 0).to(torch.int64)
+            event_threshold = float(getattr(core, "interact_event_threshold", 0.0))
+            button_pred = fast_pass.fast.button_predictions(
+                event_threshold=event_threshold
+            )[0].to(torch.int64)
             button_target = mb["button_target"][0].to(torch.int64)
             for i in range(button_pred.shape[-1]):
                 out["button_pred_positive_counts"][i] += int(button_pred[:, i].sum())
                 out["button_target_positive_counts"][i] += int(button_target[:, i].sum())
+            event_logits = (fast_pass.fast.interact_event_logits
+                            if fast_pass.fast.interact_event_logits is not None
+                            else fast_pass.fast.button_logits[..., 0])
+            out["event_logits"].append(event_logits[0].detach().cpu())
+            out["event_targets"].append(mb["button_target"][0, :, 0].detach().cpu())
+            out["event_masks"].append(torch.ones_like(mb["button_target"][0, :, 0], dtype=torch.bool).cpu())
     if out["slow_count"]:
         out["slow_intent_loss_mean"] = out["slow_intent_loss_sum"] / out["slow_count"]
         out["slow_subgoal_loss_mean"] = out["slow_subgoal_loss_sum"] / out["slow_count"]
@@ -113,6 +126,15 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
         out["move_nonstop_pred"] / out["move_nonstop_total"] if out["move_nonstop_total"] else None)
     out["interact_pred_positive"] = out["button_pred_positive_counts"][0]
     out["interact_target_positive"] = out["button_target_positive_counts"][0]
+    if out["event_logits"]:
+        out["interact_event"] = _interact_event_metrics(
+            torch.stack(out.pop("event_logits")),
+            torch.stack(out.pop("event_targets")),
+            torch.stack(out.pop("event_masks")),
+            threshold=float(getattr(core, "interact_event_threshold", 0.0)),
+        )
+    else:
+        out["interact_event"] = None
     total = stats["hits"] + stats["encoded"]
     out["frame_cache"] = {
         "hits": stats["hits"], "misses": stats["encoded"],

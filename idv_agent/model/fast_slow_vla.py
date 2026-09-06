@@ -73,15 +73,24 @@ def fuse_fast_outputs(visual: FastVLAOutput, prior: FastVLAOutput,
     if not 0.0 <= scale <= 1.0:
         raise ValueError("prior_scale 必须在 [0,1]")
     prior_logits = (lambda value: torch.tanh(value) if bound_prior else value)
+    visual_event = (visual.interact_event_logits if visual.interact_event_logits is not None
+                    else visual.button_logits[..., 0])
+    prior_event = (prior.interact_event_logits if prior.interact_event_logits is not None
+                   else prior.button_logits[..., 0])
+    event_logits = visual_event + scale * prior_logits(prior_event)
+    button_logits = visual.button_logits + scale * prior_logits(prior.button_logits)
+    button_logits = button_logits.clone()
+    button_logits[..., 0] = event_logits
     return FastVLAOutput(
         move_logits=visual.move_logits + scale * prior_logits(prior.move_logits),
         camera_dx_logits=visual.camera_dx_logits + scale * prior_logits(prior.camera_dx_logits),
         camera_dy_logits=visual.camera_dy_logits + scale * prior_logits(prior.camera_dy_logits),
-        button_logits=visual.button_logits + scale * prior_logits(prior.button_logits),
+        button_logits=button_logits,
         duration=(visual.duration + scale * (prior.duration - 6.0)).clamp(1.0, 30.0),
         confidence=(visual.confidence + scale * (prior.confidence - 0.5)).clamp(0.0, 1.0),
         stop_or_replan=(visual.stop_or_replan + scale * (prior.stop_or_replan - 0.5)).clamp(0.0, 1.0),
         intent_context_logits=visual.intent_context_logits + scale * prior_logits(prior.intent_context_logits),
+        interact_event_logits=event_logits,
     )
 
 
@@ -224,6 +233,7 @@ class SharedFastSlowVLA(nn.Module):
             confidence=visual.fast.confidence,
             stop_or_replan=visual.fast.stop_or_replan,
             intent_context_logits=visual.fast.intent_context_logits,
+            interact_event_logits=visual.fast.interact_event_logits,
         )
         prior_slow = self.slow_head(slow_temporal) if run_slow and slow_temporal is not None else None
         slow = visual.slow if prior_slow is not None else None

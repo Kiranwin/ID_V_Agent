@@ -41,6 +41,7 @@ class VLALossWeights:
     # scalar, preventing a majority interaction label from collapsing to all
     # ones (or a rare key from collapsing to all zeros).
     button_global_counts: Optional[torch.Tensor] = None
+    interact_event_positive_weight: float = 3.0
 
 
 def balanced_class_weights(counts: torch.Tensor, *, min_weight: float = 0.35,
@@ -170,26 +171,40 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
     cam_dy = F.cross_entropy(fast.camera_dy_logits.transpose(1, 2), batch["camera_dy_target"],
                              weight=camera_dy_weight, reduction="none")
     button_target = batch["button_target"].to(fast.button_logits.dtype)
+    event_target = button_target[..., 0]
+    ordinary_button_target = button_target[..., 1:]
     if weights.button_global_counts is not None:
         counts = weights.button_global_counts.to(device=fast.button_logits.device,
                                                  dtype=fast.button_logits.dtype)
         if counts.ndim != 2 or counts.shape[0] != fast.button_logits.shape[-1] or counts.shape[1] != 2:
             raise ValueError("button_global_counts 必须是 [num_buttons, 2]，列为 negative/positive")
         pos_weight = (counts[:, 0] / counts[:, 1].clamp_min(1.0)).clamp_min(1e-3)
-        positive_weight = torch.where(button_target > 0, pos_weight, torch.ones_like(button_target))
+        positive_weight = torch.where(ordinary_button_target > 0, pos_weight[1:],
+                                      torch.ones_like(ordinary_button_target))
     else:
-        positive_weight = torch.where(button_target > 0,
+        positive_weight = torch.where(ordinary_button_target > 0,
                                       torch.as_tensor(weights.button_positive_weight, device=fast.button_logits.device,
                                                       dtype=fast.button_logits.dtype),
                                       torch.ones((), device=fast.button_logits.device,
                                                  dtype=fast.button_logits.dtype))
-    buttons = F.binary_cross_entropy_with_logits(fast.button_logits, button_target,
+    buttons = F.binary_cross_entropy_with_logits(fast.button_logits[..., 1:], ordinary_button_target,
                                                  weight=positive_weight, reduction="none")
+    event_logits = (fast.interact_event_logits if fast.interact_event_logits is not None
+                    else fast.button_logits[..., 0])
+    event_weight = torch.where(
+        event_target > 0,
+        torch.as_tensor(weights.interact_event_positive_weight,
+                        device=event_logits.device, dtype=event_logits.dtype),
+        torch.ones_like(event_target),
+    )
+    interact_event = F.binary_cross_entropy_with_logits(
+        event_logits, event_target, weight=event_weight, reduction="none")
     duration = F.smooth_l1_loss(fast.duration, batch["duration_target"], reduction="none")
     losses = {
         "fast_move": _masked_mean(move, fast_mask),
         "fast_camera": _masked_mean(cam_dx + cam_dy, fast_mask),
         "fast_buttons": _masked_mean(buttons, fast_mask),
+        "fast_interact_event": _masked_mean(interact_event, fast_mask),
         "fast_duration": _masked_mean(duration, fast_mask),
     }
     zero = fast.move_logits.sum() * 0.0
@@ -223,6 +238,7 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
         weights.move * losses["fast_move"]
         + weights.camera * losses["fast_camera"]
         + weights.buttons * losses["fast_buttons"]
+        + weights.buttons * losses["fast_interact_event"]
         + weights.duration * losses["fast_duration"]
         + weights.slow_intent * losses["slow_intent"]
         + weights.slow_subgoal * losses["slow_subgoal"]
@@ -238,7 +254,7 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
             visual_fast, visual_slow, batch,
             weights=replace(weights, consistency=0.0, visual_aux=0.0),
         )
-        names = ("fast_move", "fast_camera", "fast_buttons", "fast_duration",
+        names = ("fast_move", "fast_camera", "fast_buttons", "fast_interact_event", "fast_duration",
                  "slow_intent", "slow_subgoal")
         for name in names:
             losses[f"visual_{name}"] = visual_base[name]
@@ -246,7 +262,7 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
         total = total + weights.visual_aux * visual_total
     else:
         zero = fast.move_logits.sum() * 0.0
-        for name in ("fast_move", "fast_camera", "fast_buttons", "fast_duration",
+        for name in ("fast_move", "fast_camera", "fast_buttons", "fast_interact_event", "fast_duration",
                      "slow_intent", "slow_subgoal"):
             losses[f"visual_{name}"] = zero
     return {"total": total, **losses}

@@ -137,6 +137,129 @@ def test_evaluation_metrics_include_recalls_and_zero_bucket_false_turn_rate():
     assert metrics["zero_false_turn_rate"] == 1 / 4
 
 
+def test_interact_event_metrics_report_precision_recall_and_logits():
+    import torch
+    from idv_agent.scripts.train_vla import _interact_event_metrics
+
+    metrics = _interact_event_metrics(
+        torch.tensor([[2.0, -1.0], [-2.0, 1.0]]),
+        torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        torch.ones(2, 2, dtype=torch.bool),
+    )
+    assert metrics["tp"] == 2
+    assert metrics["fp"] == 0
+    assert metrics["precision"] == 1.0
+    assert metrics["recall"] == 1.0
+    assert metrics["per_step_target_positive"] == [1.0, 1.0]
+
+
+def test_interact_event_threshold_fits_separated_scores_with_fp_limit():
+    import torch
+    from idv_agent.scripts.train_vla import _fit_interact_event_threshold
+
+    threshold, report = _fit_interact_event_threshold(
+        torch.tensor([-8.0, -7.0, -6.0, -1.0, -0.5]),
+        torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0]),
+        max_false_positive_rate=0.15,
+    )
+    assert -6.0 < threshold < -1.0
+    assert report["false_positive_rate"] == 0.0
+    assert report["recall"] == 1.0
+
+
+def test_interact_event_threshold_can_use_strict_event_fpr():
+    import torch
+    from idv_agent.scripts.train_vla import _fit_interact_event_threshold
+
+    threshold, report = _fit_interact_event_threshold(
+        torch.tensor([-8.0, -7.0, -6.0, -3.0, -1.0]),
+        torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0]),
+        max_false_positive_rate=0.02,
+    )
+    assert threshold > -3.0
+    assert report["false_positive_rate"] == 0.0
+    assert report["recall"] == 1.0
+
+
+def test_ordinary_button_bias_init_returns_only_five_held_channels():
+    import torch
+    from idv_agent.scripts.train_vla import _ordinary_button_bias_init
+
+    dataset = [
+        {"button_target": torch.tensor([
+            [0, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0],
+        ], dtype=torch.float32)},
+        {"button_target": torch.zeros(4, 6)},
+    ]
+    bias = _ordinary_button_bias_init(dataset)
+    assert bias.shape == (4, 5)
+    assert bias[0, 0].item() == pytest.approx(0.0)
+    assert bias[1, 0].item() < -8.0
+
+
+def test_interact_event_metrics_uses_explicit_threshold():
+    import torch
+    from idv_agent.scripts.train_vla import _interact_event_metrics
+
+    metrics = _interact_event_metrics(
+        torch.tensor([[-2.0, -5.0], [-4.0, -5.0]]),
+        torch.tensor([[1.0, 0.0], [0.0, 0.0]]),
+        torch.ones(2, 2, dtype=torch.bool),
+        threshold=-3.0,
+    )
+    assert metrics["threshold_logit"] == -3.0
+    assert metrics["tp"] == 1
+    assert metrics["fp"] == 0
+
+
+def test_evaluate_event_threshold_supports_batched_future_steps(monkeypatch):
+    import torch
+    from types import SimpleNamespace
+    import idv_agent.scripts.train_vla as train_vla
+
+    fast = SimpleNamespace(
+        move_logits=torch.zeros(2, 2, 9), camera_dx_logits=torch.zeros(2, 2, 5),
+        camera_dy_logits=torch.zeros(2, 2, 5), button_logits=torch.zeros(2, 2, 6),
+        interact_event_logits=torch.tensor([[-2.0, -3.0], [-4.0, -5.0]]),
+    )
+    slow = SimpleNamespace(intent_logits=torch.zeros(2, 8))
+    output = SimpleNamespace(fast=fast, slow=slow)
+    batch = {
+        "fast_loss_mask": torch.ones(2), "move_target": torch.zeros(2, 2, dtype=torch.long),
+        "camera_dx_target": torch.zeros(2, 2, dtype=torch.long),
+        "camera_dy_target": torch.zeros(2, 2, dtype=torch.long),
+        "button_target": torch.zeros(2, 2, 6), "intent_target": torch.zeros(2, dtype=torch.long),
+    }
+    monkeypatch.setattr(train_vla, "forward_loss", lambda *args, **kwargs: ({"total": torch.tensor(1.)}, output))
+    monkeypatch.setattr(train_vla, "_slow_accuracy", lambda *args, **kwargs: 1.0)
+    result = train_vla._evaluate(torch.nn.Module(), torch.nn.Module(), [batch],
+                                 torch.device("cpu"), False, event_threshold=-3.0)
+    assert result["interact_pred_positive"] == 2
+
+
+def test_apply_interact_event_threshold_reuses_evaluation_without_reencoding():
+    import torch
+    from idv_agent.scripts.train_vla import _apply_interact_event_threshold
+
+    result = {
+        "button_pred_positive_counts": [99, 3, 0, 0, 0, 0],
+        "button_target_positive_counts": [2, 3, 0, 0, 0, 0],
+        "interact_pred_positive": 99,
+        "interact_target_positive": 2,
+    }
+    updated = _apply_interact_event_threshold(
+        result,
+        torch.tensor([[-2.0, -4.0], [-5.0, -6.0]]),
+        torch.tensor([[1.0, 0.0], [0.0, 0.0]]),
+        threshold=-3.0,
+    )
+    assert updated["button_pred_positive_counts"] == [1, 3, 0, 0, 0, 0]
+    assert updated["interact_pred_positive"] == 1
+    assert updated["interact_target_positive"] == 1
+    assert updated["interact_event"]["recall"] == 1.0
+
+
 def test_balance_acceptance_requires_baseline_and_enforces_zero_turn_limit():
     from idv_agent.scripts.train_vla import _balance_acceptance
 
@@ -254,3 +377,59 @@ def test_act_training_no_longer_requires_m2_checkpoint(monkeypatch):
     with pytest.raises(ValueError, match="VLA JSONL 不存在"):
         train(args)
     assert called == [123]
+
+
+def test_event_centered_merge_removes_periodic_future_overlap():
+    from idv_agent.scripts.prepare_mvp_data import _merge_event_centered_rows
+
+    def row(start, mode):
+        return {"episode_id": "ep", "anchor_frame": start - 2,
+                "alignment": {"action_start_frame": start,
+                               "action_end_frame": start + 23},
+                "auxiliary": {"sampling_mode": mode}}
+
+    merged = _merge_event_centered_rows(
+        [row(23, "periodic"), row(47, "periodic"), row(71, "periodic")],
+        [row(40, "event_centered")],
+    )
+
+    assert [item["auxiliary"]["sampling_mode"] for item in merged] == [
+        "event_centered", "periodic"
+    ]
+    assert [item["alignment"]["action_start_frame"] for item in merged] == [40, 71]
+
+
+def test_event_centered_merge_drops_periodic_interact_when_event_window_unavailable():
+    from idv_agent.scripts.prepare_mvp_data import _merge_event_centered_rows
+
+    periodic = {
+        "episode_id": "ep", "anchor_frame": 50,
+        "alignment": {"action_start_frame": 52, "action_end_frame": 75},
+        "action_chunk": [
+            {"buttons": [0, 0, 0, 0, 0, 0]},
+            {"buttons": [0, 0, 0, 0, 0, 0]},
+            {"buttons": [0, 0, 0, 0, 0, 0]},
+            {"buttons": [1, 0, 0, 0, 0, 0]},
+        ],
+        "auxiliary": {"sampling_mode": "periodic"},
+    }
+
+    assert _merge_event_centered_rows([periodic], []) == []
+
+
+def test_interact_event_bias_init_returns_only_future_event_logits():
+    import torch
+    from idv_agent.scripts.train_vla import _interact_event_bias_init
+
+    dataset = [
+        {"button_target": torch.tensor([
+            [1, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0],
+        ], dtype=torch.float32)},
+        {"button_target": torch.zeros(4, 6)},
+    ]
+
+    prior = _interact_event_bias_init(dataset)
+    assert prior.shape == (4,)
+    assert prior[0].item() == pytest.approx(0.0)
+    assert prior[1].item() < -8.0

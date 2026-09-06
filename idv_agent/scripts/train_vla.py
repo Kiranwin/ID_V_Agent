@@ -38,7 +38,7 @@ from idv_agent.training.feature_activity import training_behavior_gate
 from idv_agent.training.vla_loss import VLALossWeights, balanced_class_weights, compute_vla_loss
 from idv_agent.training.utils import set_seed
 from idv_agent.configs.subgoal import SUBGOAL_NAMES
-from idv_agent.vla.action_chunk import INTENTS, VLA_SCHEMA_VERSION_V5
+from idv_agent.vla.action_chunk import ACTION_CHUNK_HORIZON, INTENTS, VLA_SCHEMA_VERSION_V5
 
 
 def _freeze_qwen(adapter: torch.nn.Module) -> None:
@@ -684,6 +684,44 @@ def _class_balance_statistics(dataset) -> dict[str, torch.Tensor]:
     return counts
 
 
+def _interact_event_bias_init(dataset, *, horizon: int = ACTION_CHUNK_HORIZON,
+                              eps: float = 1e-4) -> torch.Tensor:
+    """Initialize the independent Q-event head from chunk-level event rates."""
+    if not 0.0 < eps < 0.5:
+        raise ValueError("interact event bias eps 必须在 (0, 0.5) 内")
+    positive = torch.zeros(horizon, dtype=torch.float64)
+    total_chunks = 0
+    for index in range(len(dataset)):
+        target = dataset[index]["button_target"]
+        if target.ndim != 2 or target.shape != (horizon, 6):
+            raise ValueError(f"button_target 必须是 [{horizon},6] Tensor")
+        positive += target[:, 0].to(torch.float64)
+        total_chunks += 1
+    if total_chunks < 1:
+        raise ValueError("interact event bias 需要至少一个动作块")
+    rate = (positive / total_chunks).clamp(eps, 1.0 - eps)
+    return torch.logit(rate).to(torch.float32)
+
+
+def _ordinary_button_bias_init(dataset, *, horizon: int = ACTION_CHUNK_HORIZON,
+                               eps: float = 1e-4) -> torch.Tensor:
+    """Initialize five held-button logits from train-subset rates."""
+    if not 0.0 < eps < 0.5:
+        raise ValueError("ordinary button bias eps 必须在 (0, 0.5) 内")
+    positive = torch.zeros((horizon, 5), dtype=torch.float64)
+    total_chunks = 0
+    for index in range(len(dataset)):
+        target = dataset[index]["button_target"]
+        if target.ndim != 2 or target.shape != (horizon, 6):
+            raise ValueError(f"button_target 必须是 [{horizon},6] Tensor")
+        positive += target[:, 1:].to(torch.float64)
+        total_chunks += 1
+    if total_chunks < 1:
+        raise ValueError("ordinary button bias 需要至少一个动作块")
+    rate = (positive / total_chunks).clamp(eps, 1.0 - eps)
+    return torch.logit(rate).to(torch.float32)
+
+
 def _class_balance_manifest(statistics: dict[str, torch.Tensor], *, data_paths: list[str],
                             sample_count: int | None = None, sampling: str | None = None,
                             max_samples: int | None = None) -> dict[str, object]:
@@ -882,6 +920,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("ACT raw-grid feature dim 未 materialize")
     core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
+    interact_event_bias_init = _interact_event_bias_init(dataset, horizon=ACTION_CHUNK_HORIZON)
+    core.visual_expert.set_interact_event_bias(interact_event_bias_init)
+    ordinary_button_bias_init = _ordinary_button_bias_init(dataset, horizon=ACTION_CHUNK_HORIZON)
+    core.visual_expert.set_ordinary_button_bias(ordinary_button_bias_init)
     visual_center = _calibrate_visual_input_center(
         adapter, core, dataset, device=device,
         samples=int(getattr(args, "visual_center_samples", 64)),
@@ -980,6 +1022,26 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             peak_memory = max(peak_memory, torch.cuda.max_memory_allocated(device))
 
     mask = _mask_comparison(history, adapter, core, first_batch, device, amp_enabled)
+    # Calibrate the independent Q-event decision from training scores only.
+    # Validation data is never used to choose this threshold.
+    train_event_scores: dict[str, list[torch.Tensor]] = {}
+    train_result = _evaluate(
+        adapter, core, eval_loader, device, amp_enabled,
+        raw_feature_cache=raw_feature_cache, event_score_sink=train_event_scores,
+    )
+    if not train_event_scores.get("logits"):
+        raise RuntimeError("训练集未产生 interact event calibration logits")
+    event_threshold, event_threshold_report = _fit_interact_event_threshold(
+        torch.cat(train_event_scores["logits"]),
+        torch.cat(train_event_scores["targets"]),
+        max_false_positive_rate=float(getattr(args, "interact_event_max_fpr", 0.02)),
+    )
+    train_result = _apply_interact_event_threshold(
+        train_result,
+        torch.cat(train_event_scores["logits"]),
+        torch.cat(train_event_scores["targets"]),
+        threshold=event_threshold,
+    )
     checkpoint = Path(args.checkpoint)
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     adapter_state = act_adapter_state(adapter)
@@ -1016,6 +1078,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "camera_prior_scale": float(core.camera_prior_scale),
                   "visual_input_center": visual_center,
                   "visual_feature_scale": float(core.visual_expert.visual_feature_scale),
+                  "interact_event_bias_init": interact_event_bias_init.tolist(),
+                  "ordinary_button_bias_init": ordinary_button_bias_init.tolist(),
+                  "interact_event_threshold": float(event_threshold),
+                  "interact_event_threshold_calibration": event_threshold_report,
+                  "interact_event_max_false_positive_rate": float(
+                      getattr(args, "interact_event_max_fpr", 0.02)),
                   "button_positive_weight": args.button_positive_weight,
                   "move_direction_balance": args.move_direction_balance,
                   "class_balance": class_balance_manifest,
@@ -1037,7 +1105,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     # directory from making a checkpoint's provenance ambiguous.
     torch.save({**saved, "manifest": manifest}, checkpoint)
     val_result = (_evaluate(adapter, core, val_loader, device, amp_enabled,
-                            raw_feature_cache=raw_feature_cache)
+                            raw_feature_cache=raw_feature_cache,
+                            event_threshold=event_threshold)
                   if val_loader is not None else None)
     baseline_result = None
     baseline_path = str(getattr(args, "acceptance_baseline", "") or "")
@@ -1066,7 +1135,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 adapter, core, eval_loader, device, amp_enabled,
                 max_samples=int(getattr(args, "max_eval_samples", 64) or 0) or None,
                 raw_feature_cache=raw_feature_cache),
-            "val": val_result, "class_balance_acceptance": acceptance}
+            "train": train_result, "val": val_result,
+            "interact_event_threshold": float(event_threshold),
+            "interact_event_threshold_calibration": event_threshold_report,
+            "class_balance_acceptance": acceptance}
     (checkpoint.parent / "metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if getattr(args, "require_training_behavior", False) and not training_behavior["pass"]:
@@ -1118,6 +1190,101 @@ def _classification_metrics(confusion: list[list[int]], *, zero_class: int | Non
     return result
 
 
+def _fit_interact_event_threshold(logits: torch.Tensor, target: torch.Tensor,
+                                  *, max_false_positive_rate: float = 0.15) -> tuple[float, dict[str, float]]:
+    """Fit a fixed event threshold using training scores only.
+
+    Among thresholds satisfying the false-positive-rate limit, choose the one
+    with highest recall, then the highest threshold for deterministic safety.
+    """
+    if not 0.0 <= float(max_false_positive_rate) <= 1.0:
+        raise ValueError("max_false_positive_rate 必须在 [0,1]")
+    scores = logits.detach().reshape(-1).to(torch.float64)
+    labels = target.detach().reshape(-1).to(torch.bool)
+    if scores.numel() < 1 or scores.numel() != labels.numel():
+        raise ValueError("事件 threshold 拟合需要等长非空 logits/target")
+    unique = torch.unique(scores).sort().values
+    if unique.numel() == 1:
+        candidates = unique
+    else:
+        candidates = torch.cat((
+            unique[:1] - 1.0,
+            (unique[:-1] + unique[1:]) / 2.0,
+            unique[-1:] + 1.0,
+        ))
+    best = None
+    for value in candidates.tolist():
+        predicted = scores >= value
+        positives = labels.sum().item()
+        negatives = (~labels).sum().item()
+        tp = (predicted & labels).sum().item()
+        fp = (predicted & ~labels).sum().item()
+        recall = tp / positives if positives else 0.0
+        fpr = fp / negatives if negatives else 0.0
+        if fpr <= float(max_false_positive_rate):
+            key = (recall, value)
+            if best is None or key > best[0]:
+                best = (key, float(value), recall, fpr)
+    if best is None:
+        value = float(scores.max().item() + 1e-6)
+        recall = 0.0
+        fpr = 0.0
+    else:
+        _, value, recall, fpr = best
+    return value, {"false_positive_rate": float(fpr), "recall": float(recall)}
+
+
+def _interact_event_metrics(logits: torch.Tensor, target: torch.Tensor,
+                            mask: torch.Tensor, *, threshold: float = 0.0) -> dict[str, object]:
+    """Report the one-shot Q event independently from held-button metrics."""
+    logits = logits.detach()
+    target = target.detach()
+    mask = mask.bool()
+    event_logits = logits[mask]
+    event_target = target[mask].to(torch.bool)
+    predicted = event_logits >= float(threshold)
+    predicted_grid = logits >= float(threshold)
+    tp = int((predicted & event_target).sum())
+    fp = int((predicted & ~event_target).sum())
+    target_positive = int(event_target.sum())
+    predicted_positive = int(predicted.sum())
+    return {
+        "threshold_logit": float(threshold),
+        "tp": tp,
+        "fp": fp,
+        "target_positive": target_positive,
+        "predicted_positive": predicted_positive,
+        "precision": (tp / predicted_positive if predicted_positive else None),
+        "recall": (tp / target_positive if target_positive else None),
+        "positive_logit_mean": (float(event_logits[event_target].mean().cpu())
+                                 if bool(event_target.any()) else None),
+        "negative_logit_mean": (float(event_logits[~event_target].mean().cpu())
+                                 if bool((~event_target).any()) else None),
+        "per_step_target_positive": (target.detach() * mask.to(target.dtype)).sum(dim=0).cpu().tolist(),
+        "per_step_predicted_positive": (predicted_grid * mask).sum(dim=0).cpu().tolist(),
+    }
+
+
+def _apply_interact_event_threshold(result: dict[str, Any], logits: torch.Tensor,
+                                    target: torch.Tensor, *, threshold: float) -> dict[str, Any]:
+    """Apply a calibrated Q threshold to an existing evaluation result."""
+    logits = logits.detach()
+    target = target.detach()
+    predicted = logits >= float(threshold)
+    positive_count = int(predicted.sum())
+    target_count = int(target.to(torch.bool).sum())
+    updated = dict(result)
+    counts = list(result.get("button_pred_positive_counts", [0] * 6))
+    counts[0] = positive_count
+    updated["button_pred_positive_counts"] = counts
+    updated["interact_pred_positive"] = positive_count
+    updated["interact_target_positive"] = target_count
+    updated["interact_event"] = _interact_event_metrics(
+        logits, target, torch.ones_like(logits, dtype=torch.bool), threshold=threshold,
+    )
+    return updated
+
+
 def _balance_acceptance(current: dict[str, Any], baseline: dict[str, Any] | None = None) -> dict[str, Any]:
     """Compare held-out class recalls without confusing observability with proof.
 
@@ -1166,7 +1333,9 @@ def _balance_acceptance(current: dict[str, Any], baseline: dict[str, Any] | None
             "failures": failures}
 
 
-def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: Any | None = None):
+def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: Any | None = None,
+              event_threshold: float = 0.0,
+              event_score_sink: dict[str, list[torch.Tensor]] | None = None):
     """Evaluate a bounded validation loader without updating model parameters."""
     if loader is None:
         return None
@@ -1183,6 +1352,9 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
     intent_confusion = [[0] * 8 for _ in range(8)]
     button_pred = [0] * 6
     button_target = [0] * 6
+    event_logits_rows: list[torch.Tensor] = []
+    event_target_rows: list[torch.Tensor] = []
+    event_mask_rows: list[torch.Tensor] = []
     non_stop_pred = 0
     non_stop_total = 0
     # Eval runs adapter.eval() + torch.no_grad(): safe to deduplicate vision
@@ -1218,9 +1390,35 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
             button_logits = output.fast.button_logits[mask]
             button_targets = batch["button_target"].to(output_device)[mask]
             button_pred_tensor = (button_logits > 0).to(torch.int64)
+            explicit_event_logits = getattr(output.fast, "interact_event_logits", None)
+            event_logits = (explicit_event_logits
+                            if explicit_event_logits is not None
+                            else output.fast.button_logits[..., 0])
+            event_mask = mask
+            if event_mask.shape != event_logits.shape:
+                if event_mask.ndim == 1 and event_mask.shape[0] == event_logits.shape[0]:
+                    event_mask = event_mask.unsqueeze(-1).expand_as(event_logits)
+                else:
+                    raise ValueError("fast_loss_mask 必须是 [B] 或与 interact_event_logits 同形状")
+            event_predictions = (event_logits[event_mask] >= float(event_threshold)).to(torch.int64)
+            if event_predictions.ndim == 2 and button_pred_tensor.shape[0] == event_predictions.shape[0]:
+                button_pred_tensor[..., 0] = event_predictions
+            elif button_pred_tensor.ndim == 3:
+                button_pred_tensor[..., 0] = event_predictions.reshape(
+                    button_pred_tensor.shape[0], button_pred_tensor.shape[1]
+                )
+            else:
+                button_pred_tensor[:, 0] = event_predictions.reshape(-1)
             for i in range(button_pred_tensor.shape[-1]):
                 button_pred[i] += int(button_pred_tensor[..., i].sum())
                 button_target[i] += int((button_targets[..., i] > 0).sum())
+            event_logits_rows.append(event_logits.detach().cpu())
+            event_target_rows.append(batch["button_target"].to(output_device)[..., 0].detach().cpu())
+            event_mask_rows.append(event_mask.detach().cpu())
+            if event_score_sink is not None:
+                event_score_sink.setdefault("logits", []).append(event_logits[event_mask].detach().cpu())
+                event_score_sink.setdefault("targets", []).append(
+                    batch["button_target"].to(output_device)[..., 0][event_mask].detach().cpu())
             for logits, target_key, confusion in (
                 (getattr(output.fast, "camera_dx_logits", None), "camera_dx_target", camera_dx_confusion),
                 (getattr(output.fast, "camera_dy_logits", None), "camera_dy_target", camera_dy_confusion),
@@ -1251,6 +1449,14 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
                               raw_feature_cache=raw_feature_cache)
     hits = frame_stats["hits"]
     total = frame_stats["encoded"] + hits
+    if event_logits_rows:
+        event_metrics = _interact_event_metrics(
+            torch.cat(event_logits_rows), torch.cat(event_target_rows),
+            torch.cat(event_mask_rows),
+            threshold=event_threshold,
+        )
+    else:
+        event_metrics = None
     return {"loss": (sum(losses) / len(losses) if losses else None),
             "slow_accuracy": slow_acc,
             "frame_cache": {
@@ -1269,6 +1475,7 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
             },
             "button_pred_positive_counts": button_pred, "button_target_positive_counts": button_target,
             "interact_pred_positive": button_pred[0], "interact_target_positive": button_target[0],
+            "interact_event": event_metrics,
             "move_nonstop_prediction_rate": (non_stop_pred / non_stop_total if non_stop_total else None)}
 
 
@@ -1320,6 +1527,8 @@ def main(argv=None) -> int:
     parser.add_argument("--image-augmentation", action=argparse.BooleanOptionalAction, default=True,
                         help="训练窗口共享色彩/平移增强；验证和缓存路径始终关闭")
     parser.add_argument("--button-positive-weight", type=float, default=4.0)
+    parser.add_argument("--interact-event-max-fpr", type=float, default=0.02,
+                        help="仅用训练集拟合 Q 阈值时允许的最大逐步假阳性率")
     parser.add_argument("--button-global-balance", action="store_true",
                         help="按训练子集每个 button 的全局正/负计数计算 BCE 权重")
     parser.add_argument("--teacher-forcing-start", type=float, default=1.0,

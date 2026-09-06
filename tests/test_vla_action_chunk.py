@@ -268,6 +268,152 @@ def test_v5_default_stride_covers_q_between_future_windows(tmp_path: Path):
     assert any(action["buttons"][0] for record in records for action in record["action_chunk"])
 
 
+def test_v5_event_anchor_starts_action_at_q_frame(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(100):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n"
+        "40000,key_down,key:q,1\n"
+        "41000,key_up,key:q,0\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(100)),
+        encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(100)),
+        encoding="utf-8")
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,99,travel\n",
+        encoding="utf-8")
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 100, "target_fps": 30}), encoding="utf-8")
+    output = tmp_path / "vla_event.jsonl"
+
+    build(session, output, anchor_frames=[38], history_stride=3, history=8,
+          macro_frames=6, schema_version=VLA_SCHEMA_VERSION_V5)
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+
+    assert record["anchor_frame"] == 38
+    assert record["alignment"]["action_start_frame"] == 40
+    assert record["action_chunk"][0]["buttons"][0] == 1
+    assert record["observations"]["frames"][-1]["frame_index"] == 38
+
+
+def test_v5_event_centered_builder_derives_q_anchor_from_decode_start(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(100):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n"
+        "40000,key_down,key:q,1\n"
+        "41000,key_up,key:q,0\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(100)),
+        encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(100)),
+        encoding="utf-8")
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\nseg_000,0,99,travel\n",
+        encoding="utf-8")
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 100, "target_fps": 30}), encoding="utf-8")
+    output = tmp_path / "vla_event_auto.jsonl"
+
+    build(session, output, history_stride=3, history=8, macro_frames=6,
+          schema_version=VLA_SCHEMA_VERSION_V5, event_centered=True)
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+
+    assert record["anchor_frame"] == 38
+    assert record["alignment"]["action_start_frame"] == 40
+    assert record["action_chunk"][0]["buttons"][0] == 1
+    assert record["auxiliary"]["sampling_mode"] == "event_centered"
+
+
+def test_v5_event_centered_slow_label_uses_q_frame_intent(tmp_path: Path):
+    """A Q event at an intent boundary must supervise the new decipher stage."""
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(120):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n"
+        "40000,key_down,key:q,1\n"
+        "41000,key_up,key:q,0\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(120)),
+        encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(120)),
+        encoding="utf-8")
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\n"
+        "seg_travel,0,39,travel\n"
+        "seg_decipher,40,119,decipher\n", encoding="utf-8")
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 120, "target_fps": 30}), encoding="utf-8")
+    output = tmp_path / "vla_event_intent_boundary.jsonl"
+
+    build(session, output, history_stride=3, history=8, macro_frames=6,
+          schema_version=VLA_SCHEMA_VERSION_V5, event_centered=True)
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+
+    assert record["anchor_frame"] == 38
+    assert record["observations"]["frames"][-1]["frame_index"] == 38
+    assert record["observations"]["frames"][-1]["slow_label"]["intent"] == "travel"
+    assert record["alignment"]["action_start_frame"] == 40
+    assert record["slow_label"]["intent"] == "decipher"
+
+
+def test_v5_event_centered_q_overrides_conflicting_travel_segment(tmp_path: Path):
+    """Q is the canonical transition into decipher even if a segment lags."""
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for i in range(120):
+        (frames / f"{i:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n"
+        "40000,key_down,key:q,1\n"
+        "41000,key_up,key:q,0\n", encoding="utf-8")
+    (session / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{i * 1000}\n" for i in range(120)),
+        encoding="utf-8")
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n" + "".join(f"{i * 1000},0,0\n" for i in range(120)),
+        encoding="utf-8")
+    (session / "intent_segments.csv").write_text(
+        "segment_id,start_frame,end_frame,intent\n"
+        "seg_travel,0,119,travel\n", encoding="utf-8")
+    (session / "meta.json").write_text(
+        json.dumps({"recording_type": "vla_raw", "mode": "standard",
+                    "num_frames": 120, "target_fps": 30}), encoding="utf-8")
+    output = tmp_path / "vla_event_conflicting_segment.jsonl"
+
+    build(session, output, history_stride=3, history=8, macro_frames=6,
+          schema_version=VLA_SCHEMA_VERSION_V5, event_centered=True)
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+
+    assert record["slow_label"]["intent"] == "decipher"
+    assert record["slow_label"]["subgoal"] == "start_decoding"
+    assert record["auxiliary"]["decision_label_source"] == "decode_start_event"
+    assert record["auxiliary"]["source_segment_id"] == "seg_travel"
+
+
+def test_v5_event_anchor_rejects_non_causal_delay(tmp_path: Path):
+    with pytest.raises(ValueError, match="event|delay|anchor"):
+        build(tmp_path / "missing", tmp_path / "vla.jsonl", anchor_frames=[38],
+              history=8, action_delay_frames=0, schema_version=VLA_SCHEMA_VERSION_V5)
+
+
 def test_v5_history_actions_are_six_frame_macro_summaries(tmp_path: Path):
     session = tmp_path / "ep"
     frames = session / "frames"

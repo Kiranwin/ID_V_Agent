@@ -106,6 +106,7 @@ def test_visual_losses_are_explicit_and_weighted_separately():
         supervised["visual_fast_move"]
         + supervised["visual_fast_camera"]
         + supervised["visual_fast_buttons"]
+        + supervised["visual_fast_interact_event"]
         + 0.25 * supervised["visual_fast_duration"]
         + supervised["visual_slow_intent"]
         + 0.5 * supervised["visual_slow_subgoal"]
@@ -196,6 +197,71 @@ def test_visual_expert_has_no_constant_class_bias_and_normalizes_visual_pair():
     assert torch.equal(output.slow.intent_logits[0], torch.zeros_like(output.slow.intent_logits[0]))
 
 
+def test_visual_expert_exposes_interact_event_as_independent_head():
+    from idv_agent.model.vla_heads import VisualActionExpert
+
+    expert = VisualActionExpert(2, 4).eval()
+    assert expert.fast.interact_event is not expert.fast.buttons
+    with torch.no_grad():
+        output = expert(torch.zeros(1, 2, 2))
+    assert output.fast.interact_event_logits.shape == (1, 4)
+    assert torch.equal(output.fast.button_logits[..., 0],
+                       output.fast.interact_event_logits)
+
+
+def test_visual_expert_keeps_ordinary_buttons_on_an_independent_negative_baseline():
+    from idv_agent.model.vla_heads import VisualActionExpert
+
+    expert = VisualActionExpert(2, 4).eval()
+    bias = torch.full((4, 5), -4.0)
+    expert.set_ordinary_button_bias(bias)
+    with torch.no_grad():
+        output = expert(torch.zeros(1, 2, 2))
+    assert torch.allclose(output.fast.button_logits[0, :, 1:], bias)
+
+
+def test_fast_output_decodes_q_with_calibrated_threshold_only():
+    from idv_agent.model.vla_heads import FastVLAOutput
+
+    output = FastVLAOutput(
+        move_logits=torch.zeros(1, 1, 2), camera_dx_logits=torch.zeros(1, 1, 2),
+        camera_dy_logits=torch.zeros(1, 1, 2),
+        button_logits=torch.zeros(1, 1, 6), duration=torch.ones(1, 1),
+        confidence=torch.zeros(1), stop_or_replan=torch.zeros(1),
+        intent_context_logits=torch.zeros(1, 8),
+        interact_event_logits=torch.tensor([[-2.0]]),
+    )
+    assert not bool(output.button_predictions(event_threshold=-1.0)[0, 0, 0])
+    assert bool(output.button_predictions(event_threshold=-3.0)[0, 0, 0])
+
+
+def test_interact_event_loss_is_separate_from_ordinary_button_loss():
+    from idv_agent.model.vla_heads import FastVLAOutput
+    from idv_agent.training.vla_loss import VLALossWeights, compute_vla_loss
+
+    shape = (1, 2)
+    base = FastVLAOutput(
+        move_logits=torch.zeros(1, 2, 2), camera_dx_logits=torch.zeros(1, 2, 2),
+        camera_dy_logits=torch.zeros(1, 2, 2), button_logits=torch.zeros(1, 2, 6),
+        interact_event_logits=torch.zeros(shape), duration=torch.ones(shape),
+        confidence=torch.zeros(1), stop_or_replan=torch.zeros(1),
+        intent_context_logits=torch.zeros(1, 8),
+    )
+    batch = {
+        "fast_loss_mask": torch.ones(1), "move_target": torch.zeros(1, 2, dtype=torch.long),
+        "camera_dx_target": torch.zeros(1, 2, dtype=torch.long),
+        "camera_dy_target": torch.zeros(1, 2, dtype=torch.long),
+        "button_target": torch.tensor([[[1, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]]], dtype=torch.float32),
+        "duration_target": torch.ones(1, 2),
+    }
+    changed = FastVLAOutput(**{**base.__dict__, "button_logits": base.button_logits.clone()})
+    changed.interact_event_logits = torch.full(shape, 100.0)
+    first = compute_vla_loss(base, None, batch, VLALossWeights())
+    second = compute_vla_loss(changed, None, batch, VLALossWeights())
+    assert torch.equal(first["fast_buttons"], second["fast_buttons"])
+    assert not torch.equal(first["fast_interact_event"], second["fast_interact_event"])
+
+
 def test_visual_expert_class_heads_read_normalized_raw_pair_without_hidden_bottleneck():
     """The held-out raw-grid linear signal must not be compressed before logits."""
     from idv_agent.model.vla_heads import VisualActionExpert
@@ -279,6 +345,23 @@ def test_camera_visual_logits_respond_to_middle_frame_trajectory():
         first = expert(frames)
         second = expert(changed)
     assert not torch.equal(first.fast.camera_dx_logits, second.fast.camera_dx_logits)
+
+
+def test_camera_visual_logits_have_a_direct_full_pair_path():
+    from idv_agent.model.vla_heads import VisualActionExpert
+
+    expert = VisualActionExpert(2, 4).eval()
+    assert expert.camera_visual_pair_dx.in_features == expert.pair_dim
+    assert expert.camera_visual_pair_dy.in_features == expert.pair_dim
+    expert.camera_visual_dx.weight.data.zero_()
+    expert.camera_visual_dy.weight.data.zero_()
+    first = torch.zeros(1, 8, 2)
+    second = first.clone()
+    second[:, -1] = 1.0
+    with torch.no_grad():
+        first_out = expert(first)
+        second_out = expert(second)
+    assert not torch.equal(first_out.fast.camera_dx_logits, second_out.fast.camera_dx_logits)
 
 
 def test_camera_summary_uses_centered_scaled_visual_features():

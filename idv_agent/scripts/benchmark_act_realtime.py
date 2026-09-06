@@ -143,6 +143,9 @@ def _load_model(args: argparse.Namespace, device: torch.device):
     core = SharedFastSlowVLA(getattr(adapter, "act_feature_dim", adapter.hidden_size), temporal_dim=temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
     load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
+    core.interact_event_threshold = float(
+        checkpoint.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
+    )
     adapter.eval()
     core.eval()
     return adapter, core, {"stage": "base_without_m2"}
@@ -161,7 +164,8 @@ def _predict(core: SharedFastSlowVLA, window: RealtimeWindow, condition: SlowCon
     move = fast.move_logits.argmax(-1)[0]
     dx = fast.camera_dx_logits.argmax(-1)[0]
     dy = fast.camera_dy_logits.argmax(-1)[0]
-    buttons = (fast.button_logits.sigmoid() >= 0.5)[0]
+    event_threshold = float(getattr(core, "interact_event_threshold", 0.0))
+    buttons = fast.button_predictions(event_threshold=event_threshold)[0]
     duration = fast.duration[0]
     steps = []
     for i in range(fast.move_logits.shape[1]):

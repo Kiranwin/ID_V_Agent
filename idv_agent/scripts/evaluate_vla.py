@@ -49,6 +49,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         encode_batch(adapter, first, device=device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
+    event_threshold = float(
+        checkpoint.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
+    )
+    core.interact_event_threshold = event_threshold
     adapter.eval()
     core.eval()
     frame_cache: dict[tuple[str, int, str], torch.Tensor] = {}
@@ -95,7 +99,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             move_pred = output.fast.move_logits.argmax(-1)
             dx_pred = output.fast.camera_dx_logits.argmax(-1)
             dy_pred = output.fast.camera_dy_logits.argmax(-1)
-            buttons_pred = (output.fast.button_logits.sigmoid() >= 0.5).to(torch.float32)
+            buttons_pred = output.fast.button_predictions(event_threshold=event_threshold).to(torch.float32)
             move_target = model_batch["move_target"]
             dx_target = model_batch["camera_dx_target"]
             dy_target = model_batch["camera_dy_target"]

@@ -64,6 +64,9 @@ class ACTPolicy:
         self.history_stride = int(history_stride)
         self.use_time_deltas = bool(use_time_deltas)
         self.zero_history = bool(zero_history)
+        self.interact_event_threshold = float(getattr(core, "interact_event_threshold", 0.0))
+        if not torch.isfinite(torch.tensor(self.interact_event_threshold)):
+            raise ValueError("core.interact_event_threshold 必须是有限数")
         self.task_cache: TaskConditionCache = adapter.encode_task_once(
             instruction, mode, task_id=f"act:{id(self)}")
         self.window_span = (self.history_frames - 1) * self.history_stride + 1
@@ -153,7 +156,7 @@ class ACTPolicy:
         moves = fast.move_logits.argmax(-1)[0].tolist()
         dxs = fast.camera_dx_logits.argmax(-1)[0].tolist()
         dys = fast.camera_dy_logits.argmax(-1)[0].tolist()
-        buttons = (fast.button_logits.sigmoid() >= 0.5)[0]
+        buttons = fast.button_predictions(event_threshold=self.interact_event_threshold)[0]
         # v5 labels and executor history are fixed six-frame macro actions.
         # Do not expose the untrained variable-duration head to deployment.
         durations = [MACRO_FRAMES] * len(moves)

@@ -49,6 +49,23 @@ class FastVLAOutput:
     confidence: torch.Tensor
     stop_or_replan: torch.Tensor
     intent_context_logits: torch.Tensor
+    # Independent one-shot interaction event (Q) logits.  The first column of
+    # ``button_logits`` mirrors this tensor for wire compatibility, but is not
+    # part of the ordinary held-button loss.
+    interact_event_logits: Optional[torch.Tensor] = None
+
+    def button_predictions(self, *, event_threshold: float = 0.0) -> torch.Tensor:
+        """Decode wire-format buttons with the calibrated one-shot Q threshold."""
+        threshold = torch.as_tensor(event_threshold)
+        if not bool(torch.isfinite(threshold)):
+            raise ValueError("event_threshold 必须是有限数")
+        predictions = self.button_logits.sigmoid() >= 0.5
+        event_logits = (self.interact_event_logits
+                        if self.interact_event_logits is not None
+                        else self.button_logits[..., 0])
+        predictions = predictions.clone()
+        predictions[..., 0] = event_logits >= float(event_threshold)
+        return predictions
 
 
 @dataclass
@@ -161,7 +178,10 @@ class FastVLAHead(nn.Module):
         self.move = nn.Linear(feature_dim, self.horizon * len(MOVE_DIRECTIONS), bias=bias)
         self.camera_dx = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS), bias=bias)
         self.camera_dy = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS), bias=bias)
-        self.buttons = nn.Linear(feature_dim, self.horizon * 6, bias=bias)
+        # Five ordinary button channels; the one-shot Q event has its own
+        # classifier below and is mirrored into button_logits[..., 0].
+        self.buttons = nn.Linear(feature_dim, self.horizon * 5, bias=bias)
+        self.interact_event = nn.Linear(feature_dim, self.horizon, bias=bias)
         # Duration is a bounded scalar in frames; sigmoid is mapped to 1..30.
         self.duration = nn.Linear(feature_dim, self.horizon, bias=bias)
         self.confidence = nn.Linear(feature_dim, 1, bias=bias)
@@ -185,15 +205,19 @@ class FastVLAHead(nn.Module):
         hidden = self.trunk(temporal_feature)
         batch = hidden.shape[0]
         reshape = lambda value, width: value.view(batch, self.horizon, width)
+        ordinary_button_logits = reshape(self.buttons(hidden), 5)
+        interact_event_logits = self.interact_event(hidden).view(batch, self.horizon)
+        button_logits = torch.cat((interact_event_logits.unsqueeze(-1), ordinary_button_logits), dim=-1)
         return FastVLAOutput(
             move_logits=reshape(self.move(hidden), len(MOVE_DIRECTIONS)),
             camera_dx_logits=reshape(self.camera_dx(hidden), len(CAMERA_BUCKETS)),
             camera_dy_logits=reshape(self.camera_dy(hidden), len(CAMERA_BUCKETS)),
-            button_logits=reshape(self.buttons(hidden), 6),
+            button_logits=button_logits,
             duration=1.0 + 29.0 * torch.sigmoid(self.duration(hidden)),
             confidence=torch.sigmoid(self.confidence(hidden)).squeeze(-1),
             stop_or_replan=torch.sigmoid(self.stop(hidden)).squeeze(-1),
             intent_context_logits=self.intent_context(hidden),
+            interact_event_logits=interact_event_logits,
         )
 
 
@@ -226,8 +250,23 @@ class VisualActionExpert(nn.Module):
         self.fast = FastVLAHead(self.pair_dim, history_action_dim=0, horizon=horizon,
                                 bias=False, direct=True)
         self.slow = SlowVLAHead(self.pair_dim, bias=False, direct=True)
+        # Sparse event channels need a calibrated negative baseline.  The
+        # parameter is initialized from the train-subset event rate and
+        # remains trainable so visual evidence can move it away from prior.
+        self.interact_event_bias = nn.Parameter(torch.zeros(horizon))
+        # Ordinary held buttons use an independent five-channel baseline;
+        # Q is intentionally excluded because it is an edge-triggered event.
+        self.ordinary_button_bias = nn.Parameter(torch.zeros(horizon, 5))
         self.camera_summary_dim = self.frame_feature_dim * 5
         self.camera_summary_scale = 0.25
+        # Keep the direct full-window visual signal in the camera path and
+        # fuse it with the trajectory summary instead of replacing it.
+        self.camera_visual_pair_dx = nn.Linear(self.pair_dim,
+                                               self.fast.horizon * len(CAMERA_BUCKETS),
+                                               bias=False)
+        self.camera_visual_pair_dy = nn.Linear(self.pair_dim,
+                                               self.fast.horizon * len(CAMERA_BUCKETS),
+                                               bias=False)
         self.camera_visual_dx = nn.Linear(self.camera_summary_dim,
                                           self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
         self.camera_visual_dy = nn.Linear(self.camera_summary_dim,
@@ -266,13 +305,45 @@ class VisualActionExpert(nn.Module):
         with torch.autocast(device_type=feature.device.type, enabled=False):
             fast = self.fast(feature)
             slow = self.slow(feature)
+            event_bias = self.interact_event_bias.to(fast.button_logits).view(1, self.fast.horizon)
+            ordinary_bias = self.ordinary_button_bias.to(
+                fast.button_logits).view(1, self.fast.horizon, 5)
+            event_logits = fast.interact_event_logits + event_bias
+            fast.interact_event_logits = event_logits
+            fast.button_logits = fast.button_logits.clone()
+            fast.button_logits[..., 0] = event_logits
+            fast.button_logits[..., 1:] = fast.button_logits[..., 1:] + ordinary_bias
         camera = self.camera_summary(frame_features, valid_mask=valid_mask)
         batch = camera.shape[0]
-        fast.camera_dx_logits = self.camera_visual_dx(camera).view(
+        pair_dx = self.camera_visual_pair_dx(feature).view(
             batch, self.fast.horizon, len(CAMERA_BUCKETS))
-        fast.camera_dy_logits = self.camera_visual_dy(camera).view(
+        pair_dy = self.camera_visual_pair_dy(feature).view(
             batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        summary_dx = self.camera_visual_dx(camera).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        summary_dy = self.camera_visual_dy(camera).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        fast.camera_dx_logits = pair_dx + summary_dx
+        fast.camera_dy_logits = pair_dy + summary_dy
         return VisualExpertOutput(fast=fast, slow=slow, feature=feature)
+
+    def set_interact_event_bias(self, bias: torch.Tensor) -> None:
+        """Initialize only the independent one-shot interaction baseline."""
+        bias = bias.detach().to(device=self.interact_event_bias.device,
+                                dtype=self.interact_event_bias.dtype).reshape(-1)
+        if bias.shape != self.interact_event_bias.shape or not bool(torch.isfinite(bias).all()):
+            raise ValueError(f"interact event bias 必须是有限 [{self.fast.horizon}] Tensor")
+        with torch.no_grad():
+            self.interact_event_bias.copy_(bias)
+
+    def set_ordinary_button_bias(self, bias: torch.Tensor) -> None:
+        """Initialize the five ordinary held-button baselines."""
+        bias = bias.detach().to(device=self.ordinary_button_bias.device,
+                                dtype=self.ordinary_button_bias.dtype)
+        if bias.shape != self.ordinary_button_bias.shape or not bool(torch.isfinite(bias).all()):
+            raise ValueError(f"ordinary button bias 必须是有限 [{self.fast.horizon},5] Tensor")
+        with torch.no_grad():
+            self.ordinary_button_bias.copy_(bias)
 
     def camera_summary(self, frame_features: torch.Tensor,
                        valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:

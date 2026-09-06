@@ -47,7 +47,7 @@ def test_act_checkpoint_schema_rejects_layernorm_cell_projector_contract():
     checkpoint = {"checkpoint_schema_version": "m4_act.visual_grounded.v1",
                   "adapter": {}, "core": {}}
 
-    with pytest.raises(ValueError, match="m17_act"):
+    with pytest.raises(ValueError, match="m19_act"):
         load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
 
 
@@ -60,7 +60,20 @@ def test_act_checkpoint_rejects_previous_m6_visual_residual_schema():
     checkpoint = {"checkpoint_schema_version": "m6_act.visual_decision_residual.v1",
                   "adapter": {}, "core": {}}
 
-    with pytest.raises(ValueError, match="m17_act"):
+    with pytest.raises(ValueError, match="m19_act"):
+        load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
+
+
+def test_act_checkpoint_rejects_previous_m17_eventless_schema():
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+    from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
+
+    adapter = _adapter()
+    core = SharedFastSlowVLA(frame_feature_dim=5, temporal_dim=4, history_action_dim=72)
+    checkpoint = {"checkpoint_schema_version": "m17_act.camera_visual_summary.v1",
+                  "adapter": {}, "core": {}}
+
+    with pytest.raises(ValueError, match="m19_act"):
         load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
 
 
