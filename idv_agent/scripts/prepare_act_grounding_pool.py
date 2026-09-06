@@ -282,29 +282,35 @@ def _yolo_objects(path: Path) -> list[tuple[int, list[float]]]:
     return objects
 
 
+def _side_from_box(box: list[float]) -> str:
+    center_x = (box[0] + box[2]) / 2
+    return "left" if center_x < 1 / 3 else "right" if center_x > 2 / 3 else "center"
+
+
 def _target_from_objects(objects: list[tuple[int, list[float]]]) -> tuple[list[float] | None, str, int, Counter]:
     """Derive one ACT target from human YOLO evidence.
 
     ``cipher_visible`` wins over highlight because it is the real machine
     geometry. Within a class, the largest visible component gives a stable
-    target when the machine is split by the player/UI. A prompt proves that
-    the interaction is currently reachable, even in the exceptional fully
-    occluded frame where no machine box remains.
+    target when the machine is split by the player/UI. When prompt is present,
+    it is the authoritative target-side signal and must co-exist with a cipher
+    box under the MVP annotation contract.
     """
     classes = Counter(class_id for class_id, _box in objects)
+    prompts = [box for class_id, box in objects if class_id == 2]
     candidates = [box for class_id, box in objects if class_id == 0]
-    source_class = 0
     if not candidates:
         candidates = [box for class_id, box in objects if class_id == 1]
-        source_class = 1
     if not candidates:
-        return None, "none", int(classes.get(2, 0) > 0), classes
+        if prompts:
+            raise ValueError("interact_prompt 存在时必须同时标注 cipher_visible 或 cipher_highlight 密码机框")
+        return None, "none", 0, classes
     box = max(candidates, key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
-    center_x = (box[0] + box[2]) / 2
-    side = "left" if center_x < 1 / 3 else "right" if center_x > 2 / 3 else "center"
-    # Prompt is the only approved direct signal of immediate reachability;
-    # visibility alone must not manufacture an interaction label.
-    return box, side, int(classes.get(2, 0) > 0), classes
+    prompt = int(bool(prompts))
+    # Prompt is the direct evidence of immediate reachability. Its screen
+    # location takes precedence over a partially player-occluded cipher box.
+    side = _side_from_box(max(prompts, key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))) if prompts else _side_from_box(box)
+    return box, side, prompt, classes
 
 
 def populate_annotations_from_yolo(pool: Path) -> dict[str, Any]:
@@ -364,9 +370,9 @@ def populate_annotations_from_yolo(pool: Path) -> dict[str, Any]:
 def validate_annotations(pool: Path) -> dict[str, Any]:
     """Fail closed until every exported frame has complete auxiliary labels.
 
-    A no-cipher frame is represented by ``cipher_bbox_xyxy_norm=null`` and
-    ``target_side=none``. ``cipher_reachable=1`` is valid with no box when a
-    prompt is visible but the player has fully occluded the machine.
+    A no-cipher frame is represented by ``cipher_bbox_xyxy_norm=null``,
+    ``target_side=none``, and no interaction prompt. A prompt must always
+    co-exist with a visible/highlight cipher box.
     """
     pool = Path(pool)
     manifest_path = pool / "manifest.jsonl"
@@ -396,14 +402,14 @@ def validate_annotations(pool: Path) -> dict[str, Any]:
         if reachable not in (0, 1):
             raise ValueError(f"辅助标注未完成或无效: {identifier}；cipher_reachable 必须为 0/1")
         if bbox is None:
-            if side != "none":
-                raise ValueError(f"无密码机框时 target_side 必须为 none: {identifier}")
-            if reachable == 1 and prompt != 1:
-                raise ValueError(f"无密码机框却可达时必须有 interact_prompt=1: {identifier}")
+            if side != "none" or reachable != 0 or prompt != 0:
+                raise ValueError(f"无密码机框时必须 target_side=none、cipher_reachable=0、interact_prompt=0: {identifier}")
         elif not _valid_bbox(bbox):
             raise ValueError(f"cipher_bbox_xyxy_norm 无效: {identifier}")
         elif side == "none":
             raise ValueError(f"有密码机框时 target_side 不能为 none: {identifier}")
+        elif prompt == 1 and reachable != 1:
+            raise ValueError(f"interact_prompt=1 时 cipher_reachable 必须为 1: {identifier}")
     counts = Counter(str(row["split"]) for row in actual.values())
     return {"frames": len(actual), "splits": {split: counts.get(split, 0) for split in ("train", "val")}}
 
