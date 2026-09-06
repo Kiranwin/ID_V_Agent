@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from idv_agent.model.vla_heads import FastVLAOutput, SlowVLAOutput
+from idv_agent.model.vla_heads import FastVLAOutput, GroundingOutput, SlowVLAOutput
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,7 @@ class VLALossWeights:
     # ones (or a rare key from collapsing to all zeros).
     button_global_counts: Optional[torch.Tensor] = None
     interact_event_positive_weight: float = 3.0
+    grounding: float = 1.0
 
 
 def balanced_class_weights(counts: torch.Tensor, *, min_weight: float = 0.35,
@@ -119,10 +120,34 @@ def _masked_mean(values: torch.Tensor, sample_mask: torch.Tensor) -> torch.Tenso
     return (values * sample_mask).sum() / sample_mask.sum().clamp_min(1.0)
 
 
+def compute_grounding_loss(grounding: GroundingOutput, batch: dict,
+                           weights: VLALossWeights = VLALossWeights()) -> dict[str, torch.Tensor]:
+    """Current-frame visual grounding loss, masked outside the annotation pool."""
+    mask = batch["grounding_mask"].to(grounding.present_logits.device)
+    bbox_mask = batch["grounding_bbox_mask"].to(grounding.bbox.device) * mask
+    present = F.binary_cross_entropy_with_logits(
+        grounding.present_logits, batch["grounding_present_target"].to(grounding.present_logits.dtype), reduction="none")
+    prompt = F.binary_cross_entropy_with_logits(
+        grounding.prompt_logits, batch["grounding_prompt_target"].to(grounding.prompt_logits.dtype), reduction="none")
+    reachable = F.binary_cross_entropy_with_logits(
+        grounding.reachable_logits, batch["grounding_reachable_target"].to(grounding.reachable_logits.dtype), reduction="none")
+    side = F.cross_entropy(grounding.side_logits, batch["grounding_side_target"].to(torch.long), reduction="none")
+    bbox = F.smooth_l1_loss(grounding.bbox, batch["grounding_bbox_target"].to(grounding.bbox.dtype), reduction="none").mean(dim=-1)
+    losses = {
+        "grounding_present": _masked_mean(present, mask),
+        "grounding_bbox": _masked_mean(bbox, bbox_mask),
+        "grounding_side": _masked_mean(side, mask),
+        "grounding_prompt": _masked_mean(prompt, mask),
+        "grounding_reachable": _masked_mean(reachable, mask),
+    }
+    return {"grounding_total": sum(losses.values()), **losses}
+
+
 def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
                      batch: dict, weights: VLALossWeights = VLALossWeights(), *,
                      visual_fast: Optional[FastVLAOutput] = None,
-                     visual_slow: Optional[SlowVLAOutput] = None) -> dict[str, torch.Tensor]:
+                     visual_slow: Optional[SlowVLAOutput] = None,
+                     grounding: Optional[GroundingOutput] = None) -> dict[str, torch.Tensor]:
     fast_mask = batch["fast_loss_mask"].to(fast.move_logits.device)
     move_class_weight = torch.ones(fast.move_logits.shape[-1], device=fast.move_logits.device,
                                    dtype=fast.move_logits.dtype)
@@ -265,4 +290,12 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
         for name in ("fast_move", "fast_camera", "fast_buttons", "fast_interact_event", "fast_duration",
                      "slow_intent", "slow_subgoal"):
             losses[f"visual_{name}"] = zero
+    if grounding is not None:
+        grounding_losses = compute_grounding_loss(grounding, batch, weights)
+        losses.update(grounding_losses)
+        total = total + weights.grounding * grounding_losses["grounding_total"]
+    else:
+        zero = fast.move_logits.sum() * 0.0
+        losses.update({"grounding_total": zero, "grounding_present": zero, "grounding_bbox": zero,
+                       "grounding_side": zero, "grounding_prompt": zero, "grounding_reachable": zero})
     return {"total": total, **losses}

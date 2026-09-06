@@ -75,6 +75,17 @@ class VisualExpertOutput:
     fast: FastVLAOutput
     slow: SlowVLAOutput
     feature: torch.Tensor
+    grounding: Optional["GroundingOutput"] = None
+
+
+@dataclass
+class GroundingOutput:
+    """Training-only visual grounding predictions for the current input frame."""
+    present_logits: torch.Tensor
+    bbox: torch.Tensor
+    side_logits: torch.Tensor
+    prompt_logits: torch.Tensor
+    reachable_logits: torch.Tensor
 
 
 class FiLMConditioner(nn.Module):
@@ -271,6 +282,13 @@ class VisualActionExpert(nn.Module):
                                           self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
         self.camera_visual_dy = nn.Linear(self.camera_summary_dim,
                                           self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        # These heads consume the direct full visual pair, never history,
+        # temporal prior, slow condition, YOLO detections, or runtime rules.
+        self.grounding_present = nn.Linear(self.pair_dim, 1, bias=False)
+        self.grounding_bbox = nn.Linear(self.pair_dim, 4, bias=False)
+        self.grounding_side = nn.Linear(self.pair_dim, 4, bias=False)
+        self.grounding_prompt = nn.Linear(self.pair_dim, 1, bias=False)
+        self.grounding_reachable = nn.Linear(self.pair_dim, 1, bias=False)
 
     @staticmethod
     def _valid_indices(frame_features: torch.Tensor,
@@ -325,7 +343,14 @@ class VisualActionExpert(nn.Module):
             batch, self.fast.horizon, len(CAMERA_BUCKETS))
         fast.camera_dx_logits = pair_dx + summary_dx
         fast.camera_dy_logits = pair_dy + summary_dy
-        return VisualExpertOutput(fast=fast, slow=slow, feature=feature)
+        grounding = GroundingOutput(
+            present_logits=self.grounding_present(feature).squeeze(-1),
+            bbox=torch.sigmoid(self.grounding_bbox(feature)),
+            side_logits=self.grounding_side(feature),
+            prompt_logits=self.grounding_prompt(feature).squeeze(-1),
+            reachable_logits=self.grounding_reachable(feature).squeeze(-1),
+        )
+        return VisualExpertOutput(fast=fast, slow=slow, feature=feature, grounding=grounding)
 
     def set_interact_event_bias(self, bias: torch.Tensor) -> None:
         """Initialize only the independent one-shot interaction baseline."""

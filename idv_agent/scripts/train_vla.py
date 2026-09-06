@@ -492,7 +492,10 @@ def encode_batch(adapter: torch.nn.Module, batch: dict[str, Any], *, device: tor
 def _model_inputs(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
     keys = ("mode_id", "intent_target", "subgoal_target", "subgoal_weight", "move_target",
             "camera_dx_target", "camera_dy_target", "button_target", "duration_target",
-            "slow_loss_mask", "fast_loss_mask", "frame_valid_mask", "history_actions")
+            "slow_loss_mask", "fast_loss_mask", "frame_valid_mask", "history_actions",
+            "grounding_mask", "grounding_present_target", "grounding_bbox_mask",
+            "grounding_bbox_target", "grounding_side_target", "grounding_prompt_target",
+            "grounding_reachable_target")
     return {key: batch[key].to(device) for key in keys}
 
 
@@ -649,9 +652,10 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
             # this ACT schema; applying visual_aux would double its gradient.
             effective_weights = replace(effective_weights, visual_aux=0.0)
         losses = (compute_vla_loss(output.fast, output.slow, model_batch,
-                                   weights=effective_weights, **loss_kwargs)
+                                   weights=effective_weights, grounding=output.visual.grounding, **loss_kwargs)
                   if effective_weights is not None else
-                  compute_vla_loss(output.fast, output.slow, model_batch, **loss_kwargs))
+                  compute_vla_loss(output.fast, output.slow, model_batch,
+                                   grounding=output.visual.grounding, **loss_kwargs))
     return losses, output
 
 
@@ -823,7 +827,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     dtype, amp_enabled = _device_dtype(device)
     if args.init_checkpoint:
         raise ValueError("M2_VG 初始化当前已禁用；请不要传 --init-checkpoint")
-    dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
+    grounding_annotations = getattr(args, "grounding_annotations", "") or None
+    dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True,
+                                 grounding_annotations=grounding_annotations)
     sampling = getattr(args, "sampling", "uniform")
     if sampling not in ("uniform", "stratified"):
         raise ValueError("sampling 必须是 uniform 或 stratified")
@@ -849,7 +855,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                              collate_fn=VLASequenceCollator(max_frames=8))
     val_paths = _dataset_paths(getattr(args, "val_data", None))
-    val_dataset = VLASequenceDataset(val_paths, verify_images=True) if val_paths else None
+    val_dataset = (VLASequenceDataset(val_paths, verify_images=True,
+                                      grounding_annotations=grounding_annotations)
+                   if val_paths else None)
     max_val_samples = int(getattr(args, "max_val_samples", 64) or 0)
     if val_dataset is not None and max_val_samples > 0:
         val_dataset = _contiguous_subset(val_dataset, max_val_samples)
@@ -904,7 +912,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                                             if class_balance_statistics else None),
                                    intent_global_counts=(class_balance_statistics["intent"]
                                                          if class_balance_statistics else None),
-                                   button_global_counts=button_global_counts)
+                                   button_global_counts=button_global_counts,
+                                   grounding=float(getattr(args, "grounding_loss_weight", 1.0)))
 
     # Materialize the direct raw-grid feature contract before constructing the
     # core/optimizer.  ``hidden_size`` is Qwen text width (2560), not ACT
@@ -1013,6 +1022,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"slow_intent={float(losses['slow_intent'].detach().cpu()):.4f} "
                 f"slow_subgoal={float(losses['slow_subgoal'].detach().cpu()):.4f} "
                 f"interact={interact_pred}/{interact_target} "
+                f"grounding={float(losses['grounding_total'].detach().cpu()):.4f} "
                 f"move_nonstop_hit={move_hit:.3f} intent_pred={intent_pred} "
                 f"tf={_teacher_forcing_ratio(args, step - 1):.3f}", flush=True,
             )
@@ -1074,6 +1084,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "grad_initial_scale": grad_initial_scale,
                   "history_dropout_p": history_dropout_p,
                   "visual_aux": float(getattr(args, "visual_aux", 1.0)),
+                  "grounding_loss_weight": float(getattr(args, "grounding_loss_weight", 1.0)),
+                  "grounding_annotations": (str(Path(grounding_annotations).resolve())
+                                             if grounding_annotations else None),
                   "prior_scale": float(core.prior_scale), "prior_logits_bounded": True,
                   "camera_prior_scale": float(core.camera_prior_scale),
                   "visual_input_center": visual_center,
@@ -1355,6 +1368,7 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
     event_logits_rows: list[torch.Tensor] = []
     event_target_rows: list[torch.Tensor] = []
     event_mask_rows: list[torch.Tensor] = []
+    grounding_rows: dict[str, list[torch.Tensor]] = defaultdict(list)
     non_stop_pred = 0
     non_stop_total = 0
     # Eval runs adapter.eval() + torch.no_grad(): safe to deduplicate vision
@@ -1373,6 +1387,22 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
             # device; indexing a CPU target with the CUDA mask raises during
             # the final validation pass after training.
             output_device = output.fast.move_logits.device
+            visual_output = getattr(output, "visual", None)
+            grounding = getattr(visual_output, "grounding", None)
+            if grounding is not None:
+                for key, value in (
+                    ("present_logits", grounding.present_logits), ("bbox", grounding.bbox),
+                    ("side_logits", grounding.side_logits), ("prompt_logits", grounding.prompt_logits),
+                    ("reachable_logits", grounding.reachable_logits),
+                    ("mask", batch["grounding_mask"].to(output_device)),
+                    ("present_target", batch["grounding_present_target"].to(output_device)),
+                    ("bbox_mask", batch["grounding_bbox_mask"].to(output_device)),
+                    ("bbox_target", batch["grounding_bbox_target"].to(output_device)),
+                    ("side_target", batch["grounding_side_target"].to(output_device)),
+                    ("prompt_target", batch["grounding_prompt_target"].to(output_device)),
+                    ("reachable_target", batch["grounding_reachable_target"].to(output_device)),
+                ):
+                    grounding_rows[key].append(value.detach().cpu())
             mask = batch["fast_loss_mask"].to(output_device).bool()
             for value in output.fast.move_logits.argmax(-1)[mask].detach().cpu().reshape(-1).tolist():
                 move_pred[int(value)] += 1
@@ -1457,6 +1487,9 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
         )
     else:
         event_metrics = None
+    grounding_metrics = (_grounding_metrics(
+        **{key: torch.cat(values) for key, values in grounding_rows.items()})
+        if grounding_rows else None)
     return {"loss": (sum(losses) / len(losses) if losses else None),
             "slow_accuracy": slow_acc,
             "frame_cache": {
@@ -1476,7 +1509,42 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
             "button_pred_positive_counts": button_pred, "button_target_positive_counts": button_target,
             "interact_pred_positive": button_pred[0], "interact_target_positive": button_target[0],
             "interact_event": event_metrics,
+            "grounding": grounding_metrics,
             "move_nonstop_prediction_rate": (non_stop_pred / non_stop_total if non_stop_total else None)}
+
+
+def _binary_metrics(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> dict[str, float | int | None]:
+    valid = mask.bool()
+    if not bool(valid.any()):
+        return {"total": 0, "accuracy": None, "precision": None, "recall": None}
+    prediction = logits[valid] >= 0
+    truth = target[valid] > 0
+    tp = int((prediction & truth).sum())
+    fp = int((prediction & ~truth).sum())
+    fn = int((~prediction & truth).sum())
+    total = int(valid.sum())
+    return {"total": total, "accuracy": float((prediction == truth).float().mean()),
+            "precision": (tp / (tp + fp) if tp + fp else None),
+            "recall": (tp / (tp + fn) if tp + fn else None)}
+
+
+def _grounding_metrics(*, present_logits: torch.Tensor, bbox: torch.Tensor, side_logits: torch.Tensor,
+                       prompt_logits: torch.Tensor, reachable_logits: torch.Tensor, mask: torch.Tensor,
+                       present_target: torch.Tensor, bbox_mask: torch.Tensor, bbox_target: torch.Tensor,
+                       side_target: torch.Tensor, prompt_target: torch.Tensor,
+                       reachable_target: torch.Tensor) -> dict[str, Any]:
+    """Score only rows backed by same-session human grounding annotations."""
+    valid = mask.bool()
+    bbox_valid = valid & bbox_mask.bool()
+    side_accuracy = (float((side_logits[valid].argmax(-1) == side_target[valid]).float().mean())
+                     if bool(valid.any()) else None)
+    bbox_l1 = (float((bbox[bbox_valid] - bbox_target[bbox_valid]).abs().mean())
+               if bool(bbox_valid.any()) else None)
+    return {"annotated": int(valid.sum()), "bbox_annotated": int(bbox_valid.sum()),
+            "presence": _binary_metrics(present_logits, present_target, valid),
+            "prompt": _binary_metrics(prompt_logits, prompt_target, valid),
+            "reachable": _binary_metrics(reachable_logits, reachable_target, valid),
+            "side_accuracy": side_accuracy, "bbox_l1": bbox_l1}
 
 
 def _teacher_forcing_ratio(args: argparse.Namespace, step: int) -> float:
@@ -1517,6 +1585,10 @@ def main(argv=None) -> int:
                         help="训练时按样本清零完整 action history 的概率；验证/部署始终为 0")
     parser.add_argument("--visual-aux", type=float, default=1.0,
                         help="history-free visual action expert 的显式监督权重")
+    parser.add_argument("--grounding-annotations", default="",
+                        help="训练期同 session ACT grounding JSONL；部署不会读取该文件")
+    parser.add_argument("--grounding-loss-weight", type=float, default=1.0,
+                        help="训练期视觉 grounding 辅助 loss 权重；0 可用于消融")
     parser.add_argument("--visual-center-samples", type=int, default=64,
                         help="从训练集分层抽取的 raw visual center 校准样本数")
     parser.add_argument("--move-stop-weight", type=float, default=0.5)

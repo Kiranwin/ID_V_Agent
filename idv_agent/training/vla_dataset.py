@@ -18,6 +18,78 @@ CAMERA_TO_INDEX = {value: index for index, value in enumerate(CAMERA_BUCKETS)}
 SUBGOAL_SOURCE_WEIGHT = {"rule": 0.5, "human_override": 1.0, "unknown": 0.0}
 HISTORY_ACTION_WIDTH = 9  # move + camera dx/dy + six button states
 HISTORY_ACTION_STEPS = 8
+GROUNDING_SIDE_TO_INDEX = {"none": 0, "left": 1, "center": 2, "right": 3}
+
+
+def _empty_grounding_targets() -> dict[str, torch.Tensor]:
+    """Return an explicitly masked training-only grounding target."""
+    return {
+        "grounding_mask": torch.tensor(0.0),
+        "grounding_present_target": torch.tensor(0.0),
+        "grounding_bbox_mask": torch.tensor(0.0),
+        "grounding_bbox_target": torch.zeros(4, dtype=torch.float32),
+        "grounding_side_target": torch.tensor(0, dtype=torch.long),
+        "grounding_prompt_target": torch.tensor(0.0),
+        "grounding_reachable_target": torch.tensor(0.0),
+    }
+
+
+class GroundingAnnotationIndex:
+    """Read completed same-frame ACT grounding labels once, fail closed.
+
+    The annotation key is exactly ``(session, observation_end_frame)``.  It is
+    a training-only lookup; images, runtime policy, and deployment never read
+    this index or its source JSONL.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if not self.path.is_file():
+            raise ValueError(f"ACT grounding 标注不存在: {self.path}")
+        self.rows: dict[tuple[str, int], dict[str, torch.Tensor]] = {}
+        for line_no, raw in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+                session, frame = str(row["session"]), int(row["frame"])
+                bbox, side = row["cipher_bbox_xyxy_norm"], row["target_side"]
+                prompt, reachable = int(row["interact_prompt"]), int(row["cipher_reachable"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"{self.path}:{line_no} grounding 标注字段无效") from exc
+            key = (session, frame)
+            if key in self.rows:
+                raise ValueError(f"{self.path}:{line_no} grounding 标注重复: {key}")
+            if side not in GROUNDING_SIDE_TO_INDEX or prompt not in (0, 1) or reachable not in (0, 1):
+                raise ValueError(f"{self.path}:{line_no} grounding 枚举值无效")
+            present = int(bbox is not None)
+            if present:
+                if (not isinstance(bbox, list) or len(bbox) != 4 or
+                        not all(isinstance(value, (int, float)) and 0.0 <= float(value) <= 1.0
+                                for value in bbox) or float(bbox[0]) >= float(bbox[2]) or
+                        float(bbox[1]) >= float(bbox[3]) or side == "none"):
+                    raise ValueError(f"{self.path}:{line_no} 密码机 bbox/side 无效")
+            elif side != "none" or prompt or reachable:
+                raise ValueError(f"{self.path}:{line_no} 无密码机框时不能有 interact_prompt/reachable")
+            if prompt and (not present or not reachable):
+                raise ValueError(f"{self.path}:{line_no} interact_prompt 必须同时有密码机框且 reachable=1")
+            self.rows[key] = {
+                "grounding_mask": torch.tensor(1.0),
+                "grounding_present_target": torch.tensor(float(present)),
+                "grounding_bbox_mask": torch.tensor(float(present)),
+                "grounding_bbox_target": torch.tensor(bbox if present else [0.0] * 4, dtype=torch.float32),
+                "grounding_side_target": torch.tensor(GROUNDING_SIDE_TO_INDEX[side], dtype=torch.long),
+                "grounding_prompt_target": torch.tensor(float(prompt)),
+                "grounding_reachable_target": torch.tensor(float(reachable)),
+            }
+        if not self.rows:
+            raise ValueError(f"ACT grounding 标注为空: {self.path}")
+
+    def lookup(self, session: str, observation_end_frame: int) -> dict[str, torch.Tensor]:
+        row = self.rows.get((str(session), int(observation_end_frame)))
+        if row is not None:
+            return {key: value.clone() for key, value in row.items()}
+        return _empty_grounding_targets()
 
 
 class VLASequenceDataset(Dataset):
@@ -29,7 +101,8 @@ class VLASequenceDataset(Dataset):
     """
 
     def __init__(self, jsonl_paths: str | Path | Iterable[str | Path],
-                 *, verify_images: bool = True):
+                 *, verify_images: bool = True,
+                 grounding_annotations: str | Path | None = None):
         if isinstance(jsonl_paths, (str, Path)):
             jsonl_paths = [jsonl_paths]
         self.records: list[tuple[Path, dict]] = []
@@ -58,6 +131,8 @@ class VLASequenceDataset(Dataset):
                     self.records.append((path.parent, record))
         if not self.records:
             raise ValueError("VLASequenceDataset 没有有效样本")
+        self.grounding = (GroundingAnnotationIndex(grounding_annotations)
+                          if grounding_annotations is not None else None)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -83,7 +158,7 @@ class VLASequenceDataset(Dataset):
                 *[float(v) for v in action["buttons"]],
             ])
         history_values.extend([0.0] * (HISTORY_ACTION_STEPS * HISTORY_ACTION_WIDTH - len(history_values)))
-        return {
+        item = {
             "episode_id": record["episode_id"],
             "anchor_frame": record["anchor_frame"],
             "frame_paths": [root / frame["path"] for frame in frames],
@@ -108,6 +183,12 @@ class VLASequenceDataset(Dataset):
             "slow_loss_mask": torch.tensor(record["loss_mask"]["slow"], dtype=torch.float32),
             "fast_loss_mask": torch.tensor(record["loss_mask"]["fast"], dtype=torch.float32),
         }
+        if self.grounding is not None:
+            item.update(self.grounding.lookup(record["episode_id"],
+                                              int(record["alignment"]["observation_end_frame"])))
+        else:
+            item.update(_empty_grounding_targets())
+        return item
 
 
 class VLASequenceCollator:
@@ -135,6 +216,9 @@ class VLASequenceCollator:
             "mode_id", "history_actions", "intent_target", "subgoal_target", "subgoal_weight",
             "move_target", "camera_dx_target", "camera_dy_target", "button_target",
             "duration_target", "slow_loss_mask", "fast_loss_mask",
+            "grounding_mask", "grounding_present_target", "grounding_bbox_mask",
+            "grounding_bbox_target", "grounding_side_target", "grounding_prompt_target",
+            "grounding_reachable_target",
         )
         batch_dict = {key: torch.stack([sample[key] for sample in samples]) for key in tensor_keys}
         batch_dict.update({
