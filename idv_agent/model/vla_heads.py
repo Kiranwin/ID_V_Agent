@@ -289,6 +289,18 @@ class VisualActionExpert(nn.Module):
         self.grounding_side = nn.Linear(self.pair_dim, 4, bias=False)
         self.grounding_prompt = nn.Linear(self.pair_dim, 1, bias=False)
         self.grounding_reachable = nn.Linear(self.pair_dim, 1, bias=False)
+        # Predicted grounding is a learned visual condition for camera only.
+        # The five logits are produced from pixels by the modules above; this
+        # path has no annotation/runtime input. Zero initialization keeps the
+        # previous direct-pair camera behavior until joint losses establish a
+        # useful side/prompt-to-turn mapping.
+        self.camera_grounding_dim = 7  # present + side(4) + prompt + reachable
+        self.camera_grounding_dx = nn.Linear(
+            self.camera_grounding_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        self.camera_grounding_dy = nn.Linear(
+            self.camera_grounding_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        nn.init.zeros_(self.camera_grounding_dx.weight)
+        nn.init.zeros_(self.camera_grounding_dy.weight)
 
     @staticmethod
     def _valid_indices(frame_features: torch.Tensor,
@@ -331,6 +343,13 @@ class VisualActionExpert(nn.Module):
             fast.button_logits = fast.button_logits.clone()
             fast.button_logits[..., 0] = event_logits
             fast.button_logits[..., 1:] = fast.button_logits[..., 1:] + ordinary_bias
+        grounding = GroundingOutput(
+            present_logits=self.grounding_present(feature).squeeze(-1),
+            bbox=torch.sigmoid(self.grounding_bbox(feature)),
+            side_logits=self.grounding_side(feature),
+            prompt_logits=self.grounding_prompt(feature).squeeze(-1),
+            reachable_logits=self.grounding_reachable(feature).squeeze(-1),
+        )
         camera = self.camera_summary(frame_features, valid_mask=valid_mask)
         batch = camera.shape[0]
         pair_dx = self.camera_visual_pair_dx(feature).view(
@@ -341,15 +360,15 @@ class VisualActionExpert(nn.Module):
             batch, self.fast.horizon, len(CAMERA_BUCKETS))
         summary_dy = self.camera_visual_dy(camera).view(
             batch, self.fast.horizon, len(CAMERA_BUCKETS))
-        fast.camera_dx_logits = pair_dx + summary_dx
-        fast.camera_dy_logits = pair_dy + summary_dy
-        grounding = GroundingOutput(
-            present_logits=self.grounding_present(feature).squeeze(-1),
-            bbox=torch.sigmoid(self.grounding_bbox(feature)),
-            side_logits=self.grounding_side(feature),
-            prompt_logits=self.grounding_prompt(feature).squeeze(-1),
-            reachable_logits=self.grounding_reachable(feature).squeeze(-1),
-        )
+        grounding_feature = torch.cat((grounding.present_logits.unsqueeze(-1), grounding.side_logits,
+                                       grounding.prompt_logits.unsqueeze(-1),
+                                       grounding.reachable_logits.unsqueeze(-1)), dim=-1)
+        grounding_dx = self.camera_grounding_dx(grounding_feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        grounding_dy = self.camera_grounding_dy(grounding_feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        fast.camera_dx_logits = pair_dx + summary_dx + grounding_dx
+        fast.camera_dy_logits = pair_dy + summary_dy + grounding_dy
         return VisualExpertOutput(fast=fast, slow=slow, feature=feature, grounding=grounding)
 
     def set_interact_event_bias(self, bias: torch.Tensor) -> None:

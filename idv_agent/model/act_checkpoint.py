@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-ACT_CHECKPOINT_SCHEMA = "m22_act.grounded_visual_pair.v1"
+ACT_CHECKPOINT_SCHEMA = "m24_act.camera_grounding_fusion.v1"
 _ACT_ADAPTER_KEYS = frozenset({"condition_projection"})
 
 
@@ -45,7 +45,7 @@ def load_visual_grounded_act_checkpoint(adapter: torch.nn.Module, core: torch.nn
                                         checkpoint: dict[str, Any]) -> None:
     """Restore a complete m8 ACT checkpoint or fail before partial loading."""
     if checkpoint.get("checkpoint_schema_version") != ACT_CHECKPOINT_SCHEMA:
-        raise ValueError("旧 ACT checkpoint 不兼容；m19_act 与 m22 grounding checkpoint 不能混用")
+        raise ValueError("旧 ACT checkpoint 不兼容；m19_act/m22/m23 不能加载 m24 camera-grounding fusion")
     if not isinstance(checkpoint.get("adapter"), dict) or not isinstance(checkpoint.get("core"), dict):
         raise ValueError("ACT checkpoint 缺少 adapter/core")
     load_act_adapter_state(adapter, checkpoint["adapter"])

@@ -74,7 +74,7 @@ checkpoint as deployable merely because its training loss decreases.
   cipher presence, normalized box, target side, interaction prompt, and
   reachability. These heads never consume YOLO/runtime rules and deployment
   never reads annotation JSONL.
-- Checkpoint schema is `m22_act.grounded_visual_pair.v1`. Older m19/m21
+- Checkpoint schema is `m24_act.camera_grounding_fusion.v1`. Older m19/m22/m23
   checkpoints fail closed and are not deployment candidates.
 
 ## Latest Evidence: m23 Grounding-Balanced Training
@@ -100,18 +100,34 @@ The full 182-sample, four-condition gate failed:
 `m23` has learned useful visual intent behavior, but camera action is still
 not sufficiently grounded and must not be run in dry-run or send-input mode.
 
+### m23 Grounding-to-Camera Alignment Audit
+
+Reports:
+
+- `C:\Codespace\ID_V_Agent\reports\m23_grounding_camera_alignment_train.json`
+- `C:\Codespace\ID_V_Agent\reports\m23_grounding_camera_alignment_val.json`
+
+The same-frame target label is informative for future camera replay but is not
+currently connected to the ACT camera-logit path. On aligned, non-prompt
+windows, side and dx have the expected sign relationship: e.g. in validation,
+`side=left` has negative dx `18/28` nonzero-or-zero comparable decisions while
+`side=right` has positive dx `12/16`; center is mostly dx=0. In contrast,
+every held-out `prompt=1/reachable=1` macro step is dx=0 and dy=0 (72/72),
+which correctly expresses “already aligned; stop turning”. Therefore the next
+architecture change should condition the learned camera head on the model's
+own visual side/prompt representation, not add a deployment rule or redefine
+the replay labels.
+
 ## Next Action
 
-1. Diagnose the direct relationship between the m23 grounding-head errors and
-   camera bucket errors on the 64 held-out aligned decision frames. Report
-   per-side and per-prompt camera dx/dy distributions before changing losses
-   or training duration.
-2. Based on that evidence, adjust the camera-grounding coupling at the visual
-   head (not a deployment rule) and add a regression test.
-3. Run a short 30--60 step behavior smoke as a blocking command. If it is
+1. The m24 learned camera-side/prompt fusion path is implemented: it consumes
+   only predicted visual grounding logits, affects only camera dx/dy, and has
+   a zero-initialized fusion layer. Schema is now
+   `m24_act.camera_grounding_fusion.v1`; m22/m23 fail closed.
+2. Run a short 30--60 step behavior smoke as a blocking command. If it is
    numerically sound, run a bounded training experiment; then run the complete
    four-condition gate as a blocking command.
-4. Update this file with the result. A checkpoint is deployable only when all
+3. Update this file with the result. A checkpoint is deployable only when all
    image-zero and image-shuffle move/camera/intent requirements pass.
 
 ## Important Historical Evidence

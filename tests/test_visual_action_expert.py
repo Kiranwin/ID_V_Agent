@@ -374,3 +374,21 @@ def test_camera_summary_uses_centered_scaled_visual_features():
     summary = expert.camera_summary(frames)
     assert float(summary.abs().max()) == 0.0
     assert expert.camera_summary_scale == 0.25
+
+
+def test_camera_logits_can_use_predicted_grounding_without_changing_move_or_intent():
+    """Camera fusion consumes model predictions, never external annotation truth."""
+    from idv_agent.model.vla_heads import VisualActionExpert
+
+    torch.manual_seed(71)
+    expert = VisualActionExpert(4, 8).eval()
+    frames = torch.randn(1, 8, 4)
+    with torch.no_grad():
+        baseline = expert(frames)
+        # The fusion head is intentionally zero-initialized; make one camera
+        # row observably depend on the predicted side/prompt representation.
+        expert.camera_grounding_dx.weight[0, 0] = 1.0
+        changed = expert(frames)
+    assert torch.equal(baseline.fast.move_logits, changed.fast.move_logits)
+    assert torch.equal(baseline.slow.intent_logits, changed.slow.intent_logits)
+    assert not torch.equal(baseline.fast.camera_dx_logits, changed.fast.camera_dx_logits)
