@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -251,13 +252,121 @@ def _valid_bbox(value: Any) -> bool:
     return float(value[0]) < float(value[2]) and float(value[1]) < float(value[3])
 
 
+def _yolo_objects(path: Path) -> list[tuple[int, list[float]]]:
+    """Read canonical YOLO rows into normalized xyxy boxes without guessing."""
+    if not path.is_file():
+        raise ValueError(f"缺少 YOLO 标签文件: {path}")
+    objects = []
+    for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) != 5:
+            raise ValueError(f"{path}:{line_no} 必须是 5 列 YOLO 格式")
+        try:
+            class_id = int(fields[0])
+            xc, yc, width, height = (float(value) for value in fields[1:])
+        except ValueError as exc:
+            raise ValueError(f"{path}:{line_no} 含有不能解析的数字") from exc
+        if class_id not in range(len(CLASSES)):
+            raise ValueError(f"{path}:{line_no} class_id 不在 0..{len(CLASSES) - 1}")
+        if not all(math.isfinite(value) and 0.0 <= value <= 1.0
+                   for value in (xc, yc, width, height)) or width <= 0 or height <= 0:
+            raise ValueError(f"{path}:{line_no} YOLO 坐标无效")
+        box = [max(0.0, xc - width / 2), max(0.0, yc - height / 2),
+               min(1.0, xc + width / 2), min(1.0, yc + height / 2)]
+        if not _valid_bbox(box):
+            raise ValueError(f"{path}:{line_no} 裁剪后无有效框")
+        objects.append((class_id, [round(value, 6) for value in box]))
+    return objects
+
+
+def _target_from_objects(objects: list[tuple[int, list[float]]]) -> tuple[list[float] | None, str, int, Counter]:
+    """Derive one ACT target from human YOLO evidence.
+
+    ``cipher_visible`` wins over highlight because it is the real machine
+    geometry. Within a class, the largest visible component gives a stable
+    target when the machine is split by the player/UI. A prompt proves that
+    the interaction is currently reachable, even in the exceptional fully
+    occluded frame where no machine box remains.
+    """
+    classes = Counter(class_id for class_id, _box in objects)
+    candidates = [box for class_id, box in objects if class_id == 0]
+    source_class = 0
+    if not candidates:
+        candidates = [box for class_id, box in objects if class_id == 1]
+        source_class = 1
+    if not candidates:
+        return None, "none", int(classes.get(2, 0) > 0), classes
+    box = max(candidates, key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
+    center_x = (box[0] + box[2]) / 2
+    side = "left" if center_x < 1 / 3 else "right" if center_x > 2 / 3 else "center"
+    # Prompt is the only approved direct signal of immediate reachability;
+    # visibility alone must not manufacture an interaction label.
+    return box, side, int(classes.get(2, 0) > 0), classes
+
+
+def populate_annotations_from_yolo(pool: Path) -> dict[str, Any]:
+    """Replace only generated fields using completed YOLO labels.
+
+    Missing X-AnyLabeling JSON has already been explicitly declared by the
+    user as a completed no-cipher image. It becomes an empty YOLO txt after
+    conversion and is therefore a deliberate negative, not an annotation gap.
+    The prior sidecar is copied once before replacement and never overwritten.
+    """
+    pool = Path(pool)
+    manifest_path = pool / "manifest.jsonl"
+    annotations_path = pool / "act_grounding_annotations.jsonl"
+    backup_path = pool / "act_grounding_annotations.before_yolo_auto.jsonl"
+    if not manifest_path.is_file() or not annotations_path.is_file():
+        raise ValueError("标注池缺少 manifest.jsonl 或 act_grounding_annotations.jsonl")
+    if backup_path.exists():
+        raise ValueError(f"已存在自动生成前备份，拒绝覆盖: {backup_path}")
+    manifest = _json_records(manifest_path)
+    annotations = _json_records(annotations_path)
+    by_id = {str(row.get("id")): row for row in annotations}
+    if len(by_id) != len(annotations) or set(by_id) != {str(row.get("id")) for row in manifest}:
+        raise ValueError("辅助标注与 manifest 不一致；拒绝自动生成")
+    generated = []
+    class_totals = Counter()
+    no_cipher = 0
+    for item in manifest:
+        identifier = str(item["id"])
+        label_value = item.get("label")
+        if not isinstance(label_value, str):
+            raise ValueError(f"manifest id={identifier} 缺少 label")
+        objects = _yolo_objects(pool / label_value)
+        bbox, side, reachable, classes = _target_from_objects(objects)
+        class_totals.update(classes)
+        no_cipher += int(bbox is None)
+        row = dict(by_id[identifier])
+        row.update({
+            "cipher_bbox_xyxy_norm": bbox,
+            "cipher_reachable": reachable,
+            "target_side": side,
+            "interact_prompt": int(classes.get(2, 0) > 0),
+            "annotation_source": "yolo_auto_from_completed_pool.v1",
+        })
+        generated.append(row)
+    shutil.copy2(annotations_path, backup_path)
+    annotations_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in generated), encoding="utf-8")
+    return {
+        "frames": len(generated),
+        "cipher_visible": class_totals.get(0, 0),
+        "cipher_highlight": class_totals.get(1, 0),
+        "interact_prompt": class_totals.get(2, 0),
+        "no_cipher": no_cipher,
+    }
+
+
 def validate_annotations(pool: Path) -> dict[str, Any]:
     """Fail closed until every exported frame has complete auxiliary labels.
 
     A no-cipher frame is represented by ``cipher_bbox_xyxy_norm=null`` and
-    ``cipher_reachable=0``.  It is still mandatory to set target_side and
-    interact_prompt explicitly so missing work can never silently become a
-    negative sample.
+    ``target_side=none``. ``cipher_reachable=1`` is valid with no box when a
+    prompt is visible but the player has fully occluded the machine.
     """
     pool = Path(pool)
     manifest_path = pool / "manifest.jsonl"
@@ -287,8 +396,10 @@ def validate_annotations(pool: Path) -> dict[str, Any]:
         if reachable not in (0, 1):
             raise ValueError(f"辅助标注未完成或无效: {identifier}；cipher_reachable 必须为 0/1")
         if bbox is None:
-            if reachable != 0 or side != "none":
-                raise ValueError(f"无密码机框时必须 cipher_reachable=0 且 target_side=none: {identifier}")
+            if side != "none":
+                raise ValueError(f"无密码机框时 target_side 必须为 none: {identifier}")
+            if reachable == 1 and prompt != 1:
+                raise ValueError(f"无密码机框却可达时必须有 interact_prompt=1: {identifier}")
         elif not _valid_bbox(bbox):
             raise ValueError(f"cipher_bbox_xyxy_norm 无效: {identifier}")
         elif side == "none":
@@ -306,10 +417,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--q-radius-frames", type=int, default=6, help="每个 Q 前后导出的帧数")
     parser.add_argument("--validate-annotations", action="store_true",
                         help="仅校验已填写的 act_grounding_annotations.jsonl；dataset 参数仍作 pool 路径")
+    parser.add_argument("--populate-from-yolo", action="store_true",
+                        help="将完成的 YOLO 标签自动生成辅助语义标注，并先创建一次不可覆盖备份")
     args = parser.parse_args(argv)
     try:
+        if args.validate_annotations and args.populate_from_yolo:
+            parser.error("--validate-annotations 与 --populate-from-yolo 只能二选一")
         if args.validate_annotations:
             report = validate_annotations(args.dataset)
+        elif args.populate_from_yolo:
+            report = populate_annotations_from_yolo(args.dataset)
         else:
             if args.output is None:
                 parser.error("导出标注池必须提供 --output")
