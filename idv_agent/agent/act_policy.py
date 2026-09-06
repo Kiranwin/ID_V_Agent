@@ -178,7 +178,10 @@ class ACTPolicy:
               f"camera=({first.camera_dx},{first.camera_dy}) "
               f"buttons={pressed} duration={first.duration_frames} "
               f"feature_mean={fingerprint:.5f} feature_age_ms={age_ms:.1f} chunk={chunk_text}")
-        return steps
+        # m25 re-observes after the causal first macro action.  The remaining
+        # logits remain an internal prediction horizon only; submitting them
+        # would execute actions conditioned on an obsolete image window.
+        return steps[:1]
 
     def _temporal_inputs(self):
         values, timestamps, valid = self.features.window(self.history_frames, self.history_stride)

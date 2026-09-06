@@ -205,7 +205,14 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
                                  history_actions=model_batch["history_actions"], run_slow=False,
                                  detach_slow_condition=False)
             sample_mask = model_batch["fast_loss_mask"] > 0
-            mask = sample_mask[:, None].expand_as(model_batch["move_target"])
+            # m25 executes a single six-frame macro action before observing a
+            # new image.  Gate accuracy must assess exactly that deployed
+            # decision, never later predictions made from stale pixels.
+            horizon = int(getattr(core, "execution_horizon", 1))
+            if not 1 <= horizon <= model_batch["move_target"].shape[1]:
+                raise ValueError("checkpoint execution_horizon 超出 action chunk")
+            mask = sample_mask[:, None].expand_as(model_batch["move_target"]).clone()
+            mask[:, horizon:] = False
             move_pred = fast_pass.fast.move_logits.argmax(-1)
             dx_pred = fast_pass.fast.camera_dx_logits.argmax(-1)
             dy_pred = fast_pass.fast.camera_dy_logits.argmax(-1)

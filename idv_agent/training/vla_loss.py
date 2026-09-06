@@ -52,6 +52,10 @@ class VLALossWeights:
     grounding_side_global_counts: Optional[torch.Tensor] = None
     grounding_prompt_global_counts: Optional[torch.Tensor] = None
     grounding_reachable_global_counts: Optional[torch.Tensor] = None
+    # Deployment re-observes after this many six-frame actions.  Restrict fast
+    # action supervision to exactly the actions that may be executed from the
+    # current visual window; keep the 4-step default for legacy callers.
+    execution_horizon: int = 4
 
 
 def balanced_class_weights(counts: torch.Tensor, *, min_weight: float = 0.35,
@@ -189,6 +193,17 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
                      visual_slow: Optional[SlowVLAOutput] = None,
                      grounding: Optional[GroundingOutput] = None) -> dict[str, torch.Tensor]:
     fast_mask = batch["fast_loss_mask"].to(fast.move_logits.device)
+    requested_horizon = int(weights.execution_horizon)
+    if requested_horizon < 1:
+        raise ValueError("execution_horizon 必须为正数")
+    # The default 4 is the v5 action-chunk length.  Unit-level callers can
+    # construct shorter tensors; retaining their complete horizon is backward
+    # compatible while m25 explicitly supplies 1.
+    horizon = min(requested_horizon, fast.move_logits.shape[1])
+    # [B,T] action mask: unexecuted future macro steps cannot supervise an
+    # observation that will be replaced by a new camera frame before execution.
+    fast_mask = fast_mask[:, None].expand(-1, fast.move_logits.shape[1]).clone()
+    fast_mask[:, horizon:] = 0
     move_class_weight = torch.ones(fast.move_logits.shape[-1], device=fast.move_logits.device,
                                    dtype=fast.move_logits.dtype)
     if weights.class_balance:

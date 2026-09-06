@@ -26,6 +26,11 @@ def audit(data: str | list[str], annotations: str | Path) -> dict:
     dataset = VLASequenceDataset(_dataset_paths(data), verify_images=False,
                                  grounding_annotations=annotations)
     grouped: dict[str, dict[str, Counter[str]]] = defaultdict(_counts)
+    # A current observation can only be directly causal for its first action
+    # step.  Preserve the existing aggregate but expose every horizon so the
+    # data audit can measure how rapidly that relationship decays.
+    horizon_grouped: dict[int, dict[str, dict[str, Counter[str]]]] = defaultdict(
+        lambda: defaultdict(_counts))
     total = 0
     for index in range(len(dataset)):
         item = dataset[index]
@@ -40,10 +45,12 @@ def audit(data: str | list[str], annotations: str | Path) -> dict:
         groups = ("all", f"present={present}", f"prompt={prompt}",
                   f"reachable={reachable}", f"side={side}")
         for group in groups:
-            for bucket in item["camera_dx_target"].tolist():
+            for horizon, bucket in enumerate(item["camera_dx_target"].tolist()):
                 grouped[group]["dx"][str(CAMERA_BUCKETS[int(bucket)])] += 1
-            for bucket in item["camera_dy_target"].tolist():
+                horizon_grouped[horizon][group]["dx"][str(CAMERA_BUCKETS[int(bucket)])] += 1
+            for horizon, bucket in enumerate(item["camera_dy_target"].tolist()):
                 grouped[group]["dy"][str(CAMERA_BUCKETS[int(bucket)])] += 1
+                horizon_grouped[horizon][group]["dy"][str(CAMERA_BUCKETS[int(bucket)])] += 1
     if not total:
         raise ValueError("没有 canonical chunk 与 grounding 标注在 observation_end_frame 对齐")
     return {
@@ -51,6 +58,12 @@ def audit(data: str | list[str], annotations: str | Path) -> dict:
         "aligned_chunks": total,
         "groups": {name: {axis: dict(counter) for axis, counter in axes.items()}
                    for name, axes in sorted(grouped.items())},
+        "horizons": {
+            str(horizon): {"groups": {
+                name: {axis: dict(counter) for axis, counter in axes.items()}
+                for name, axes in sorted(groups.items())}}
+            for horizon, groups in sorted(horizon_grouped.items())
+        },
     }
 
 

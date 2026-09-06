@@ -183,6 +183,27 @@ side, prompt/reachability, and action horizon before choosing between a
 causal camera-target reformulation and targeted human labels. No deployment
 rule may substitute for that learned mapping.
 
+## m25 Causal Rolling-Step Protocol (Implemented, Not Yet Trained)
+
+The per-horizon audit reports are at
+`C:\\Codespace\\ID_V_Agent\\reports\\m24_grounding_camera_alignment_train.json`
+and `C:\\Codespace\\ID_V_Agent\\reports\\m24_grounding_camera_alignment_val.json`.
+They show that the observation-frame side label predicts the first action's
+dx sign (held-out: left is negative `5/7`, right is positive `4/4`), while
+steps 2--3 become mixed after the game view has changed. Runtime previously
+executed all four six-frame actions (~0.8 s) before a new block could start,
+which made those stale-image targets part of both training loss and deployment.
+
+`m25_act.rolling_causal_step.v1` fixes that protocol end-to-end without an
+external rule: the model still predicts a four-step tensor, but the trainer,
+offline evaluator, and ACT executor share `execution_horizon=1`. They
+supervise/score/submit only action 0 (six frames = 200 ms), then observe the
+next real frame before issuing the next model decision. `m24` and all older
+checkpoints fail closed because their four-step loss/execution semantics are
+not compatible. The implementation and causal-loss regression are covered by
+75 focused tests. Next: run a 30--60 step m25 smoke, then a bounded full m25
+training and the complete four-condition gate.
+
 ## Latest Evidence: m24 Learned Camera-Grounding Fusion Smoke
 
 | Item | Evidence |

@@ -1007,7 +1007,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                    grounding_prompt_global_counts=(grounding_class_balance_statistics["prompt"]
                                                                    if grounding_class_balance_statistics else None),
                                    grounding_reachable_global_counts=(grounding_class_balance_statistics["reachable"]
-                                                                      if grounding_class_balance_statistics else None))
+                                                                      if grounding_class_balance_statistics else None),
+                                   execution_horizon=int(getattr(args, "execution_horizon", 1)))
 
     # Materialize the direct raw-grid feature contract before constructing the
     # core/optimizer.  ``hidden_size`` is Qwen text width (2560), not ACT
@@ -1023,6 +1024,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("ACT raw-grid feature dim 未 materialize")
     core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
+    core.execution_horizon = int(getattr(args, "execution_horizon", 1))
     interact_event_bias_init = _interact_event_bias_init(dataset, horizon=ACTION_CHUNK_HORIZON)
     core.visual_expert.set_interact_event_bias(interact_event_bias_init)
     ordinary_button_bias_init = _ordinary_button_bias_init(dataset, horizon=ACTION_CHUNK_HORIZON)
@@ -1201,7 +1203,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "global_button_counts": button_global_counts.tolist() if button_global_counts is not None else None,
                   "teacher_forcing_start": args.teacher_forcing_start,
                   "teacher_forcing_end": args.teacher_forcing_end,
-                  "teacher_forcing_decay_steps": args.teacher_forcing_decay_steps},
+                  "teacher_forcing_decay_steps": args.teacher_forcing_decay_steps,
+                  "execution_horizon": int(getattr(args, "execution_horizon", 1))},
         schema_versions=[VLA_SCHEMA_VERSION_V5],
         artifacts={"act_checkpoint": str(checkpoint.name)},
         extra={"initialization": "base_without_m2", "parent_stage": None,
@@ -1499,7 +1502,12 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
                     ("reachable_target", batch["grounding_reachable_target"].to(output_device)),
                 ):
                     grounding_rows[key].append(value.detach().cpu())
+            execution_horizon = int(getattr(core, "execution_horizon", output.fast.move_logits.shape[1]))
+            if not 1 <= execution_horizon <= output.fast.move_logits.shape[1]:
+                raise ValueError("execution_horizon 超出 fast action chunk")
             mask = batch["fast_loss_mask"].to(output_device).bool()
+            mask = mask[:, None].expand_as(output.fast.move_logits.argmax(-1)).clone()
+            mask[:, execution_horizon:] = False
             for value in output.fast.move_logits.argmax(-1)[mask].detach().cpu().reshape(-1).tolist():
                 move_pred[int(value)] += 1
             targets = batch["move_target"].to(output_device)[mask].detach().cpu().reshape(-1).tolist()
@@ -1679,6 +1687,8 @@ def main(argv=None) -> int:
                         help="FP16 GradScaler 初始 scale；2080 Ti 默认 1024 以避免首步溢出")
     parser.add_argument("--history-dropout-p", type=float, default=0.5,
                         help="训练时按样本清零完整 action history 的概率；验证/部署始终为 0")
+    parser.add_argument("--execution-horizon", type=int, default=1,
+                        help="当前画面允许执行并参与 fast action loss 的宏步数；m25 固定为 1")
     parser.add_argument("--visual-aux", type=float, default=1.0,
                         help="history-free visual action expert 的显式监督权重")
     parser.add_argument("--grounding-annotations", default="",

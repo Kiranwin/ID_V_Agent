@@ -146,6 +146,11 @@ def _load_model(args: argparse.Namespace, device: torch.device):
     core.interact_event_threshold = float(
         checkpoint.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
     )
+    core.execution_horizon = int(
+        checkpoint.get("manifest", {}).get("training", {}).get("execution_horizon", 1)
+    )
+    if core.execution_horizon != 1:
+        raise ValueError("ACT runtime 仅接受 m25 execution_horizon=1 checkpoint")
     adapter.eval()
     core.eval()
     return adapter, core, {"stage": "base_without_m2"}
@@ -168,7 +173,7 @@ def _predict(core: SharedFastSlowVLA, window: RealtimeWindow, condition: SlowCon
     buttons = fast.button_predictions(event_threshold=event_threshold)[0]
     duration = fast.duration[0]
     steps = []
-    for i in range(fast.move_logits.shape[1]):
+    for i in range(int(core.execution_horizon)):
         steps.append(ActionChunkStep(
             int(move[i]), CAMERA_BUCKETS[int(dx[i])], CAMERA_BUCKETS[int(dy[i])],
             tuple(int(v) for v in buttons[i].tolist()), int(round(float(duration[i])))))

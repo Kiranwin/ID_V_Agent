@@ -72,7 +72,8 @@ def test_act_policy_emits_fixed_v5_duration():
         policy.observe(1, frame_index=i, timestamp_ns=i + 1)
     steps = policy._predict_chunk(None)
 
-    assert [step.duration_frames for step in steps] == [6, 6, 6, 6]
+    # Runtime must execute only the causal first macro-step then re-observe.
+    assert [step.duration_frames for step in steps] == [6]
 
 
 def test_act_policy_zero_history_diagnostic_does_not_consume_executor_history():

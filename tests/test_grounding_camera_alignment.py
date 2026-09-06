@@ -36,3 +36,5 @@ def test_alignment_audit_groups_camera_replay_by_observation_grounding(tmp_path)
     assert report["aligned_chunks"] == 1
     assert report["groups"]["side=right"]["dx"]["2"] == 4
     assert report["groups"]["prompt=1"]["dy"]["-1"] == 4
+    assert report["horizons"]["0"]["groups"]["side=right"]["dx"]["2"] == 1
+    assert report["horizons"]["3"]["groups"]["prompt=1"]["dy"]["-1"] == 1
