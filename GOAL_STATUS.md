@@ -124,10 +124,13 @@ the replay labels.
    four-condition visual-dependency evaluation. The checkpoint is rejected;
    see the m24 evidence and decision below.
 2. Before starting a bounded m24 run, improve the grounding supervision that
-   feeds the learned camera fusion: prompt/reachability use unweighted BCE and
-   previously over-predicted positives, while the zero-initialized fusion has
-   received only 30 updates. Add and test head-local calibrated imbalance
-   handling, then train a bounded m24 experiment with 50% annotated sampling.
+   feeds the learned camera fusion: the head-local calibrated imbalance change
+   is implemented and covered by 34 focused tests. Prompt/reachability no
+   longer use unweighted BCE; present, side, prompt, and reachable each derive
+   a separate inverse-sqrt, `[0.35, 3.0]`-clamped, mean-one table from only
+   human-annotated training decision frames. The exact tables, timestamp, ACT
+   source data, and annotation JSONL will be embedded in the next manifest.
+   Train a bounded m24 experiment with 50% annotated sampling.
 3. Re-run the full gate as one blocking foreground command after that training.
    A checkpoint is deployable only when all image-zero and image-shuffle
    move/camera/intent requirements pass.

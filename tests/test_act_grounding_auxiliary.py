@@ -96,6 +96,40 @@ def test_grounding_loss_ignores_unannotated_rows():
     assert torch.allclose(first["grounding_total"], second["grounding_total"])
 
 
+def test_grounding_loss_uses_head_local_balanced_global_counts():
+    """Prompt/reachability must not inherit a different head's class prior."""
+    from idv_agent.model.vla_heads import GroundingOutput
+    from idv_agent.training.vla_loss import VLALossWeights, compute_grounding_loss
+
+    # Both rows are positive for presence/prompt and side=none.  Their
+    # respective training-set histograms say these are real majority labels,
+    # so the per-head inverse-sqrt tables must reduce their contribution.
+    out = GroundingOutput(
+        torch.zeros(2, requires_grad=True), torch.zeros(2, 4, requires_grad=True),
+        torch.zeros(2, 4, requires_grad=True), torch.zeros(2, requires_grad=True),
+        torch.zeros(2, requires_grad=True),
+    )
+    batch = {
+        "grounding_mask": torch.ones(2), "grounding_present_target": torch.ones(2),
+        "grounding_bbox_mask": torch.zeros(2), "grounding_bbox_target": torch.zeros(2, 4),
+        "grounding_side_target": torch.zeros(2, dtype=torch.long),
+        "grounding_prompt_target": torch.ones(2),
+        "grounding_reachable_target": torch.zeros(2),
+    }
+    unweighted = compute_grounding_loss(out, batch, VLALossWeights())
+    weighted = compute_grounding_loss(out, batch, VLALossWeights(
+        grounding_class_balance=True,
+        grounding_present_global_counts=torch.tensor([1., 100.]),
+        grounding_prompt_global_counts=torch.tensor([1., 100.]),
+        grounding_reachable_global_counts=torch.tensor([100., 1.]),
+        grounding_side_global_counts=torch.tensor([100., 1., 1., 1.]),
+    ))
+    assert weighted["grounding_present"] < unweighted["grounding_present"]
+    assert weighted["grounding_prompt"] < unweighted["grounding_prompt"]
+    assert weighted["grounding_reachable"] < unweighted["grounding_reachable"]
+    assert weighted["grounding_side"] < unweighted["grounding_side"]
+
+
 def test_vla_dataset_attaches_grounding_only_at_observation_end_frame(tmp_path):
     from idv_agent.training.vla_dataset import VLASequenceDataset
 

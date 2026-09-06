@@ -707,6 +707,30 @@ def _class_balance_statistics(dataset) -> dict[str, torch.Tensor]:
     return counts
 
 
+def _grounding_class_balance_statistics(dataset) -> dict[str, torch.Tensor]:
+    """Count only human-annotated decision frames for each grounding head."""
+    counts = {
+        "present": torch.zeros(2, dtype=torch.float32),
+        "side": torch.zeros(4, dtype=torch.float32),
+        "prompt": torch.zeros(2, dtype=torch.float32),
+        "reachable": torch.zeros(2, dtype=torch.float32),
+    }
+    annotated = 0
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        if not bool(sample["grounding_mask"]):
+            continue
+        annotated += 1
+        for name, target in (("present", sample["grounding_present_target"]),
+                             ("prompt", sample["grounding_prompt_target"]),
+                             ("reachable", sample["grounding_reachable_target"])):
+            counts[name][int(float(target) > 0)] += 1
+        counts["side"][int(sample["grounding_side_target"])] += 1
+    if annotated < 1:
+        raise ValueError("grounding 类别平衡需要至少一个已标注训练样本")
+    return counts
+
+
 def _interact_event_bias_init(dataset, *, horizon: int = ACTION_CHUNK_HORIZON,
                               eps: float = 1e-4) -> torch.Tensor:
     """Initialize the independent Q-event head from chunk-level event rates."""
@@ -759,6 +783,28 @@ def _class_balance_manifest(statistics: dict[str, torch.Tensor], *, data_paths: 
                    "sample_count": sample_count,
                    "sampling": sampling,
                    "max_samples": max_samples},
+        "heads": {
+            name: {"counts": values.tolist(), "weights": balanced_class_weights(values).tolist()}
+            for name, values in statistics.items()
+        },
+    }
+
+
+def _grounding_class_balance_manifest(statistics: dict[str, torch.Tensor], *,
+                                      data_paths: list[str], annotation_path: str,
+                                      sample_count: int) -> dict[str, object]:
+    """Persist per-head grounding weights with both ACT and label provenance."""
+    return {
+        "method": "inverse_sqrt_clamped_mean1",
+        "clamp": [0.35, 3.0],
+        "normalized_per_head": True,
+        "computed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": {
+            "act_schema": VLA_SCHEMA_VERSION_V5,
+            "act_paths": [str(Path(path).resolve()) for path in data_paths],
+            "grounding_annotations": str(Path(annotation_path).resolve()),
+            "annotated_sample_count": sample_count,
+        },
         "heads": {
             name: {"counts": values.tolist(), "weights": balanced_class_weights(values).tolist()}
             for name, values in statistics.items()
@@ -913,6 +959,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     global_counts = None
     class_balance_statistics = None
     class_balance_manifest = None
+    grounding_class_balance_statistics = None
+    grounding_class_balance_manifest = None
     button_global_counts = None
     if args.move_direction_balance:
         global_counts = torch.zeros(9, dtype=torch.float32)
@@ -924,6 +972,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             class_balance_statistics, data_paths=_dataset_paths(args.data),
             sample_count=len(dataset), sampling=sampling,
             max_samples=int(getattr(args, "max_samples", 0) or 0))
+    if grounding_annotations is not None and float(getattr(args, "grounding_loss_weight", 1.0)) > 0:
+        grounding_class_balance_statistics = _grounding_class_balance_statistics(dataset)
+        grounding_class_balance_manifest = _grounding_class_balance_manifest(
+            grounding_class_balance_statistics, data_paths=_dataset_paths(args.data),
+            annotation_path=grounding_annotations,
+            sample_count=int(grounding_class_balance_statistics["present"].sum()))
     if getattr(args, "button_global_balance", False):
         button_global_counts = torch.zeros((6, 2), dtype=torch.float32)
         for index in range(len(dataset)):
@@ -944,7 +998,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                    intent_global_counts=(class_balance_statistics["intent"]
                                                          if class_balance_statistics else None),
                                    button_global_counts=button_global_counts,
-                                   grounding=float(getattr(args, "grounding_loss_weight", 1.0)))
+                                   grounding=float(getattr(args, "grounding_loss_weight", 1.0)),
+                                   grounding_class_balance=grounding_class_balance_statistics is not None,
+                                   grounding_present_global_counts=(grounding_class_balance_statistics["present"]
+                                                                    if grounding_class_balance_statistics else None),
+                                   grounding_side_global_counts=(grounding_class_balance_statistics["side"]
+                                                                 if grounding_class_balance_statistics else None),
+                                   grounding_prompt_global_counts=(grounding_class_balance_statistics["prompt"]
+                                                                   if grounding_class_balance_statistics else None),
+                                   grounding_reachable_global_counts=(grounding_class_balance_statistics["reachable"]
+                                                                      if grounding_class_balance_statistics else None))
 
     # Materialize the direct raw-grid feature contract before constructing the
     # core/optimizer.  ``hidden_size`` is Qwen text width (2560), not ACT
@@ -1132,6 +1195,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "button_positive_weight": args.button_positive_weight,
                   "move_direction_balance": args.move_direction_balance,
                   "class_balance": class_balance_manifest,
+                  "grounding_class_balance": grounding_class_balance_manifest,
                   "image_augmentation": image_augmentation,
                   "global_move_counts": global_counts.tolist() if global_counts is not None else None,
                   "global_button_counts": button_global_counts.tolist() if button_global_counts is not None else None,

@@ -43,6 +43,15 @@ class VLALossWeights:
     button_global_counts: Optional[torch.Tensor] = None
     interact_event_positive_weight: float = 3.0
     grounding: float = 1.0
+    # Grounding annotations are sparse and their binary targets have different
+    # base rates (for example prompt/reachable).  These tables are calculated
+    # only from annotated training frames and normalized independently per
+    # head, so they cannot change the relative lambda between grounding heads.
+    grounding_class_balance: bool = False
+    grounding_present_global_counts: Optional[torch.Tensor] = None
+    grounding_side_global_counts: Optional[torch.Tensor] = None
+    grounding_prompt_global_counts: Optional[torch.Tensor] = None
+    grounding_reachable_global_counts: Optional[torch.Tensor] = None
 
 
 def balanced_class_weights(counts: torch.Tensor, *, min_weight: float = 0.35,
@@ -100,6 +109,16 @@ def _validated_global_counts(counts: torch.Tensor | None, classes: int, name: st
     return counts
 
 
+def _binary_target_weights(target: torch.Tensor, counts: torch.Tensor | None,
+                           *, name: str) -> torch.Tensor | None:
+    """Return negative/positive class weights selected per binary target."""
+    if counts is None:
+        return None
+    checked = _validated_global_counts(counts, 2, name, target.new_zeros(2))
+    table = balanced_class_weights(checked).to(device=target.device, dtype=target.dtype)
+    return table[(target > 0).to(torch.long)]
+
+
 def _move_class_weights(counts: torch.Tensor, *, move_stop_weight: float,
                         balance: bool) -> torch.Tensor:
     """Build movement CE weights while preserving the explicit stop policy."""
@@ -125,13 +144,34 @@ def compute_grounding_loss(grounding: GroundingOutput, batch: dict,
     """Current-frame visual grounding loss, masked outside the annotation pool."""
     mask = batch["grounding_mask"].to(grounding.present_logits.device)
     bbox_mask = batch["grounding_bbox_mask"].to(grounding.bbox.device) * mask
+    present_target = batch["grounding_present_target"].to(grounding.present_logits.dtype)
+    prompt_target = batch["grounding_prompt_target"].to(grounding.prompt_logits.dtype)
+    reachable_target = batch["grounding_reachable_target"].to(grounding.reachable_logits.dtype)
+    present_weight = prompt_weight = reachable_weight = side_weight = None
+    if weights.grounding_class_balance:
+        present_weight = _binary_target_weights(
+            present_target, weights.grounding_present_global_counts,
+            name="grounding_present_global_counts")
+        prompt_weight = _binary_target_weights(
+            prompt_target, weights.grounding_prompt_global_counts,
+            name="grounding_prompt_global_counts")
+        reachable_weight = _binary_target_weights(
+            reachable_target, weights.grounding_reachable_global_counts,
+            name="grounding_reachable_global_counts")
+        side_counts = _validated_global_counts(
+            weights.grounding_side_global_counts, grounding.side_logits.shape[-1],
+            "grounding_side_global_counts", torch.bincount(
+                batch["grounding_side_target"].reshape(-1), minlength=grounding.side_logits.shape[-1]))
+        side_weight = balanced_class_weights(side_counts).to(
+            device=grounding.side_logits.device, dtype=grounding.side_logits.dtype)
     present = F.binary_cross_entropy_with_logits(
-        grounding.present_logits, batch["grounding_present_target"].to(grounding.present_logits.dtype), reduction="none")
+        grounding.present_logits, present_target, weight=present_weight, reduction="none")
     prompt = F.binary_cross_entropy_with_logits(
-        grounding.prompt_logits, batch["grounding_prompt_target"].to(grounding.prompt_logits.dtype), reduction="none")
+        grounding.prompt_logits, prompt_target, weight=prompt_weight, reduction="none")
     reachable = F.binary_cross_entropy_with_logits(
-        grounding.reachable_logits, batch["grounding_reachable_target"].to(grounding.reachable_logits.dtype), reduction="none")
-    side = F.cross_entropy(grounding.side_logits, batch["grounding_side_target"].to(torch.long), reduction="none")
+        grounding.reachable_logits, reachable_target, weight=reachable_weight, reduction="none")
+    side = F.cross_entropy(grounding.side_logits, batch["grounding_side_target"].to(torch.long),
+                           weight=side_weight, reduction="none")
     bbox = F.smooth_l1_loss(grounding.bbox, batch["grounding_bbox_target"].to(grounding.bbox.dtype), reduction="none").mean(dim=-1)
     losses = {
         "grounding_present": _masked_mean(present, mask),
