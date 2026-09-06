@@ -120,15 +120,46 @@ the replay labels.
 
 ## Next Action
 
-1. The m24 learned camera-side/prompt fusion path is implemented: it consumes
-   only predicted visual grounding logits, affects only camera dx/dy, and has
-   a zero-initialized fusion layer. Schema is now
-   `m24_act.camera_grounding_fusion.v1`; m22/m23 fail closed.
-2. Run a short 30--60 step behavior smoke as a blocking command. If it is
-   numerically sound, run a bounded training experiment; then run the complete
-   four-condition gate as a blocking command.
-3. Update this file with the result. A checkpoint is deployable only when all
-   image-zero and image-shuffle move/camera/intent requirements pass.
+1. `m24` completed its 30-step numerical smoke and the complete 182-sample
+   four-condition visual-dependency evaluation. The checkpoint is rejected;
+   see the m24 evidence and decision below.
+2. Before starting a bounded m24 run, improve the grounding supervision that
+   feeds the learned camera fusion: prompt/reachability use unweighted BCE and
+   previously over-predicted positives, while the zero-initialized fusion has
+   received only 30 updates. Add and test head-local calibrated imbalance
+   handling, then train a bounded m24 experiment with 50% annotated sampling.
+3. Re-run the full gate as one blocking foreground command after that training.
+   A checkpoint is deployable only when all image-zero and image-shuffle
+   move/camera/intent requirements pass.
+
+## Latest Evidence: m24 Learned Camera-Grounding Fusion Smoke
+
+| Item | Evidence |
+|---|---|
+| Checkpoint | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m24_camera_grounding_smoke30_local_idv312\\act.pt` |
+| Schema / initialization | `m24_act.camera_grounding_fusion.v1`; base Qwen only, without M2 |
+| Training setup | 30 steps, batch=4, max source samples=64, grounding annotated fraction=0.5 |
+| Optimization | loss `11.3464 -> 6.2800`; minimum `4.7771`; max gradient norm `78.683`; behavior smoke passed (finite loss/gradients and deterministic feature checks) |
+| Full gate report | `C:\\Codespace\\ID_V_Agent\\reports\\m24_visual_dependency_full.json` |
+
+### m24 Deployment Decision: **REJECT / FAIL-CLOSED**
+
+The evaluator completed over all 182 held-out chunks. The checkpoint fails
+both required image conditions when assessed with balanced accuracy:
+
+- `image_zero`: move `0.1441 -> 0.1667` (drop `-0.0226`), camera
+  `0.2368 -> 0.2329` (drop `0.0040`), intent `0.4019 -> 0.5000` (drop
+  `-0.0981`); all fail their required drops.
+- `image_shuffle`: move `0.1441 -> 0.1473` (drop `-0.0031`) and camera
+  `0.2368 -> 0.2300` (drop `0.0068`) fail; intent does pass (`0.4019 ->
+  0.2483`, drop `0.1536`, threshold `0.0603`).
+
+The image tensors do affect raw outputs (for example, image-zero camera-dx
+argmax flips on `83.4%` of actions), but that sensitivity does not translate
+to the required *correct* visual decisions. `history_zero` is effectively
+unchanged, confirming the intended history-free move/intent path, but it does
+not satisfy the visual-dependency requirement. Do not deploy or enable
+`--send-input` for this checkpoint.
 
 ## Important Historical Evidence
 
