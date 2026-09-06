@@ -201,8 +201,15 @@ supervise/score/submit only action 0 (six frames = 200 ms), then observe the
 next real frame before issuing the next model decision. `m24` and all older
 checkpoints fail closed because their four-step loss/execution semantics are
 not compatible. The implementation and causal-loss regression are covered by
-75 focused tests. Next: run a 30--60 step m25 smoke, then a bounded full m25
-training and the complete four-condition gate.
+75 focused tests. The first m25 smoke wrote
+`C:\\Codespace\\ID_V_Agent\\checkpoints\\m25_rolling_smoke60_local_idv312\\act.pt`
+and `metrics.json`, but was rejected by the numerical behavior gate: maximum
+unscaled gradient norm was `103.3916` at step 4 versus the `100.0` limit.
+Loss still decreased `7.4353 -> 6.7463`, all component losses were finite
+(maximum `13.9462`), and no NaN/Inf was reported. Its 64-sample validation
+also had camera-dx zero false-turn rate `0.6000`; it is not a deployment
+candidate. Re-run m25 smoke with a conservative learning rate before a full
+training and complete four-condition gate.
 
 ## Latest Evidence: m24 Learned Camera-Grounding Fusion Smoke
 
