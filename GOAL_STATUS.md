@@ -131,6 +131,9 @@ the replay labels.
    human-annotated training decision frames. The exact tables, timestamp, ACT
    source data, and annotation JSONL will be embedded in the next manifest.
    Train a bounded m24 experiment with 50% annotated sampling.
+   A 366-step local command for that experiment was started but was interrupted
+   before it emitted `metrics.json` or a checkpoint; it is **not** an
+   experimental result and must not be compared with m23/m24-smoke.
 3. Re-run the full gate as one blocking foreground command after that training.
    A checkpoint is deployable only when all image-zero and image-shuffle
    move/camera/intent requirements pass.
