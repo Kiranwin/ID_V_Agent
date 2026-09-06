@@ -138,6 +138,51 @@ the replay labels.
    A checkpoint is deployable only when all image-zero and image-shuffle
    move/camera/intent requirements pass.
 
+## Latest Evidence: m24 Full Grounding-Balanced Training
+
+| Item | Evidence |
+|---|---|
+| Checkpoint | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m24_groundingbalanced_2epoch_local_idv312\\act.pt` |
+| Metrics / manifest | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m24_groundingbalanced_2epoch_local_idv312\\metrics.json`, `manifest.json` |
+| Training | 366 steps, all 732 train chunks, batch=4, image augmentation, history dropout=0.5, 50% annotated sampler, base Qwen only |
+| Optimization | loss `12.0795 -> 1.5974`; finite throughout; all-sample diagnostics completed |
+| Grounding validation | 64 annotated chunks: presence `0.6094` accuracy / `0.6545` recall; prompt `0.8594` accuracy / `0.9444` recall; reachable `0.8281` accuracy / `0.9444` recall; side `0.4531`; bbox L1 `0.1128` |
+| Full gate report | `C:\\Codespace\\ID_V_Agent\\reports\\m24_groundingbalanced_visual_dependency_full.json` |
+
+### m24 Grounding-Balanced Deployment Decision: **REJECT / FAIL-CLOSED**
+
+This is the strongest normal-condition model so far: on all 182 held-out
+chunks, normal accuracy is move `0.5357`, camera `0.5591`, intent `0.8516`;
+balanced accuracy is move `0.2829`, camera `0.2500`, intent `0.8636`.
+Prompt/reachability calibration improved materially over the 30-step smoke.
+The history-zero condition is identical to normal, as required by the
+history-free visual move/intent design.
+
+It still fails the visual-dependency gate and cannot be deployed:
+
+- `image_zero`: move drop `0.1163` passes and intent drop `0.3636` passes,
+  but camera drop is only `0.0206 < 0.05`.
+- `image_shuffle`: intent drop `0.3478` passes, but move changes by `-0.0016`
+  and camera drop is only `0.0318 < 0.05`.
+
+The evaluator exits nonzero when a gate fails; that is expected fail-closed
+behavior after it has written the complete report. The training command also
+returned nonzero only because `--require-training-behavior` is deliberately a
+30--60-step smoke gate while this run had 366 steps. The checkpoint, manifest,
+metrics, and full diagnostics had already been written and are valid; do not
+interpret that option-contract failure as an optimization failure.
+
+### Next Diagnostic Decision
+
+Do not merely add more epochs. The calibrated manifest shows that of the 128
+annotated training decision frames, target side is `none=8`, `left=5`,
+`center=105`, `right=10`. The sparse left/right supervision and the
+observation-to-future Raw Input replay offset are likely limiting the learned
+side-to-five-bucket camera mapping. Audit this relationship conditionally by
+side, prompt/reachability, and action horizon before choosing between a
+causal camera-target reformulation and targeted human labels. No deployment
+rule may substitute for that learned mapping.
+
 ## Latest Evidence: m24 Learned Camera-Grounding Fusion Smoke
 
 | Item | Evidence |
