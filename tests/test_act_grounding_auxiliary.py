@@ -176,3 +176,32 @@ def test_grounding_metrics_score_only_annotated_rows():
     assert metrics["presence"]["accuracy"] == 1.0
     assert metrics["side_accuracy"] == 1.0
     assert metrics["bbox_l1"] == 0.0
+
+
+def test_grounding_sampling_weights_set_requested_annotation_probability():
+    from idv_agent.scripts.train_vla import _grounding_sampling_weights
+
+    class Dataset:
+        def __len__(self):
+            return 10
+
+        def __getitem__(self, index):
+            return {"grounding_mask": torch.tensor(float(index < 2))}
+
+    weights, report = _grounding_sampling_weights(Dataset(), annotated_fraction=0.5)
+    assert torch.isclose(weights[:2].sum() / weights.sum(), torch.tensor(0.5))
+    assert report == {"annotated": 2, "unannotated": 8, "target_annotated_fraction": 0.5}
+
+
+def test_grounding_sampling_weights_fail_when_requested_without_annotations():
+    from idv_agent.scripts.train_vla import _grounding_sampling_weights
+
+    class Dataset:
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            return {"grounding_mask": torch.tensor(0.0)}
+
+    with pytest.raises(ValueError, match="没有带 grounding 标注"):
+        _grounding_sampling_weights(Dataset(), annotated_fraction=0.5)

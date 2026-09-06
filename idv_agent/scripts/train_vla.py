@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 from idv_agent.model.fast_slow_vla import FastSlowVLAOutput, SharedFastSlowVLA
 from idv_agent.model.act_checkpoint import (
@@ -134,6 +134,25 @@ def _episode_diverse_subset(dataset, limit: int):
                        if index not in used)
         selected = selected[:limit]
     return Subset(dataset, selected)
+
+
+def _grounding_sampling_weights(dataset, *, annotated_fraction: float) -> tuple[torch.Tensor, dict[str, int | float]]:
+    """Raise sparse grounding exposure without dropping ordinary ACT chunks."""
+    fraction = float(annotated_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("grounding annotated fraction 必须在 (0,1)")
+    masks = torch.tensor([float(dataset[index]["grounding_mask"].item()) for index in range(len(dataset))])
+    annotated = int((masks > 0).sum())
+    unannotated = int((masks <= 0).sum())
+    if annotated == 0:
+        raise ValueError("训练集没有带 grounding 标注的样本，不能启用 grounding 过采样")
+    if unannotated == 0:
+        raise ValueError("训练集全部带 grounding 标注，无需启用 grounding 过采样")
+    weights = torch.where(masks > 0,
+                          torch.tensor(fraction / annotated, dtype=torch.float32),
+                          torch.tensor((1.0 - fraction) / unannotated, dtype=torch.float32))
+    return weights, {"annotated": annotated, "unannotated": unannotated,
+                     "target_annotated_fraction": fraction}
 
 
 def _evaluation_stratified_subset(dataset, limit: int):
@@ -850,8 +869,20 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         raw_feature_cache = RawFeatureCache(args.raw_feature_cache, spatial_k=8)
     if image_augmentation and raw_feature_cache is not None:
         raise ValueError("--image-augmentation 与 --raw-feature-cache 不兼容；请关闭其中之一")
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                        collate_fn=VLASequenceCollator(max_frames=8))
+    grounding_annotated_fraction = float(getattr(args, "grounding_annotated_fraction", 0.0))
+    grounding_sampling = None
+    if grounding_annotated_fraction:
+        if grounding_annotations is None:
+            raise ValueError("--grounding-annotated-fraction 需要 --grounding-annotations")
+        weights, grounding_sampling = _grounding_sampling_weights(
+            dataset, annotated_fraction=grounding_annotated_fraction)
+        sampler = WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True,
+                                        generator=torch.Generator().manual_seed(int(getattr(args, "seed", 0))) )
+        loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                            collate_fn=VLASequenceCollator(max_frames=8))
+    else:
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            collate_fn=VLASequenceCollator(max_frames=8))
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                              collate_fn=VLASequenceCollator(max_frames=8))
     val_paths = _dataset_paths(getattr(args, "val_data", None))
@@ -1085,6 +1116,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "history_dropout_p": history_dropout_p,
                   "visual_aux": float(getattr(args, "visual_aux", 1.0)),
                   "grounding_loss_weight": float(getattr(args, "grounding_loss_weight", 1.0)),
+                  "grounding_sampling": grounding_sampling,
                   "grounding_annotations": (str(Path(grounding_annotations).resolve())
                                              if grounding_annotations else None),
                   "prior_scale": float(core.prior_scale), "prior_logits_bounded": True,
@@ -1589,6 +1621,8 @@ def main(argv=None) -> int:
                         help="训练期同 session ACT grounding JSONL；部署不会读取该文件")
     parser.add_argument("--grounding-loss-weight", type=float, default=1.0,
                         help="训练期视觉 grounding 辅助 loss 权重；0 可用于消融")
+    parser.add_argument("--grounding-annotated-fraction", type=float, default=0.0,
+                        help="训练抽样中带 grounding 标注的目标比例；0 禁用，建议 0.5")
     parser.add_argument("--visual-center-samples", type=int, default=64,
                         help="从训练集分层抽取的 raw visual center 校准样本数")
     parser.add_argument("--move-stop-weight", type=float, default=0.5)
