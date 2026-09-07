@@ -188,7 +188,10 @@ def test_camera_control_ui_serves_context_and_writes_annotated_copy(tmp_path: Pa
     try:
         response = request(server, "/camera-control")
         assert response.status == 200
-        assert b"Camera Control Annotation" in response.read()
+        page = response.read()
+        assert b"Camera Control Annotation" in page
+        assert b'id="replay-play"' in page
+        assert b'id="replay-slider"' in page
         sets = get_json(server, "/api/camera-control/sets")
         assert sets["splits"]["train"]["pending"] == 1
         context = get_json(server, "/api/camera-control/train/rows/s1_00000021/context")

@@ -6,7 +6,7 @@ const OPTIONS = {
   desired_turn_dx: [-2, -1, 0, 1, 2], desired_turn_dy: [-2, -1, 0, 1, 2],
   status: ["pending", "complete"],
 };
-const state = { data: null, split: "train", rowIndex: 0, context: [] };
+const state = { data: null, split: "train", rowIndex: 0, context: [], replayIndex: 0, replayTimer: null };
 const $ = (id) => document.getElementById(id);
 
 async function api(path, options = {}) {
@@ -54,12 +54,35 @@ function renderTarget() {
   const bbox = $("bbox"), b = g.cipher_bbox_xyxy_norm; bbox.hidden = !b;
   if (b) { bbox.style.left = `${b[0] * 100}%`; bbox.style.top = `${b[1] * 100}%`; bbox.style.width = `${(b[2] - b[0]) * 100}%`; bbox.style.height = `${(b[3] - b[1]) * 100}%`; }
 }
-function renderContext() { const box = $("context"); box.replaceChildren(); const row = selected(); state.context.filter(x => x.exists).forEach((item, index) => { const figure = document.createElement("figure"); const img = document.createElement("img"); img.loading = "lazy"; img.src = `/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}/frames/${item.frame}`; img.alt = `frame ${item.frame}`; const c = document.createElement("figcaption"); c.textContent = `frame ${item.frame}${index === 0 ? " · h0 start" : index === 5 ? " · h0 end" : ""}`; figure.append(img, c); box.append(figure); }); }
+function stopReplay() { if (state.replayTimer !== null) { clearInterval(state.replayTimer); state.replayTimer = null; } const button = $("replay-play"); if (button) button.textContent = "▶ 播放"; }
+function replayFrames() { return state.context.filter(item => item.exists); }
+function showReplayFrame(index) {
+  const frames = replayFrames(); if (!frames.length) return;
+  state.replayIndex = (index + frames.length) % frames.length;
+  const item = frames[state.replayIndex], row = selected();
+  $("replay-image").src = `/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}/frames/${item.frame}`;
+  $("replay-image").hidden = false; $("replay-empty").hidden = true;
+  $("replay-caption").textContent = `frame ${item.frame} · h0 ${state.replayIndex + 1}/${frames.length}${state.replayIndex === 0 ? " · start" : state.replayIndex === frames.length - 1 ? " · end" : ""}`;
+  $("replay-slider").value = String(state.replayIndex);
+  document.querySelectorAll("#context figure").forEach((figure, itemIndex) => figure.classList.toggle("active", itemIndex === state.replayIndex));
+}
+function toggleReplay() {
+  const frames = replayFrames(); if (!frames.length) return;
+  if (state.replayTimer !== null) return stopReplay();
+  $("replay-play").textContent = "❚❚ 暂停";
+  state.replayTimer = setInterval(() => showReplayFrame(state.replayIndex + 1), Number($("replay-speed").value));
+}
+function renderContext() { const box = $("context"); box.replaceChildren(); const row = selected(); const frames = replayFrames(); frames.forEach((item, index) => { const figure = document.createElement("figure"); const img = document.createElement("img"); img.loading = "lazy"; img.src = `/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}/frames/${item.frame}`; img.alt = `frame ${item.frame}`; const c = document.createElement("figcaption"); c.textContent = `frame ${item.frame}${index === 0 ? " · h0 start" : index === frames.length - 1 ? " · h0 end" : ""}`; figure.append(img, c); figure.onclick = () => { stopReplay(); showReplayFrame(index); }; box.append(figure); }); const slider = $("replay-slider"); slider.max = String(Math.max(0, frames.length - 1)); slider.disabled = !frames.length; if (frames.length) showReplayFrame(Math.min(state.replayIndex, frames.length - 1)); else { $("replay-image").hidden = true; $("replay-empty").hidden = false; $("replay-caption").textContent = "无可用 h0 帧"; } }
 function render() { renderQueue(); const row = selected(); $("empty").hidden = Boolean(row); $("editor").hidden = !row; if (!row) return; renderTarget(); renderContext(); renderFields(); }
-async function loadContext() { const row = selected(); if (!row) { state.context = []; return; } state.context = (await api(`/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}/context`)).frames; }
+async function loadContext() { stopReplay(); const row = selected(); state.replayIndex = 0; if (!row) { state.context = []; return; } state.context = (await api(`/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}/context`)).frames; }
 async function load() { error(); status("Loading"); state.data = await api("/api/camera-control/sets"); const rows = state.data.splits[state.split].rows; const pending = rows.findIndex(x => x.status !== "complete"); state.rowIndex = pending < 0 ? 0 : pending; await loadContext(); render(); status("Ready", "success"); }
 async function save(goNext = false) { const row = selected(); if (!row) return; error(); status("Saving"); const annotation = Object.fromEntries(Object.keys(OPTIONS).map(key => [key, row[key]])); try { const result = await api(`/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ annotation }) }); state.data.splits[state.split].rows[state.rowIndex] = result.row; const meta = state.data.splits[state.split]; meta.complete = meta.rows.filter(x => x.status === "complete").length; meta.pending = meta.rows.length - meta.complete; meta.source = meta.output; if (goNext) nextPending(); render(); status("Saved", "success"); } catch (e) { error(e.message); status("Save failed", "error"); } }
 function nextPending() { const rows = state.data.splits[state.split].rows; const start = state.rowIndex; for (let i = 1; i <= rows.length; i += 1) { const index = (start + i) % rows.length; if (rows[index].status !== "complete") { state.rowIndex = index; loadContext().then(render).catch(e => error(e.message)); return; } } }
 $("refresh").onclick = () => load().catch(e => { error(e.message); status("Load failed", "error"); });
 $("save").onclick = () => save(); $("next").onclick = () => save(true); $("next-pending").onclick = nextPending;
+$("replay-previous").onclick = () => { stopReplay(); showReplayFrame(state.replayIndex - 1); };
+$("replay-next").onclick = () => { stopReplay(); showReplayFrame(state.replayIndex + 1); };
+$("replay-play").onclick = toggleReplay;
+$("replay-slider").oninput = (event) => { stopReplay(); showReplayFrame(Number(event.currentTarget.value)); };
+$("replay-speed").onchange = () => { if (state.replayTimer !== null) { stopReplay(); toggleReplay(); } };
 load().catch(e => { error(e.message); status("Load failed", "error"); });
