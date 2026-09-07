@@ -120,23 +120,30 @@ the replay labels.
 
 ## Next Action
 
-1. `m24` completed its 30-step numerical smoke and the complete 182-sample
-   four-condition visual-dependency evaluation. The checkpoint is rejected;
-   see the m24 evidence and decision below.
-2. Before starting a bounded m24 run, improve the grounding supervision that
-   feeds the learned camera fusion: the head-local calibrated imbalance change
-   is implemented and covered by 34 focused tests. Prompt/reachability no
-   longer use unweighted BCE; present, side, prompt, and reachable each derive
-   a separate inverse-sqrt, `[0.35, 3.0]`-clamped, mean-one table from only
-   human-annotated training decision frames. The exact tables, timestamp, ACT
-   source data, and annotation JSONL will be embedded in the next manifest.
-   Train a bounded m24 experiment with 50% annotated sampling.
-   A 366-step local command for that experiment was started but was interrupted
-   before it emitted `metrics.json` or a checkpoint; it is **not** an
-   experimental result and must not be compared with m23/m24-smoke.
-3. Re-run the full gate as one blocking foreground command after that training.
-   A checkpoint is deployable only when all image-zero and image-shuffle
-   move/camera/intent requirements pass.
+1. The m25 loss-scale fix has passed the 60-step numerical smoke; run the
+   complete 366-step m25 training locally with the same configuration before
+   making any deployment decision.
+2. Run the full four-condition visual-dependency gate as one blocking
+   foreground command after training. A checkpoint is deployable only when all
+   image-zero and image-shuffle move/camera/intent requirements pass.
+3. If the gate passes, perform the sandbox dry-run sequence and verify the
+   learned policy completes find-machine, approach, Q interaction, and decoding
+   entry. Keep `--send-input` disabled until that evidence exists.
+
+## Latest Evidence: m25 Loss-Scale Smoke
+
+| Item | Evidence |
+|---|---|
+| Checkpoint | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m25_rolling_smoke60_scaled_local_idv312\\act.pt` |
+| Metrics | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m25_rolling_smoke60_scaled_local_idv312\\metrics.json` |
+| Training | 60 steps, 128 train samples, 64 validation samples, base Qwen only, M2/VG disabled |
+| Optimization | loss `3.8789 -> 3.5390`; finite throughout; training behavior gate passed; command exit code `0` |
+| Validation signal | camera-dx zero false-turn rate `0.5500`; dx recall `0.1429, 0.0000, 0.4500, 0.0000, 0.2500`; intent recall `0.8000` / `0.5254` for observed classes |
+
+This smoke validates the corrected causal loss scale and numerical stability,
+but it is not a deployment result. The full visual-dependency gate was not run
+for this checkpoint, camera remains weak, and the class-balance acceptance is
+`not_comparable` because no acceptance baseline was supplied.
 
 ## Latest Evidence: m24 Full Grounding-Balanced Training
 
