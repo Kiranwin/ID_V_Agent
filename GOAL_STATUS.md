@@ -309,6 +309,24 @@ python -m idv_agent.scripts.prepare_camera_control_annotations validate --input 
 It rejects incomplete rows, duplicate ids, invalid enums, `hold` with a
 nonzero desired turn, and `target_align` without a visible control target.
 
+### Current External Blocker (2026-09-07)
+
+Validation from the m26 worktree confirms the annotation workspace is intact
+but not yet filled: `camera_control_train.pending.jsonl` is `0/48 complete`
+and `camera_control_val.pending.jsonl` is `0/46 complete`. There is no
+completed camera-control sidecar to train against. Do not run another camera
+retrain, add a runtime threshold, or enable deployment while this remains the
+case; doing so would repeat the proven prompt=0 ambiguity failure.
+
+Resume sequence after the user provides completed labels:
+
+1. Run the strict validator on both JSONL files (without `--allow-pending`).
+2. Audit split, field coverage, enums, and desired-turn distributions.
+3. Add these targets to the training-only camera supervision path, with model
+   predictions—not sidecar values—used at deployment.
+4. Run a 60-step smoke, full 366-step run, visual dependency/feature gates,
+   class safety gate, then sandbox dry-run on an interactive DXGI desktop.
+
 ## Latest Evidence: m26 Full Training and Cross-Session Gate
 
 | Item | Evidence |
