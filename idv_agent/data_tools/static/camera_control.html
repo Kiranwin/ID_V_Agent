@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera Control Annotation · IDV VLA</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="camera-annotation">
+  <header class="topbar"><a class="brand" href="/"><span class="brand-mark">IDV</span><span><strong>Camera Control Annotation</strong><small>v2 · causal steering labels</small></span></a><div class="top-status"><span class="dot"></span><span id="save-status">Loading</span></div></header>
+  <main class="camera-shell">
+    <aside class="camera-sidebar panel">
+      <div class="section-heading">标注队列 <button id="refresh" class="icon-button" title="刷新">↻</button></div>
+      <div id="split-tabs" class="split-tabs"></div>
+      <div id="queue-stats" class="queue-stats"></div>
+      <button id="next-pending" class="button primary">下一个待标注</button>
+      <p class="sidebar-foot">原始 pending 模板只读。保存会写入同目录的 <code>.annotated.jsonl</code>。</p>
+    </aside>
+    <section class="camera-workspace">
+      <div id="error" class="error-panel" hidden></div>
+      <div id="empty" class="panel empty-panel"><div class="empty-icon">◎</div><h1>没有可标注的记录</h1><p>检查 v2 pending 文件和启动参数。</p></div>
+      <div id="editor" hidden>
+        <div class="hero-row"><div><p class="eyebrow" id="row-id"></p><h1 id="frame-title">Frame</h1><p class="subtle" id="grounding"></p></div><div class="actions"><button id="save" class="button primary">保存当前标注</button><button id="next" class="button secondary">保存并下一个</button></div></div>
+        <section class="camera-grid">
+          <div class="panel section-panel camera-frame-panel"><div class="section-heading">观察帧 <span class="read-only">橙框为现有 cipher grounding</span></div><div class="annotation-frame"><img id="target-image" alt="当前观察帧"><div id="bbox"></div></div><div id="frame-caption" class="frame-caption"></div></div>
+          <div class="panel section-panel evidence-panel"><div class="section-heading">回放证据 <span class="read-only">只读</span></div><dl><dt>replay camera</dt><dd id="replay-camera"></dd><dt>target side</dt><dd id="target-side"></dd><dt>interact prompt</dt><dd id="interact-prompt"></dd><dt>reachable</dt><dd id="reachable"></dd></dl><p class="section-note">请标“这一步应如何转”，不是机械复刻 replay。</p></div>
+        </section>
+        <section class="panel section-panel"><div class="section-heading">上下文 <span class="section-note">每 3 帧一张，末张是当前观察帧</span></div><div id="context" class="annotation-context"></div></section>
+        <section class="panel section-panel annotation-fields">
+          <div class="field"><label>camera control phase</label><div data-field="camera_control_phase" class="choice-row"></div><small>search：搜寻；target_acquire：首次获得目标；target_align：将目标居中；hold：不转。</small></div>
+          <div class="field"><label>camera target id</label><div data-field="camera_target_id" class="choice-row"></div><small>相机控制所依据的对象；路径绕行时仍可为 target_cipher。</small></div>
+          <div class="field"><label>camera steering mode</label><div data-field="camera_steering_mode" class="choice-row"></div><small>target_center：居中目标；path_follow：配合移动绕路；search_sweep：扫视；hold：保持。</small></div>
+          <div class="field"><label>path strategy</label><div data-field="path_strategy" class="choice-row"></div><small>仅 path_follow 填 direct / detour_left / detour_right，其他一律 unknown。</small></div>
+          <div class="turn-grid"><div class="field"><label>desired turn dx</label><div data-field="desired_turn_dx" class="choice-row bucket-row"></div></div><div class="field"><label>desired turn dy</label><div data-field="desired_turn_dy" class="choice-row bucket-row"></div></div></div>
+          <div class="field"><label>status</label><div data-field="status" class="choice-row"></div></div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <script src="/static/camera_control.js"></script>
+</body>
+</html>

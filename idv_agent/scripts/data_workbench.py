@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from idv_agent.data_tools.session_store import SessionStore
+from idv_agent.data_tools.camera_control_store import CameraControlStore
 from idv_agent.data_tools.workbench import DataWorkbench
 
 
@@ -21,6 +22,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     """HTTP routes for one configured ``DataWorkbench`` instance."""
 
     workbench: DataWorkbench
+    camera_control: CameraControlStore | None
     static_dir: Path
     protocol_version = "HTTP/1.0"
 
@@ -59,6 +61,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             parts = self._path_parts()
             if not parts:
                 return self._send_file(self.static_dir / "index.html")
+            if parts == ["camera-control"]:
+                if self.camera_control is None:
+                    return self._send_error(HTTPStatus.NOT_FOUND, "camera-control UI is not configured")
+                return self._send_file(self.static_dir / "camera_control.html")
+            if parts[0:2] == ["api", "camera-control"]:
+                return self._camera_control_get(parts)
             if parts[0] == "api" and parts[1:] == ["sessions"]:
                 return self._send_json({"sessions": self.workbench.sessions()})
             if len(parts) == 4 and parts[:2] == ["api", "sessions"] and parts[3] == "summary":
@@ -102,6 +110,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         try:
             parts = self._path_parts()
+            if len(parts) == 5 and parts[:3] == ["api", "camera-control", parts[2]] and parts[3] == "rows":
+                if self.camera_control is None:
+                    return self._send_error(HTTPStatus.NOT_FOUND, "camera-control UI is not configured")
+                payload = self._read_json()
+                if not isinstance(payload, dict) or not isinstance(payload.get("annotation"), dict):
+                    raise ValueError("annotation payload 必须包含 annotation 对象")
+                row = self.camera_control.update(parts[2], parts[4], payload["annotation"])
+                return self._send_json({"row": row})
             if len(parts) == 4 and parts[:2] == ["api", "sessions"] and parts[3] == "intents":
                 payload = self._read_json()
                 if not isinstance(payload, list):
@@ -115,6 +131,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
         except Exception as exc:
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def _camera_control_get(self, parts: list[str]) -> None:
+        if self.camera_control is None:
+            return self._send_error(HTTPStatus.NOT_FOUND, "camera-control UI is not configured")
+        if parts == ["api", "camera-control", "sets"]:
+            return self._send_json(self.camera_control.summary())
+        if len(parts) == 6 and parts[:3] == ["api", "camera-control", parts[2]] and parts[3] == "rows" and parts[5] == "context":
+            return self._send_json({"frames": self.camera_control.context_frames(parts[2], parts[4])})
+        if len(parts) == 7 and parts[:3] == ["api", "camera-control", parts[2]] and parts[3] == "rows" and parts[5] == "frames":
+            if not parts[6].isdigit():
+                raise ValueError("frame must be an integer")
+            return self._send_file(self.camera_control.frame_path(parts[2], parts[4], int(parts[6])))
+        self._send_error(HTTPStatus.NOT_FOUND, "route not found")
 
     def _send_file(self, path: Path) -> None:
         if not path.is_file():
@@ -142,14 +171,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self._send_file(path)
 
 
-def create_server(root: Path, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
+def create_server(root: Path, host: str = "127.0.0.1", port: int = 8765,
+                  camera_control_dir: Path | None = None) -> ThreadingHTTPServer:
     store = SessionStore(root)
     workbench = DataWorkbench(store)
     static_dir = Path(__file__).resolve().parents[1] / "data_tools" / "static"
     handler = type(
         "ConfiguredWorkbenchHandler",
         (WorkbenchHandler,),
-        {"workbench": workbench, "static_dir": static_dir},
+        {"workbench": workbench, "static_dir": static_dir,
+         "camera_control": (CameraControlStore(camera_control_dir, root)
+                            if camera_control_dir is not None else None)},
     )
     return ThreadingHTTPServer((host, port), handler)
 
@@ -159,9 +191,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path("data/new_vla_raw_sessions"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--camera-control-dir", type=Path,
+                        help="camera_control_{train,val}.v2.pending.jsonl 所在目录")
     args = parser.parse_args(argv)
-    server = create_server(args.root, args.host, args.port)
+    server = create_server(args.root, args.host, args.port, args.camera_control_dir)
     print(f"[workbench] http://{args.host}:{server.server_port}/")
+    if args.camera_control_dir is not None:
+        print(f"[camera-control] http://{args.host}:{server.server_port}/camera-control")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
