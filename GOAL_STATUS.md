@@ -221,6 +221,22 @@ This smoke validates the corrected causal class-balance source and remains a
 numerical smoke only. The full 732/182 training and visual-dependency gate are
 still pending.
 
+## Latest Evidence: m26 Causal-Balance Full Training and Gates
+
+| Item | Evidence |
+|---|---|
+| Checkpoint | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m26_causal_balance_full366_local_idv312\\act.pt` |
+| Metrics / manifest | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m26_causal_balance_full366_local_idv312\\metrics.json`, `manifest.json` |
+| Training | 366 steps, 732 train chunks, 182 validation chunks, `execution_horizon=1`, `camera_prior_scale=0`, corrected h0 class-balance tables, image augmentation, 50% grounding sampling, base Qwen only |
+| Optimization | loss `8.1873 -> 0.8854`; checkpoint loss delta `0`; command exit code `0`; class-balance manifest horizon `1` |
+| Visual dependency gate | `C:\\Codespace\\ID_V_Agent\\reports\\m26_causal_balance_full366_visual_dependency_crosssession_grounded.json`; exit code `0`; all image-zero/image-shuffle move/camera/intent checks passed |
+| Feature activity gate | `C:\\Codespace\\ID_V_Agent\\reports\\m26_causal_balance_full366_feature_activity.json`; exit code `0`; gate passed |
+
+The full checkpoint now has verified visual dependency and non-collapsed
+spatial/deep features. The normal validation camera-dx zero false-turn rate is
+still high (`0.6218`) and the rare-class acceptance has not yet been compared
+against a declared baseline; this is not yet deployment authorization.
+
 ## Latest Evidence: m26 Full Training and Cross-Session Gate
 
 | Item | Evidence |
