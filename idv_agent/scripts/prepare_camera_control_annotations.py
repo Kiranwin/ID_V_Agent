@@ -19,9 +19,13 @@ from idv_agent.training.vla_dataset import GroundingAnnotationIndex, VLASequence
 from idv_agent.vla.action_chunk import CAMERA_BUCKETS
 
 
-ANNOTATION_SCHEMA = "act.camera_control_annotation.v1"
+ANNOTATION_SCHEMA = "act.camera_control_annotation.v2"
 CONTROL_PHASES = ("search", "target_acquire", "target_align", "hold")
 TARGET_IDS = ("target_cipher", "other_visible", "none")
+# The visible cipher can be the navigation goal while the camera deliberately
+# follows the walkable route around an obstacle.  Keep these concepts separate.
+STEERING_MODES = ("target_center", "path_follow", "search_sweep", "hold")
+PATH_STRATEGIES = ("direct", "detour_left", "detour_right", "unknown")
 
 
 def _template_row(*, record: dict[str, Any], source_root: Path,
@@ -50,6 +54,8 @@ def _template_row(*, record: dict[str, Any], source_root: Path,
         "replay_camera_dy": int(action["camera_dy"]),
         "camera_control_phase": None,
         "camera_target_id": None,
+        "camera_steering_mode": None,
+        "path_strategy": None,
         "desired_turn_dx": None,
         "desired_turn_dy": None,
         "status": "pending",
@@ -105,6 +111,7 @@ def validate(path: str | Path, *, require_complete: bool = True) -> dict[str, An
             row = json.loads(raw)
             identifier = str(row["id"])
             phase, target, status = row["camera_control_phase"], row["camera_target_id"], row["status"]
+            steering, path = row["camera_steering_mode"], row["path_strategy"]
             dx, dy = row["desired_turn_dx"], row["desired_turn_dy"]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ValueError(f"{path}:{line_no} camera-control 字段无效") from exc
@@ -115,14 +122,23 @@ def validate(path: str | Path, *, require_complete: bool = True) -> dict[str, An
             if require_complete:
                 raise ValueError(f"{path}:{line_no} 仍为 pending")
             continue
-        if status != "complete" or phase not in CONTROL_PHASES or target not in TARGET_IDS:
-            raise ValueError(f"{path}:{line_no} phase/target/status 无效")
+        if (status != "complete" or phase not in CONTROL_PHASES or target not in TARGET_IDS or
+                steering not in STEERING_MODES or path not in PATH_STRATEGIES):
+            raise ValueError(f"{path}:{line_no} phase/target/steering/path/status 无效")
         if dx not in CAMERA_BUCKETS or dy not in CAMERA_BUCKETS:
             raise ValueError(f"{path}:{line_no} desired_turn_dx/dy 必须是 -2..2")
         if phase == "hold" and (dx != 0 or dy != 0):
             raise ValueError(f"{path}:{line_no} hold 必须标记 desired_turn=(0,0)")
         if target == "none" and phase == "target_align":
             raise ValueError(f"{path}:{line_no} target_align 需要可识别的控制目标")
+        if phase == "hold" and steering != "hold":
+            raise ValueError(f"{path}:{line_no} hold 必须使用 camera_steering_mode=hold")
+        if steering == "hold" and phase != "hold":
+            raise ValueError(f"{path}:{line_no} steering_mode=hold 必须使用 phase=hold")
+        if steering == "path_follow" and path not in {"direct", "detour_left", "detour_right"}:
+            raise ValueError(f"{path}:{line_no} path_follow 需要 direct/detour_left/detour_right")
+        if steering in {"target_center", "search_sweep", "hold"} and path != "unknown":
+            raise ValueError(f"{path}:{line_no} 非 path_follow 必须使用 path_strategy=unknown")
         complete += 1
     if not seen:
         raise ValueError("camera-control 标注为空")

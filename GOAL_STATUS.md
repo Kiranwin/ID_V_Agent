@@ -278,10 +278,15 @@ camera decision frame is therefore not another bbox; it is:
 
 1. `camera_control_phase`: `search`, `target_acquire`, `target_align`, or
    `hold`.
-2. `camera_target_id`: whether the visible cipher is the target currently
-   being approached (`target_cipher` / `other_visible` / `none`).
-3. `desired_turn_dx` and `desired_turn_dy`: intended one-step correction bucket
-   (`-2..2`) for the current frame, with `0` only when intentional hold/alignment.
+2. `camera_target_id`: whether the visible cipher is the navigation goal
+   (`target_cipher` / `other_visible` / `none`).
+3. `camera_steering_mode`: `target_center`, `path_follow`, `search_sweep`,
+   or `hold`—the camera can follow a walkable detour while the cipher remains
+   the navigation target.
+4. `path_strategy`: `direct`, `detour_left`, `detour_right`, or `unknown`;
+   required only when steering mode is `path_follow`.
+5. `desired_turn_dx` and `desired_turn_dy`: intended one-step correction bucket
+   (`-2..2`) for the camera's current steering mode.
 
 Label the existing grounding-pool prompt=0 frames first (train=48, val=46),
 with priority on central/small visible cipher frames and every nonzero replay
@@ -290,17 +295,18 @@ training-only semantic targets. Resume only after the labels pass a coverage
 and enum validator, then use their model predictions—not sidecar values—in the
 camera head.
 
-### Annotation Workspace Ready
+### Annotation Workspace Ready (v2)
 
 The pending templates have been generated and validated without modifying raw
 sessions, canonical chunks, or the existing grounding JSONL:
 
-- `C:\\Codespace\\ID_V_Agent\\data\\mvp_act_grounding_pool_v1\\camera_control_train.pending.jsonl` — 48 rows
-- `C:\\Codespace\\ID_V_Agent\\data\\mvp_act_grounding_pool_v1\\camera_control_val.pending.jsonl` — 46 rows
+- `C:\\Codespace\\ID_V_Agent\\data\\mvp_act_grounding_pool_v1\\camera_control_train.v2.pending.jsonl` — 48 rows
+- `C:\\Codespace\\ID_V_Agent\\data\\mvp_act_grounding_pool_v1\\camera_control_val.v2.pending.jsonl` — 46 rows
 
 For each row, replace `status: pending` with `complete` and fill exactly:
-`camera_control_phase`, `camera_target_id`, `desired_turn_dx`, and
-`desired_turn_dy`. The validator command is:
+`camera_control_phase`, `camera_target_id`, `camera_steering_mode`,
+`path_strategy`, `desired_turn_dx`, and `desired_turn_dy`. The validator
+command is:
 
 ```powershell
 python -m idv_agent.scripts.prepare_camera_control_annotations validate --input <completed.jsonl>
@@ -312,8 +318,8 @@ nonzero desired turn, and `target_align` without a visible control target.
 ### Current External Blocker (2026-09-07)
 
 Validation from the m26 worktree confirms the annotation workspace is intact
-but not yet filled: `camera_control_train.pending.jsonl` is `0/48 complete`
-and `camera_control_val.pending.jsonl` is `0/46 complete`. There is no
+but not yet filled: `camera_control_train.v2.pending.jsonl` is `0/48 complete`
+and `camera_control_val.v2.pending.jsonl` is `0/46 complete`. There is no
 completed camera-control sidecar to train against. Do not run another camera
 retrain, add a runtime threshold, or enable deployment while this remains the
 case; doing so would repeat the proven prompt=0 ambiguity failure.
