@@ -290,6 +290,25 @@ training-only semantic targets. Resume only after the labels pass a coverage
 and enum validator, then use their model predictions—not sidecar values—in the
 camera head.
 
+### Annotation Workspace Ready
+
+The pending templates have been generated and validated without modifying raw
+sessions, canonical chunks, or the existing grounding JSONL:
+
+- `C:\\Codespace\\ID_V_Agent\\data\\mvp_act_grounding_pool_v1\\camera_control_train.pending.jsonl` — 48 rows
+- `C:\\Codespace\\ID_V_Agent\\data\\mvp_act_grounding_pool_v1\\camera_control_val.pending.jsonl` — 46 rows
+
+For each row, replace `status: pending` with `complete` and fill exactly:
+`camera_control_phase`, `camera_target_id`, `desired_turn_dx`, and
+`desired_turn_dy`. The validator command is:
+
+```powershell
+python -m idv_agent.scripts.prepare_camera_control_annotations validate --input <completed.jsonl>
+```
+
+It rejects incomplete rows, duplicate ids, invalid enums, `hold` with a
+nonzero desired turn, and `target_align` without a visible control target.
+
 ## Latest Evidence: m26 Full Training and Cross-Session Gate
 
 | Item | Evidence |
