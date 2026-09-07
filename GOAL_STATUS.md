@@ -68,8 +68,8 @@ checkpoint as deployable merely because its training loss decreases.
   convention and executor lookup table. Training labels and deployed pixel
   commands remain same-source.
 - The deployed ACT path is the history-free `VisualActionExpert`; temporal
-  history is diagnostic/prior-only and cannot replace visual move or intent
-  logits. Camera retains a bounded temporal prior contribution.
+  history is diagnostic/prior-only and cannot replace visual move, camera, or
+  intent logits. m26 camera is visual-only with `camera_prior_scale=0`.
 - m22 added **training-only** heads on the direct visual-pair feature for
   cipher presence, normalized box, target side, interaction prompt, and
   reachability. These heads never consume YOLO/runtime rules and deployment
@@ -124,9 +124,11 @@ the replay labels.
 1. Reduce camera zero-bucket false turns while preserving the passed visual
    dependency and spatial-feature gates. Do not deploy while camera-dx/dy
    zero-target false-turn exceeds `0.15`.
-2. Run a bounded smoke and then a full retrain for any camera-loss/calibration
-   change; compare rare-bucket recall and majority recall against the current
-   m26 baseline before accepting it.
+2. The calibration scan shows a scalar zero-bucket bias is not sufficient:
+   train false-turn reaches `0.1478`, but held-out false-turn remains `0.2269`
+   and nonzero recalls collapse. Before another full retrain, audit/repair the
+   prompt=0 camera supervision or add a stronger same-frame target-position
+   contract; do not hide this with a deployment threshold.
 3. After all offline gates and class/over-action checks pass, perform the
    sandbox dry-run sequence and verify find-machine, approach, Q interaction,
    and decoding entry. Keep `--send-input` disabled until that evidence exists.
@@ -242,6 +244,23 @@ The live realtime benchmark also exposed the machine-side limitation: model
 loading completed, but DXGI returned no display device in the current
 non-interactive session. This is an environment blocker for live capture only;
 it does not replace the offline checkpoint gates.
+
+## Latest Evidence: Camera Zero-Bucket Calibration Diagnostic
+
+| Item | Evidence |
+|---|---|
+| Report | `C:\\Codespace\\ID_V_Agent\\reports\\m26_camera_zero_calibration_diagnostic.json` |
+| Method | Fit a zero-class logit bias on train only; evaluate unchanged on the 182-sample held-out validation set |
+| Train result | bias `+1.5249`; zero-target false-turn `0.1478`; nonzero macro recall `0.3546` |
+| Held-out result | zero-target false-turn `0.2269`; recalls for buckets `[-2,-1,0,+1,+2]` = `[0.1000,0.0909,0.7731,0.0833,0.0500]` |
+
+This rejects “just add a zero-bucket threshold” as the fix. The model's
+visual camera logits are image-sensitive, but prompt=0 held-out decisions do
+not generalize: the annotation subset has only 46 prompt=0 samples, while its
+camera targets span all five buckets; side supervision is also sparse
+(`left=7`, `right=4`). The current evidence supports a data/target ambiguity
+or observation-to-action mismatch as the primary blocker, not insufficient
+epochs or a missing image pathway.
 
 ## Latest Evidence: m26 Full Training and Cross-Session Gate
 
