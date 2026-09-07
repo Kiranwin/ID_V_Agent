@@ -130,6 +130,11 @@ the replay labels.
    learned policy completes find-machine, approach, Q interaction, and decoding
    entry. Keep `--send-input` disabled until that evidence exists.
 
+The previous full m26 checkpoint is not reusable: its class-balance tables were
+computed over all four action horizons while the causal loss trained only step
+0. The corrected implementation has passed a fresh smoke; the next full run
+must be trained from the base Qwen with the corrected step-0 tables.
+
 ## Latest Evidence: m25 Loss-Scale Smoke
 
 | Item | Evidence |
@@ -202,6 +207,19 @@ This smoke validates numerical stability and the visual-only camera protocol,
 but does not establish generalization or deployment readiness. Its 64-sample
 validation camera-dx zero false-turn rate is `0.6750`; full training and the
 complete 182-sample cross-session visual gate are still required.
+
+## Latest Evidence: m26 Causal-Balance Smoke
+
+| Item | Evidence |
+|---|---|
+| Checkpoint | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m26_causal_balance_smoke60_local_idv312\\act.pt` |
+| Metrics / manifest | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m26_causal_balance_smoke60_local_idv312\\metrics.json`, `manifest.json` |
+| Optimization | 60 steps, loss `3.9061 -> 3.6445`; max gradient norm `76.8631`; checkpoint loss delta `0`; behavior gate passed; command exit code `0` |
+| Causal class tables | `execution_horizon=1`; camera-dx counts `[11,8,85,9,15]`, camera-dy counts `[0,0,110,17,1]`, move counts `[37,75,11,2,0,0,0,0,3]` |
+
+This smoke validates the corrected causal class-balance source and remains a
+numerical smoke only. The full 732/182 training and visual-dependency gate are
+still pending.
 
 ## Latest Evidence: m26 Full Training and Cross-Session Gate
 
