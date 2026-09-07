@@ -74,8 +74,9 @@ checkpoint as deployable merely because its training loss decreases.
   cipher presence, normalized box, target side, interaction prompt, and
   reachability. These heads never consume YOLO/runtime rules and deployment
   never reads annotation JSONL.
-- Checkpoint schema is `m24_act.camera_grounding_fusion.v1`. Older m19/m22/m23
-  checkpoints fail closed and are not deployment candidates.
+- Checkpoint schema for the next ACT run is
+  `m26_act.visual_camera_no_prior.v1`. m19/m22/m23/m24/m25 checkpoints fail
+  closed for the current protocol and are not deployment candidates.
 
 ## Latest Evidence: m23 Grounding-Balanced Training
 
@@ -120,18 +121,14 @@ the replay labels.
 
 ## Next Action
 
-1. Diagnose the m25 camera/move visual-dependency failure before another long
-   run. The current model output is image-sensitive, but the sensitivity does
-   not improve correct camera decisions; do not tune the gate threshold or
-   deploy this checkpoint.
-2. Use the existing per-side/per-prompt alignment audit and the m25 evaluator
-   to isolate whether the failure is caused by sparse left/right supervision,
-   camera-prior dominance, or a label/visual timing mismatch. Add a focused
-   regression or audit artifact before changing architecture or data.
-3. After the diagnosis and targeted fix, train a bounded smoke first, then run
-   the full four-condition gate. Keep `--send-input` disabled until every
-   image-zero/image-shuffle move/camera/intent requirement and the sandbox
-   dry-run sequence pass.
+1. Run a 60-step m26 numerical smoke with `camera_prior_scale=0`, then inspect
+   its embedded manifest and behavior acceptance.
+2. If the smoke passes, run the full 366-step m26 training and the revised
+   cross-session four-condition gate. The checkpoint is deployable only when
+   all image-zero/image-shuffle move/camera/intent requirements pass.
+3. After an offline pass, perform the sandbox dry-run sequence and verify the
+   learned policy completes find-machine, approach, Q interaction, and decoding
+   entry. Keep `--send-input` disabled until that evidence exists.
 
 ## Latest Evidence: m25 Loss-Scale Smoke
 
@@ -167,6 +164,29 @@ move `0.264/0.167/0.364`, camera `0.256/0.225/0.229`, and intent
 `0.05`), while image-shuffle camera drops `0.0272` and move improves by
 `0.1002`; both image conditions fail. The checkpoint is rejected and remains
 fail-closed.
+
+## m26 Protocol Repair (Implemented, Awaiting Smoke)
+
+The m25 failure diagnosis separated two defects from the model itself:
+
+- The default `camera_prior_scale=0.5` improved ordinary camera accuracy using
+  temporal priors (`0.7527` prior branch accuracy) but obscured useful visual
+  camera decisions. With a true prior-free diagnostic, the visual model passes
+  all four required image-drop checks.
+- `image_shuffle` previously mapped every row to the next ordered row, often a
+  near-identical chunk from the same session. The gate now deterministically
+  maps each row to a different session, and fails if fewer than two sessions
+  are available.
+
+The new `m26_act.visual_camera_no_prior.v1` schema permanently fixes camera
+prior to zero in core construction, training, checkpoint loading, offline
+evaluation, and realtime benchmarking; m25 and older checkpoints now fail
+closed. On the 182-sample m25 diagnostic with the m26 output protocol and
+cross-session shuffle, image-zero drops move/camera/intent by
+`0.0973/0.0879/0.3604`, and image-shuffle drops by
+`0.0999/0.0596/0.3318`; all satisfy the gate. This is diagnostic evidence
+only: m25 was trained with camera prior `0.5`, so m26 must be retrained before
+any deployment decision.
 
 ## Latest Evidence: m24 Full Grounding-Balanced Training
 

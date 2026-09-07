@@ -51,12 +51,29 @@ def _image_transform(condition: str) -> Callable[[Image.Image], Image.Image] | N
     raise ValueError(f"unknown condition: {condition}")
 
 
-def _shuffle_frame_paths(frame_paths_by_sample: list[list[Path | None]]) -> list[list[Path | None]]:
-    """Cyclically replace every sample's image window with another sample's."""
+def _shuffle_frame_paths(frame_paths_by_sample: list[list[Path | None]], *,
+                         episode_ids: list[str] | None = None) -> list[list[Path | None]]:
+    """Replace every visual window with one from another session deterministically."""
     if len(frame_paths_by_sample) < 2:
         raise ValueError("image_shuffle 至少需要两个样本")
-    return [list(frame_paths_by_sample[(index + 1) % len(frame_paths_by_sample)])
-            for index in range(len(frame_paths_by_sample))]
+    if episode_ids is None:
+        return [list(frame_paths_by_sample[(index + 1) % len(frame_paths_by_sample)])
+                for index in range(len(frame_paths_by_sample))]
+    if len(episode_ids) != len(frame_paths_by_sample):
+        raise ValueError("episode_ids 与 image_shuffle 样本数不一致")
+    groups: dict[str, list[int]] = {}
+    for index, episode_id in enumerate(episode_ids):
+        groups.setdefault(str(episode_id), []).append(index)
+    episodes = list(groups)
+    if len(episodes) < 2:
+        raise ValueError("image_shuffle 至少需要两个不同 session")
+    shuffled: list[list[Path | None] | None] = [None] * len(frame_paths_by_sample)
+    for episode_index, episode_id in enumerate(episodes):
+        source_indices = groups[episode_id]
+        target_indices = groups[episodes[(episode_index + 1) % len(episodes)]]
+        for offset, source_index in enumerate(source_indices):
+            shuffled[source_index] = list(frame_paths_by_sample[target_indices[offset % len(target_indices)]])
+    return [paths for paths in shuffled if paths is not None]
 
 
 def _zero_history(batch: dict[str, Any]) -> dict[str, Any]:
@@ -64,6 +81,16 @@ def _zero_history(batch: dict[str, Any]) -> dict[str, Any]:
     result = dict(batch)
     result["history_actions"] = batch["history_actions"].clone().zero_()
     return result
+
+
+def _override_camera_prior_scale(core: SharedFastSlowVLA, value: float | None) -> None:
+    """Apply the m26 camera-only protocol override after restore."""
+    if value is None:
+        return
+    scale = float(value)
+    if scale != 0.0:
+        raise ValueError("m26 ACT 已废除 camera prior；camera-prior-scale 只能为 0")
+    core.camera_prior_scale = scale
 
 
 def _finite_metric(value: Any, name: str) -> float | None:
@@ -328,21 +355,17 @@ def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dic
     adapter.condition_projection.to(device=device, dtype=torch.float32)
     core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
-    if getattr(args, "camera_prior_scale", None) is not None:
-        value = float(args.camera_prior_scale)
-        if not 0.0 <= value <= 1.0:
-            raise ValueError("camera-prior-scale 必须在 [0,1]")
-        core.camera_prior_scale = value
     first_loader = DataLoader(samples[:1], batch_size=1, collate_fn=VLASequenceCollator(max_frames=8))
     with torch.no_grad():
         encode_batch(adapter, next(iter(first_loader)), device=device)
     saved = torch.load(checkpoint, map_location=device, weights_only=False)
     load_visual_grounded_act_checkpoint(adapter, core, saved)
+    _override_camera_prior_scale(core, getattr(args, "camera_prior_scale", None))
     adapter.eval()
     core.eval()
 
     paths = [list(sample["frame_paths"]) for sample in samples]
-    shuffled = _shuffle_frame_paths(paths)
+    shuffled = _shuffle_frame_paths(paths, episode_ids=[str(sample["episode_id"]) for sample in samples])
     condition_samples = {
         "normal": _copy_samples(samples),
         "image_zero": _copy_samples(samples),

@@ -908,6 +908,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     _ablate_frame = bool(getattr(args, "ablate_frame_avg", False))
     _no_history = bool(getattr(args, "no_history", False))
     history_dropout_p = float(getattr(args, "history_dropout_p", 0.5))
+    camera_prior_scale = float(getattr(args, "camera_prior_scale", 0.0))
+    if camera_prior_scale != 0.0:
+        raise ValueError("m26 ACT 已废除 camera prior；camera_prior_scale 必须为 0")
     image_augmentation = bool(getattr(args, "image_augmentation", True))
     raw_feature_cache = None
     if getattr(args, "raw_feature_cache", ""):
@@ -1024,6 +1027,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("ACT raw-grid feature dim 未 materialize")
     core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
+    core.camera_prior_scale = camera_prior_scale
     core.execution_horizon = int(getattr(args, "execution_horizon", 1))
     interact_event_bias_init = _interact_event_bias_init(dataset, horizon=ACTION_CHUNK_HORIZON)
     core.visual_expert.set_interact_event_bias(interact_event_bias_init)
@@ -1689,6 +1693,8 @@ def main(argv=None) -> int:
                         help="训练时按样本清零完整 action history 的概率；验证/部署始终为 0")
     parser.add_argument("--execution-horizon", type=int, default=1,
                         help="当前画面允许执行并参与 fast action loss 的宏步数；m25 固定为 1")
+    parser.add_argument("--camera-prior-scale", type=float, default=0.0,
+                        help="m26 固定为 0；不允许 history/temporal prior 改写 camera logits")
     parser.add_argument("--visual-aux", type=float, default=1.0,
                         help="history-free visual action expert 的显式监督权重")
     parser.add_argument("--grounding-annotations", default="",

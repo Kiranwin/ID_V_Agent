@@ -27,10 +27,22 @@ def test_image_shuffle_uses_other_sample_and_is_deterministic():
         [Path("b/0.jpg"), Path("b/1.jpg")],
         [Path("c/0.jpg"), None],
     ]
-    shuffled = _shuffle_frame_paths(paths)
+    shuffled = _shuffle_frame_paths(paths, episode_ids=["a", "b", "c"])
 
     assert shuffled == [paths[1], paths[2], paths[0]]
     assert all(left != right for left, right in zip(paths, shuffled))
+
+
+def test_image_shuffle_never_uses_another_window_from_the_same_session():
+    from idv_agent.scripts.evaluate_visual_dependency import _shuffle_frame_paths
+
+    paths = [[Path(f"a/{index}.jpg")] for index in range(3)] + [[Path(f"b/{index}.jpg")] for index in range(2)]
+    episodes = ["a", "a", "a", "b", "b"]
+    shuffled = _shuffle_frame_paths(paths, episode_ids=episodes)
+
+    assert [path[0].parts[0] for path in shuffled] == ["b", "b", "b", "a", "a"]
+    with pytest.raises(ValueError, match="不同 session"):
+        _shuffle_frame_paths(paths, episode_ids=["a"] * len(paths))
 
 
 def test_history_zero_clears_only_history_tensor():
@@ -45,6 +57,18 @@ def test_history_zero_clears_only_history_tensor():
     assert torch.equal(zeroed["history_actions"], torch.zeros(2, 72))
     assert torch.equal(zeroed["move_target"], batch["move_target"])
     assert torch.equal(batch["history_actions"], torch.ones(2, 72))
+
+
+def test_camera_prior_override_is_applied_after_checkpoint_restore():
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+    from idv_agent.scripts.evaluate_visual_dependency import _override_camera_prior_scale
+
+    core = SharedFastSlowVLA(frame_feature_dim=4, temporal_dim=4, history_action_dim=72)
+    core.camera_prior_scale = 0.5
+    _override_camera_prior_scale(core, 0.0)
+    assert core.camera_prior_scale == 0.0
+    with pytest.raises(ValueError, match="只能为 0"):
+        _override_camera_prior_scale(core, 0.5)
 
 
 def test_episode_diverse_subset_uses_distinct_episode_representatives_first():

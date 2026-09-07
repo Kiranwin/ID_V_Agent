@@ -55,6 +55,13 @@ def test_final_logits_are_visual_plus_bounded_prior():
     assert torch.equal(output.slow.intent_logits, output.visual.slow.intent_logits)
 
 
+def test_m26_camera_logits_are_visual_only_by_default():
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+
+    core = SharedFastSlowVLA(8, temporal_dim=12, history_action_dim=72)
+    assert core.camera_prior_scale == 0.0
+
+
 def test_visual_expert_uses_first_to_last_change():
     """A last-frame-identical sequence with a different first frame is visible."""
     from idv_agent.model.fast_slow_vla import SharedFastSlowVLA

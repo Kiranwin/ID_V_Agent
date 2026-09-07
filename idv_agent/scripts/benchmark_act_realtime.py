@@ -18,7 +18,7 @@ import torch
 
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA, SlowCondition
-from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
+from idv_agent.model.act_checkpoint import ACT_CAMERA_PRIOR_SCALE, load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import _load_act_base_backbone
 from idv_agent.vla.action_chunk import BUTTON_NAMES, MOVE_DIRECTIONS, CAMERA_BUCKETS
 
@@ -143,6 +143,12 @@ def _load_model(args: argparse.Namespace, device: torch.device):
     core = SharedFastSlowVLA(getattr(adapter, "act_feature_dim", adapter.hidden_size), temporal_dim=temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
     load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
+    configured_camera_prior = float(
+        checkpoint.get("manifest", {}).get("training", {}).get(
+            "camera_prior_scale", ACT_CAMERA_PRIOR_SCALE))
+    if configured_camera_prior != ACT_CAMERA_PRIOR_SCALE:
+        raise ValueError("m26 ACT manifest 的 camera_prior_scale 必须为 0")
+    core.camera_prior_scale = ACT_CAMERA_PRIOR_SCALE
     core.interact_event_threshold = float(
         checkpoint.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
     )

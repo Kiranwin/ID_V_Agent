@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
-from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
+from idv_agent.model.act_checkpoint import ACT_CAMERA_PRIOR_SCALE, load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import (_contiguous_subset, _dataset_paths, _load_act_base_backbone,
                                           encode_batch, _model_inputs, _scheduled_condition)
 from idv_agent.training.checkpoint_manifest import load_manifest
@@ -49,6 +49,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         encode_batch(adapter, first, device=device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
+    core.camera_prior_scale = float(
+        checkpoint.get("manifest", {}).get("training", {}).get(
+            "camera_prior_scale", ACT_CAMERA_PRIOR_SCALE))
     event_threshold = float(
         checkpoint.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
     )
