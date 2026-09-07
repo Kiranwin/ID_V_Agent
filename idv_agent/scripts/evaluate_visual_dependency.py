@@ -36,6 +36,7 @@ from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDatas
 
 REQUIRED_METRICS = ("move_accuracy", "camera_accuracy", "intent_accuracy")
 CONDITIONS = ("normal", "image_zero", "image_shuffle", "history_zero")
+GROUNDING_SIDES = ("none", "left", "center", "right")
 
 
 def _image_transform(condition: str) -> Callable[[Image.Image], Image.Image] | None:
@@ -175,6 +176,70 @@ def _copy_samples(samples: list[dict[str, Any]], *, frame_paths: list[list[Path 
     return copied
 
 
+def _empty_grounding_camera_group() -> dict[str, Any]:
+    """Allocate a compact per-observation-group camera accounting record."""
+    return {
+        "samples": 0, "dx_correct": 0, "dy_correct": 0,
+        "dx_target_counts": [0] * 5, "dy_target_counts": [0] * 5,
+        "dx_pred_counts": [0] * 5, "dy_pred_counts": [0] * 5,
+        "dx_confusion": [[0] * 5 for _ in range(5)],
+        "dy_confusion": [[0] * 5 for _ in range(5)],
+    }
+
+
+def _record_grounding_camera_groups(groups: dict[str, dict[str, Any]], *,
+                                    batch: dict[str, Any], sample_mask: torch.Tensor,
+                                    dx_prediction: torch.Tensor, dy_prediction: torch.Tensor) -> None:
+    """Score h=0 camera predictions by human same-frame visual annotations only."""
+    for index in torch.nonzero(sample_mask.bool(), as_tuple=False).flatten().tolist():
+        if not bool(batch["grounding_mask"][index].item()):
+            continue
+        side = GROUNDING_SIDES[int(batch["grounding_side_target"][index].item())]
+        prompt = int(float(batch["grounding_prompt_target"][index].item()) > 0)
+        reachable = int(float(batch["grounding_reachable_target"][index].item()) > 0)
+        names = ("annotated", f"side={side}", f"prompt={prompt}", f"reachable={reachable}")
+        dx_target = int(batch["camera_dx_target"][index, 0].item())
+        dy_target = int(batch["camera_dy_target"][index, 0].item())
+        dx_pred = int(dx_prediction[index, 0].item())
+        dy_pred = int(dy_prediction[index, 0].item())
+        for name in names:
+            group = groups.setdefault(name, _empty_grounding_camera_group())
+            group["samples"] += 1
+            group["dx_correct"] += int(dx_pred == dx_target)
+            group["dy_correct"] += int(dy_pred == dy_target)
+            group["dx_target_counts"][dx_target] += 1
+            group["dy_target_counts"][dy_target] += 1
+            group["dx_pred_counts"][dx_pred] += 1
+            group["dy_pred_counts"][dy_pred] += 1
+            group["dx_confusion"][dx_target][dx_pred] += 1
+            group["dy_confusion"][dy_target][dy_pred] += 1
+
+
+def _grounding_camera_group_metrics(groups: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Convert raw group counts into compact accuracy and macro-recall summaries."""
+    result = {}
+    for name, group in sorted(groups.items()):
+        samples = int(group["samples"])
+        dx_accuracy = group["dx_correct"] / samples if samples else None
+        dy_accuracy = group["dy_correct"] / samples if samples else None
+        result[name] = {
+            "samples": samples,
+            "camera_dx_accuracy": dx_accuracy,
+            "camera_dy_accuracy": dy_accuracy,
+            "camera_accuracy": ((dx_accuracy + dy_accuracy) / 2
+                                if dx_accuracy is not None and dy_accuracy is not None else None),
+            "balanced_camera_accuracy": ((
+                (_macro_recall(group["dx_confusion"]) or 0.0) +
+                (_macro_recall(group["dy_confusion"]) or 0.0)
+            ) / 2),
+            "dx_target_counts": group["dx_target_counts"],
+            "dy_target_counts": group["dy_target_counts"],
+            "dx_pred_counts": group["dx_pred_counts"],
+            "dy_pred_counts": group["dy_pred_counts"],
+        }
+    return result
+
+
 def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
                        samples: list[dict[str, Any]], *, condition: str,
                        device: torch.device, amp_enabled: bool, batch_size: int,
@@ -201,6 +266,7 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
     visual_input_count = 0
     output_vectors: dict[str, list[torch.Tensor]] = {name: [] for name in
                                                        ("move", "camera_dx", "camera_dy", "intent")}
+    grounding_camera_groups: dict[str, dict[str, Any]] = {}
     with torch.no_grad():
         for batch in loader:
             model_batch = _model_inputs(batch, device)
@@ -264,6 +330,9 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
                 for target, prediction_value in zip(model_batch[target_key][mask].detach().cpu().reshape(-1).tolist(),
                                                     prediction[mask].detach().cpu().reshape(-1).tolist()):
                     confusions[key][int(target)][int(prediction_value)] += 1
+            _record_grounding_camera_groups(
+                grounding_camera_groups, batch=model_batch, sample_mask=sample_mask,
+                dx_prediction=dx_pred, dy_prediction=dy_pred)
             for target, prediction_value in zip(model_batch["intent_target"][intent_mask].detach().cpu().reshape(-1).tolist(),
                                                 intent_pred[intent_mask].detach().cpu().reshape(-1).tolist()):
                 confusions["intent"][int(target)][int(prediction_value)] += 1
@@ -332,6 +401,7 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
             "last_visual_input_norm_mean": visual_input_norm_sum / max(1, visual_input_count),
             "last_visual_input_abs_mean": visual_input_abs_sum / max(1, visual_input_count * visual_features.shape[-1]),
         },
+        "grounding_camera_groups": _grounding_camera_group_metrics(grounding_camera_groups),
         "_output_vectors": {name: torch.cat(values, dim=0) for name, values in output_vectors.items()},
     }
 
@@ -340,7 +410,8 @@ def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dic
     """Evaluate one M3_ACT checkpoint under all four dependency conditions."""
     device = torch.device(args.device)
     amp_enabled = device.type == "cuda"
-    dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
+    dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True,
+                                 grounding_annotations=(getattr(args, "grounding_annotations", "") or None))
     if args.max_samples > 0:
         dataset = _evaluation_stratified_subset(dataset, args.max_samples)
     samples = [dataset[index] for index in range(len(dataset))]
@@ -430,6 +501,8 @@ def main(argv=None) -> int:
     parser.add_argument("--temporal-dim", type=int, default=256)
     parser.add_argument("--camera-prior-scale", type=float, default=None,
                         help="诊断时覆盖 camera prior 权重；默认使用模型配置")
+    parser.add_argument("--grounding-annotations", default="",
+                        help="可选同帧人工标注；只生成分层诊断，不参与模型输入或门禁")
     parser.add_argument("--output", default="reports/visual_dependency_gate.json")
     args = parser.parse_args(argv)
     results = [evaluate_checkpoint(path, args) for path in _checkpoint_paths(args)]

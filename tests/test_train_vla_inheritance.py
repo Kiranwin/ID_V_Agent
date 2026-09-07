@@ -299,6 +299,31 @@ def test_class_balance_manifest_records_sampled_data_provenance(tmp_path):
     assert manifest["source"]["paths"] == [str(source.resolve())]
 
 
+def test_class_balance_statistics_match_causal_execution_horizon():
+    import torch
+    from idv_agent.scripts.train_vla import _class_balance_statistics
+
+    class Dataset:
+        rows = [{
+            "move_target": torch.tensor([1, 2, 2, 2]),
+            "camera_dx_target": torch.tensor([0, 1, 2, 2]),
+            "camera_dy_target": torch.tensor([2, 3, 4, 4]),
+            "intent_target": torch.tensor(0),
+            "slow_loss_mask": torch.tensor(0),
+        }]
+
+        def __len__(self):
+            return len(self.rows)
+
+        def __getitem__(self, index):
+            return self.rows[index]
+
+    statistics = _class_balance_statistics(Dataset(), execution_horizon=1)
+    assert statistics["move"].tolist() == [0, 1, 0, 0, 0, 0, 0, 0, 0]
+    assert statistics["camera_dx"].tolist() == [1, 0, 0, 0, 0]
+    assert statistics["camera_dy"].tolist() == [0, 0, 1, 0, 0]
+
+
 def test_mvp_finds_transitional_v4_chunk_filename(tmp_path):
     from idv_agent.scripts.prepare_mvp_data import _find_v4_chunks
 

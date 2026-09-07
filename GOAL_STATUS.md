@@ -203,6 +203,29 @@ but does not establish generalization or deployment readiness. Its 64-sample
 validation camera-dx zero false-turn rate is `0.6750`; full training and the
 complete 182-sample cross-session visual gate are still required.
 
+## Latest Evidence: m26 Full Training and Cross-Session Gate
+
+| Item | Evidence |
+|---|---|
+| Checkpoint | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m26_visual_camera_full366_local_idv312\\act.pt` |
+| Metrics / manifest | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m26_visual_camera_full366_local_idv312\\metrics.json`, `manifest.json` |
+| Optimization | 366 steps, loss `8.1786 -> 0.8788`, checkpoint loss delta `0`, command exit code `0`, schema `m26_act.visual_camera_no_prior.v1` |
+| Validation | intent accuracy `0.8462`; camera-dx zero false-turn rate `0.6218`; camera-dy zero false-turn rate `0.2323`; grounding side accuracy `0.4531` |
+| Gate | `C:\\Codespace\\ID_V_Agent\\reports\\m26_visual_camera_full366_visual_dependency_crosssession_grounded.json`; exit code `1`; `visual_dependency_gate_pass=false` |
+
+The full m26 checkpoint is rejected. Move and intent satisfy both image
+degradation checks, but camera does not: image-zero balanced camera drop is
+`0.0458 < 0.05`, and cross-session image-shuffle camera drop is `-0.0039`.
+The grounded subset shows the failure is concentrated before interaction:
+`prompt=1/reachable=1` camera accuracy is `0.9167` on 18 samples, while
+`prompt=0` is `0.3913` on 46 samples; `side=right` has only 4 samples.
+
+The report also exposed that m26's causal loss consumed only action step 0,
+while class-balance histograms still counted all four horizon steps. This is
+now corrected in code and covered by regression tests; the existing m26
+checkpoint must not be reused because its weights were trained with the old
+histograms.
+
 ## Latest Evidence: m24 Full Grounding-Balanced Training
 
 | Item | Evidence |

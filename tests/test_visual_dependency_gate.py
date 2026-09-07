@@ -214,6 +214,34 @@ def test_output_change_summary_reports_logit_shift_and_argmax_flip_per_head():
     assert result["move"]["mean_abs_logit_delta"] > 0
 
 
+def test_grounding_camera_group_metrics_score_only_annotated_first_actions():
+    from idv_agent.scripts.evaluate_visual_dependency import (
+        _grounding_camera_group_metrics, _record_grounding_camera_groups,
+    )
+
+    groups = {}
+    batch = {
+        "grounding_mask": torch.tensor([1., 1., 0.]),
+        "grounding_side_target": torch.tensor([1, 3, 2]),
+        "grounding_prompt_target": torch.tensor([0., 1., 0.]),
+        "grounding_reachable_target": torch.tensor([0., 1., 0.]),
+        "camera_dx_target": torch.tensor([[1, 4], [3, 0], [2, 1]]),
+        "camera_dy_target": torch.tensor([[2, 4], [2, 0], [1, 3]]),
+    }
+    _record_grounding_camera_groups(
+        groups, batch=batch, sample_mask=torch.tensor([1, 1, 1]),
+        dx_prediction=torch.tensor([[1, 4], [2, 0], [0, 1]]),
+        dy_prediction=torch.tensor([[2, 4], [1, 0], [1, 3]]),
+    )
+    metrics = _grounding_camera_group_metrics(groups)
+
+    assert metrics["annotated"]["samples"] == 2
+    assert metrics["side=left"]["camera_accuracy"] == 1.0
+    assert metrics["side=right"]["camera_accuracy"] == 0.0
+    assert metrics["prompt=1"]["dx_target_counts"] == [0, 0, 0, 1, 0]
+    assert metrics["annotated"]["dx_target_counts"] == [0, 1, 0, 1, 0]
+
+
 def test_macro_recall_reveals_majority_class_collapse_hidden_by_accuracy():
     from idv_agent.scripts.evaluate_visual_dependency import _macro_recall
 

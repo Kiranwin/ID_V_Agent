@@ -689,8 +689,11 @@ def _mask_comparison(losses, adapter, core, batch, device, amp_enabled):
             "mask1_slow": float((o["slow_intent"] + o["slow_subgoal"]).detach().cpu())}
 
 
-def _class_balance_statistics(dataset) -> dict[str, torch.Tensor]:
-    """Count exactly the train-subset labels consumed by each weighted head."""
+def _class_balance_statistics(dataset, *, execution_horizon: int = ACTION_CHUNK_HORIZON) -> dict[str, torch.Tensor]:
+    """Count only labels consumed by the configured causal execution horizon."""
+    horizon = int(execution_horizon)
+    if not 1 <= horizon <= ACTION_CHUNK_HORIZON:
+        raise ValueError("execution_horizon 必须在 action chunk horizon 范围内")
     counts = {
         "move": torch.zeros(9, dtype=torch.float32),
         "camera_dx": torch.zeros(5, dtype=torch.float32),
@@ -699,9 +702,9 @@ def _class_balance_statistics(dataset) -> dict[str, torch.Tensor]:
     }
     for index in range(len(dataset)):
         sample = dataset[index]
-        counts["move"] += torch.bincount(sample["move_target"].reshape(-1), minlength=9).to(torch.float32)
-        counts["camera_dx"] += torch.bincount(sample["camera_dx_target"].reshape(-1), minlength=5).to(torch.float32)
-        counts["camera_dy"] += torch.bincount(sample["camera_dy_target"].reshape(-1), minlength=5).to(torch.float32)
+        counts["move"] += torch.bincount(sample["move_target"][:horizon].reshape(-1), minlength=9).to(torch.float32)
+        counts["camera_dx"] += torch.bincount(sample["camera_dx_target"][:horizon].reshape(-1), minlength=5).to(torch.float32)
+        counts["camera_dy"] += torch.bincount(sample["camera_dy_target"][:horizon].reshape(-1), minlength=5).to(torch.float32)
         if int(sample["slow_loss_mask"]) and int(sample["intent_target"]) >= 0:
             counts["intent"][int(sample["intent_target"])] += 1
     return counts
@@ -771,12 +774,14 @@ def _ordinary_button_bias_init(dataset, *, horizon: int = ACTION_CHUNK_HORIZON,
 
 def _class_balance_manifest(statistics: dict[str, torch.Tensor], *, data_paths: list[str],
                             sample_count: int | None = None, sampling: str | None = None,
-                            max_samples: int | None = None) -> dict[str, object]:
+                            max_samples: int | None = None,
+                            execution_horizon: int = ACTION_CHUNK_HORIZON) -> dict[str, object]:
     """Make the exact balance table and its source reproducible in a checkpoint."""
     return {
         "method": "inverse_sqrt_clamped_mean1",
         "clamp": [0.35, 3.0],
         "normalized_per_head": True,
+        "execution_horizon": int(execution_horizon),
         "computed_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": {"schema": VLA_SCHEMA_VERSION_V5,
                    "paths": [str(Path(path).resolve()) for path in data_paths],
@@ -968,13 +973,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if args.move_direction_balance:
         global_counts = torch.zeros(9, dtype=torch.float32)
         for index in range(len(dataset)):
-            global_counts += torch.bincount(dataset[index]["move_target"], minlength=9).to(torch.float32)
+            horizon = int(getattr(args, "execution_horizon", 1))
+            global_counts += torch.bincount(dataset[index]["move_target"][:horizon], minlength=9).to(torch.float32)
     if getattr(args, "class_balance", True):
-        class_balance_statistics = _class_balance_statistics(dataset)
+        execution_horizon = int(getattr(args, "execution_horizon", 1))
+        class_balance_statistics = _class_balance_statistics(
+            dataset, execution_horizon=execution_horizon)
         class_balance_manifest = _class_balance_manifest(
             class_balance_statistics, data_paths=_dataset_paths(args.data),
             sample_count=len(dataset), sampling=sampling,
-            max_samples=int(getattr(args, "max_samples", 0) or 0))
+            max_samples=int(getattr(args, "max_samples", 0) or 0),
+            execution_horizon=execution_horizon)
     if grounding_annotations is not None and float(getattr(args, "grounding_loss_weight", 1.0)) > 0:
         grounding_class_balance_statistics = _grounding_class_balance_statistics(dataset)
         grounding_class_balance_manifest = _grounding_class_balance_manifest(
