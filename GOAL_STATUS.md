@@ -121,14 +121,15 @@ the replay labels.
 
 ## Next Action
 
-1. Run a 60-step m26 numerical smoke with `camera_prior_scale=0`, then inspect
-   its embedded manifest and behavior acceptance.
-2. If the smoke passes, run the full 366-step m26 training and the revised
-   cross-session four-condition gate. The checkpoint is deployable only when
-   all image-zero/image-shuffle move/camera/intent requirements pass.
-3. After an offline pass, perform the sandbox dry-run sequence and verify the
-   learned policy completes find-machine, approach, Q interaction, and decoding
-   entry. Keep `--send-input` disabled until that evidence exists.
+1. Reduce camera zero-bucket false turns while preserving the passed visual
+   dependency and spatial-feature gates. Do not deploy while camera-dx/dy
+   zero-target false-turn exceeds `0.15`.
+2. Run a bounded smoke and then a full retrain for any camera-loss/calibration
+   change; compare rare-bucket recall and majority recall against the current
+   m26 baseline before accepting it.
+3. After all offline gates and class/over-action checks pass, perform the
+   sandbox dry-run sequence and verify find-machine, approach, Q interaction,
+   and decoding entry. Keep `--send-input` disabled until that evidence exists.
 
 The previous full m26 checkpoint is not reusable: its class-balance tables were
 computed over all four action horizons while the causal loss trained only step
@@ -236,6 +237,11 @@ The full checkpoint now has verified visual dependency and non-collapsed
 spatial/deep features. The normal validation camera-dx zero false-turn rate is
 still high (`0.6218`) and the rare-class acceptance has not yet been compared
 against a declared baseline; this is not yet deployment authorization.
+
+The live realtime benchmark also exposed the machine-side limitation: model
+loading completed, but DXGI returned no display device in the current
+non-interactive session. This is an environment blocker for live capture only;
+it does not replace the offline checkpoint gates.
 
 ## Latest Evidence: m26 Full Training and Cross-Session Gate
 

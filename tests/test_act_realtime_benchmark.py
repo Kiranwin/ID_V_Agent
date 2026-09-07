@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from idv_agent.scripts.benchmark_act_realtime import (
@@ -57,3 +58,28 @@ def test_realtime_window_keeps_last_three_features_and_pads_before_warmup():
     assert features.flatten().tolist() == [2.0, 3.0, 4.0]
     assert valid.tolist() == [[True, True, True]]
     assert indices == [2, 3, 4]
+
+
+def test_realtime_window_returns_exact_v5_eight_frame_stride_three_window():
+    from idv_agent.scripts.benchmark_act_realtime import RealtimeWindow
+
+    window = RealtimeWindow(max_length=22)
+    for index in range(22):
+        window.append(torch.tensor([float(index)]), frame_index=index, timestamp_ns=index + 1)
+
+    assert window.ready(history_frames=8, history_stride=3)
+    features, valid, indices = window.snapshot_window(history_frames=8, history_stride=3)
+    assert features.flatten().tolist() == [0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0]
+    assert valid.tolist() == [[True] * 8]
+    assert indices == [0, 3, 6, 9, 12, 15, 18, 21]
+
+
+def test_realtime_window_protocol_requires_full_span():
+    from idv_agent.scripts.benchmark_act_realtime import RealtimeWindow
+
+    window = RealtimeWindow(max_length=22)
+    for index in range(21):
+        window.append(torch.tensor([float(index)]), frame_index=index, timestamp_ns=index + 1)
+    assert not window.ready(history_frames=8, history_stride=3)
+    with pytest.raises(RuntimeError, match="未预热"):
+        window.snapshot_window(history_frames=8, history_stride=3)
