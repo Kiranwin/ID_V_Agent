@@ -38,3 +38,5 @@ def test_alignment_audit_groups_camera_replay_by_observation_grounding(tmp_path)
     assert report["groups"]["prompt=1"]["dy"]["-1"] == 4
     assert report["horizons"]["0"]["groups"]["side=right"]["dx"]["2"] == 1
     assert report["horizons"]["3"]["groups"]["prompt=1"]["dy"]["-1"] == 1
+    assert report["causal_horizon_summary"]["side=right"]["dx"]["entropy_bits"] == 0.0
+    assert report["causal_horizon_summary"]["previous_dx=0"]["dx"]["dominant_bucket"] == "2"

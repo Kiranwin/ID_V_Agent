@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -20,6 +21,19 @@ from idv_agent.vla.action_chunk import CAMERA_BUCKETS
 
 def _counts() -> dict[str, Counter[str]]:
     return {"dx": Counter(), "dy": Counter()}
+
+
+def _distribution_summary(counter: Counter[str]) -> dict[str, object]:
+    """Summarize label ambiguity without treating a majority as causality."""
+    total = sum(counter.values())
+    if not total:
+        return {"count": 0, "entropy_bits": None, "dominant_bucket": None,
+                "dominant_rate": None, "counts": {}}
+    probabilities = [value / total for value in counter.values() if value]
+    entropy = -sum(value * math.log2(value) for value in probabilities)
+    bucket, count = sorted(counter.items(), key=lambda item: (-item[1], item[0]))[0]
+    return {"count": total, "entropy_bits": entropy, "dominant_bucket": bucket,
+            "dominant_rate": count / total, "counts": dict(counter)}
 
 
 def audit(data: str | list[str], annotations: str | Path) -> dict:
@@ -42,8 +56,14 @@ def audit(data: str | list[str], annotations: str | Path) -> dict:
         reachable = int(item["grounding_reachable_target"].item())
         side_index = int(item["grounding_side_target"].item())
         side = ("none", "left", "center", "right")[side_index]
+        last_history_dx_index = int(item["history_actions"][-9 + 1].item())
+        last_history_dy_index = int(item["history_actions"][-9 + 2].item())
+        last_history_dx = CAMERA_BUCKETS[last_history_dx_index]
+        last_history_dy = CAMERA_BUCKETS[last_history_dy_index]
         groups = ("all", f"present={present}", f"prompt={prompt}",
-                  f"reachable={reachable}", f"side={side}")
+                  f"reachable={reachable}", f"side={side}",
+                  f"previous_dx={last_history_dx}", f"previous_dy={last_history_dy}",
+                  f"side={side}|previous_dx={last_history_dx}")
         for group in groups:
             for horizon, bucket in enumerate(item["camera_dx_target"].tolist()):
                 grouped[group]["dx"][str(CAMERA_BUCKETS[int(bucket)])] += 1
@@ -63,6 +83,13 @@ def audit(data: str | list[str], annotations: str | Path) -> dict:
                 name: {axis: dict(counter) for axis, counter in axes.items()}
                 for name, axes in sorted(groups.items())}}
             for horizon, groups in sorted(horizon_grouped.items())
+        },
+        # Only h=0 is causally consumed by m25/m26.  These summaries quantify
+        # whether the observation labels make that executed replay bucket
+        # determinate; they do not claim a condition is itself sufficient.
+        "causal_horizon_summary": {
+            name: {axis: _distribution_summary(counter) for axis, counter in axes.items()}
+            for name, axes in sorted(horizon_grouped[0].items())
         },
     }
 

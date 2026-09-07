@@ -124,11 +124,10 @@ the replay labels.
 1. Reduce camera zero-bucket false turns while preserving the passed visual
    dependency and spatial-feature gates. Do not deploy while camera-dx/dy
    zero-target false-turn exceeds `0.15`.
-2. The calibration scan shows a scalar zero-bucket bias is not sufficient:
-   train false-turn reaches `0.1478`, but held-out false-turn remains `0.2269`
-   and nonzero recalls collapse. Before another full retrain, audit/repair the
-   prompt=0 camera supervision or add a stronger same-frame target-position
-   contract; do not hide this with a deployment threshold.
+2. **Human annotation required before another camera retrain.** The prompt=0
+   camera replay target is high entropy even conditional on current bbox/side:
+   define and annotate the intended camera-control target/phase for those
+   frames. Do not conceal this with a deployment threshold or more epochs.
 3. After all offline gates and class/over-action checks pass, perform the
    sandbox dry-run sequence and verify find-machine, approach, Q interaction,
    and decoding entry. Keep `--send-input` disabled until that evidence exists.
@@ -261,6 +260,35 @@ camera targets span all five buckets; side supervision is also sparse
 (`left=7`, `right=4`). The current evidence supports a data/target ambiguity
 or observation-to-action mismatch as the primary blocker, not insufficient
 epochs or a missing image pathway.
+
+## Latest Evidence: Prompt=0 Camera Target Ambiguity
+
+| Item | Evidence |
+|---|---|
+| Entropy reports | `C:\\Codespace\\ID_V_Agent\\reports\\m26_grounding_camera_causal_entropy_train.json`, `C:\\Codespace\\ID_V_Agent\\reports\\m26_grounding_camera_causal_entropy_val.json` |
+| Scope | Same-frame human grounding, causal action horizon 0 only; read-only audit |
+| Train prompt=0 dx | 48 samples; entropy `2.1511` bits; dominant bucket only `35.4%`; counts `{-2:9,-1:8,0:17,+1:3,+2:11}` |
+| Val prompt=0 dx | 46 samples; entropy `2.1894` bits; dominant bucket only `32.6%`; counts `{-2:9,-1:5,0:15,+1:5,+2:12}` |
+| Prompt=1 contrast | train `77/80` dx=0; validation `18/18` dx=0 |
+
+Bounding-box horizontal position partly explains edge turns, but does not
+resolve central targets: validation central/small (`x2|small`) contains all
+five dx buckets. The smallest useful human label for each selected prompt=0
+camera decision frame is therefore not another bbox; it is:
+
+1. `camera_control_phase`: `search`, `target_acquire`, `target_align`, or
+   `hold`.
+2. `camera_target_id`: whether the visible cipher is the target currently
+   being approached (`target_cipher` / `other_visible` / `none`).
+3. `desired_turn_dx` and `desired_turn_dy`: intended one-step correction bucket
+   (`-2..2`) for the current frame, with `0` only when intentional hold/alignment.
+
+Label the existing grounding-pool prompt=0 frames first (train=48, val=46),
+with priority on central/small visible cipher frames and every nonzero replay
+bucket. Preserve the existing raw replay label unchanged; these are new
+training-only semantic targets. Resume only after the labels pass a coverage
+and enum validator, then use their model predictions—not sidecar values—in the
+camera head.
 
 ## Latest Evidence: m26 Full Training and Cross-Session Gate
 
