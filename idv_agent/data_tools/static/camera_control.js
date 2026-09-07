@@ -45,14 +45,16 @@ function renderFields() { Object.keys(OPTIONS).forEach(renderChoices); }
 function renderTarget() {
   const row = selected(), g = row.existing_grounding;
   $("row-id").textContent = row.id; $("frame-title").textContent = `${row.session} · frame ${row.frame}`;
-  $("grounding").textContent = `现有 grounding：${g.cipher_bbox_xyxy_norm ? "cipher bbox" : "无 bbox"} · target_side=${g.target_side}`;
+  const actionStart = row.frame + 2, actionEnd = actionStart + 5;
+  $("grounding").textContent = `观察窗口 frame ${Math.max(0, row.frame - 21)}–${row.frame}；现有 grounding：${g.cipher_bbox_xyxy_norm ? "cipher bbox" : "无 bbox"} · target_side=${g.target_side}`;
   $("target-image").src = `/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}/frames/${row.frame}`;
   $("frame-caption").innerHTML = `<strong>观察帧 ${row.frame}</strong><span>上下文结束点；标签应描述此刻可得信息下的控制意图</span>`;
+  $("replay-window").textContent = `frame ${actionStart}–${actionEnd}`;
   $("replay-camera").textContent = `dx ${row.replay_camera_dx}, dy ${row.replay_camera_dy}`; $("target-side").textContent = g.target_side; $("interact-prompt").textContent = g.interact_prompt ? "yes" : "no"; $("reachable").textContent = g.cipher_reachable ? "yes" : "no";
   const bbox = $("bbox"), b = g.cipher_bbox_xyxy_norm; bbox.hidden = !b;
   if (b) { bbox.style.left = `${b[0] * 100}%`; bbox.style.top = `${b[1] * 100}%`; bbox.style.width = `${(b[2] - b[0]) * 100}%`; bbox.style.height = `${(b[3] - b[1]) * 100}%`; }
 }
-function renderContext() { const box = $("context"); box.replaceChildren(); const row = selected(); state.context.filter(x => x.exists).forEach((item) => { const figure = document.createElement("figure"); const img = document.createElement("img"); img.loading = "lazy"; img.src = `/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}/frames/${item.frame}`; img.alt = `frame ${item.frame}`; const c = document.createElement("figcaption"); c.textContent = item.frame === row.frame ? `${item.frame} · 当前` : `frame ${item.frame}`; figure.append(img, c); box.append(figure); }); }
+function renderContext() { const box = $("context"); box.replaceChildren(); const row = selected(); state.context.filter(x => x.exists).forEach((item, index) => { const figure = document.createElement("figure"); const img = document.createElement("img"); img.loading = "lazy"; img.src = `/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}/frames/${item.frame}`; img.alt = `frame ${item.frame}`; const c = document.createElement("figcaption"); c.textContent = `frame ${item.frame}${index === 0 ? " · h0 start" : index === 5 ? " · h0 end" : ""}`; figure.append(img, c); box.append(figure); }); }
 function render() { renderQueue(); const row = selected(); $("empty").hidden = Boolean(row); $("editor").hidden = !row; if (!row) return; renderTarget(); renderContext(); renderFields(); }
 async function loadContext() { const row = selected(); if (!row) { state.context = []; return; } state.context = (await api(`/api/camera-control/${state.split}/rows/${encodeURIComponent(row.id)}/context`)).frames; }
 async function load() { error(); status("Loading"); state.data = await api("/api/camera-control/sets"); const rows = state.data.splits[state.split].rows; const pending = rows.findIndex(x => x.status !== "complete"); state.rowIndex = pending < 0 ? 0 : pending; await loadContext(); render(); status("Ready", "success"); }

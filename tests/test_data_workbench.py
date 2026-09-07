@@ -192,7 +192,7 @@ def test_camera_control_ui_serves_context_and_writes_annotated_copy(tmp_path: Pa
         sets = get_json(server, "/api/camera-control/sets")
         assert sets["splits"]["train"]["pending"] == 1
         context = get_json(server, "/api/camera-control/train/rows/s1_00000021/context")
-        assert [item["frame"] for item in context["frames"]] == list(range(0, 22, 3))
+        assert [item["frame"] for item in context["frames"]] == list(range(23, 29))
         frame = request(server, "/api/camera-control/train/rows/s1_00000021/frames/21")
         assert frame.status == 200
         assert frame.read() == b"jpeg"

@@ -119,8 +119,12 @@ class CameraControlStore:
         if session.parent != self.raw_root or not session.is_dir():
             raise ValueError("annotation session is outside raw root")
         target = int(row["frame"])
+        # Canonical v5/m26 causal alignment uses one skipped frame after the
+        # observation and then a six-frame h0 macro action.  Annotators need
+        # to inspect that recorded outcome, not the already-consumed history.
+        h0_start = target + 2
         result = []
-        for frame in range(max(0, target - 21), target + 1, 3):
+        for frame in range(h0_start, h0_start + 6):
             path = (session / "frames" / f"{frame:08d}.jpg").resolve()
             if path.parent != (session / "frames").resolve():
                 raise ValueError("invalid frame path")
@@ -128,11 +132,13 @@ class CameraControlStore:
         return result
 
     def frame_path(self, split: str, identifier: str, frame: int) -> Path:
-        allowed = {item["frame"] for item in self.context_frames(split, identifier)}
-        if frame not in allowed:
-            raise ValueError("frame 不属于该标注的上下文")
         rows, _ = self.rows(split)
         row = next(item for item in rows if item["id"] == identifier)
+        allowed = {int(row["frame"])} | {
+            item["frame"] for item in self.context_frames(split, identifier)
+        }
+        if frame not in allowed:
+            raise ValueError("frame 不属于当前观察帧或 h0 录制回放")
         session = (self.raw_root / str(row["session"])).resolve()
         path = (session / "frames" / f"{frame:08d}.jpg").resolve()
         if path.parent != (session / "frames").resolve() or not path.is_file():
