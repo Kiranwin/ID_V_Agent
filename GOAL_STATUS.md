@@ -120,15 +120,18 @@ the replay labels.
 
 ## Next Action
 
-1. The m25 loss-scale fix has passed the 60-step numerical smoke; run the
-   complete 366-step m25 training locally with the same configuration before
-   making any deployment decision.
-2. Run the full four-condition visual-dependency gate as one blocking
-   foreground command after training. A checkpoint is deployable only when all
-   image-zero and image-shuffle move/camera/intent requirements pass.
-3. If the gate passes, perform the sandbox dry-run sequence and verify the
-   learned policy completes find-machine, approach, Q interaction, and decoding
-   entry. Keep `--send-input` disabled until that evidence exists.
+1. Diagnose the m25 camera/move visual-dependency failure before another long
+   run. The current model output is image-sensitive, but the sensitivity does
+   not improve correct camera decisions; do not tune the gate threshold or
+   deploy this checkpoint.
+2. Use the existing per-side/per-prompt alignment audit and the m25 evaluator
+   to isolate whether the failure is caused by sparse left/right supervision,
+   camera-prior dominance, or a label/visual timing mismatch. Add a focused
+   regression or audit artifact before changing architecture or data.
+3. After the diagnosis and targeted fix, train a bounded smoke first, then run
+   the full four-condition gate. Keep `--send-input` disabled until every
+   image-zero/image-shuffle move/camera/intent requirement and the sandbox
+   dry-run sequence pass.
 
 ## Latest Evidence: m25 Loss-Scale Smoke
 
@@ -144,6 +147,26 @@ This smoke validates the corrected causal loss scale and numerical stability,
 but it is not a deployment result. The full visual-dependency gate was not run
 for this checkpoint, camera remains weak, and the class-balance acceptance is
 `not_comparable` because no acceptance baseline was supplied.
+
+## Latest Evidence: m25 Full Training and Visual Gate
+
+| Item | Evidence |
+|---|---|
+| Checkpoint | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m25_rolling_full366_local_idv312\\act.pt` |
+| Metrics / manifest | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m25_rolling_full366_local_idv312\\metrics.json`, `manifest.json` |
+| Training | 366 steps, 732 train chunks, 182 validation chunks, batch=4, `execution_horizon=1`, image augmentation, class balance, 50% grounding sampling, base Qwen only |
+| Optimization | loss `8.2220 -> 0.8976`; checkpoint loss delta `0`; command exit code `0`; all recorded gradients finite |
+| Validation | intent accuracy `0.8462`; interaction precision/recall `0.6364/0.3500`; camera-dx zero false-turn rate `0.5630`; grounding side accuracy `0.4531` |
+| Four-condition gate | `C:\\Codespace\\ID_V_Agent\\reports\\m25_rolling_full366_visual_dependency.json`; exit code `1`; `visual_dependency_gate_pass=false` |
+
+The model is measurably image-sensitive: camera-dx argmax flip rate is
+`0.6964` for image-zero and `0.4368` for image-shuffle. However, this does
+not constitute useful visual grounding. Balanced normal/zero/shuffle scores are
+move `0.264/0.167/0.364`, camera `0.256/0.225/0.229`, and intent
+`0.860/0.500/0.513`. Thus image-zero camera drops only `0.0310` (required
+`0.05`), while image-shuffle camera drops `0.0272` and move improves by
+`0.1002`; both image conditions fail. The checkpoint is rejected and remains
+fail-closed.
 
 ## Latest Evidence: m24 Full Grounding-Balanced Training
 
