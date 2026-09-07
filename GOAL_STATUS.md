@@ -211,6 +211,15 @@ also had camera-dx zero false-turn rate `0.6000`; it is not a deployment
 candidate. Re-run m25 smoke with a conservative learning rate before a full
 training and complete four-condition gate.
 
+The lower-`lr` retry also failed (`max_grad=117.1901`, final loss `9.0805`),
+which ruled out learning rate as the root cause. The actual issue was loss
+scale: restricting `_masked_mean` from 4 future actions to 1 causal action
+amplified each fast-head sample gradient by 4x. The fix is implemented and
+covered by 77 focused tests: m25 fast move/camera/button/event/duration loss
+is normalized by `execution_horizon / 4`, preserving the new causal target
+mask, class weights, and head lambdas. Re-run the smoke at the original
+`lr=1e-4` before a full m25 run.
+
 ## Latest Evidence: m24 Learned Camera-Grounding Fusion Smoke
 
 | Item | Evidence |

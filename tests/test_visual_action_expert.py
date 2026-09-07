@@ -138,6 +138,29 @@ def test_rolling_execution_horizon_ignores_unexecuted_future_action_losses():
     assert torch.allclose(first["fast_camera"], second["fast_camera"])
 
 
+def test_rolling_execution_horizon_preserves_fast_loss_scale_by_action_coverage():
+    """One supervised step must not amplify fast gradients fourfold."""
+    from idv_agent.model.vla_heads import FastVLAOutput
+    from idv_agent.training.vla_loss import VLALossWeights, compute_vla_loss
+
+    logits = torch.zeros(1, 4, 2, requires_grad=True)
+    fast = FastVLAOutput(
+        move_logits=logits, camera_dx_logits=torch.zeros(1, 4, 2),
+        camera_dy_logits=torch.zeros(1, 4, 2), button_logits=torch.zeros(1, 4, 6),
+        duration=torch.ones(1, 4), confidence=torch.zeros(1), stop_or_replan=torch.zeros(1),
+        intent_context_logits=torch.zeros(1, 8), interact_event_logits=torch.zeros(1, 4),
+    )
+    batch = {
+        "fast_loss_mask": torch.ones(1), "move_target": torch.zeros(1, 4, dtype=torch.long),
+        "camera_dx_target": torch.zeros(1, 4, dtype=torch.long),
+        "camera_dy_target": torch.zeros(1, 4, dtype=torch.long),
+        "button_target": torch.zeros(1, 4, 6), "duration_target": torch.ones(1, 4),
+    }
+    full = compute_vla_loss(fast, None, batch, VLALossWeights(execution_horizon=4))
+    rolling = compute_vla_loss(fast, None, batch, VLALossWeights(execution_horizon=1))
+    assert torch.allclose(rolling["fast_move"], full["fast_move"] / 4.0)
+
+
 def test_visual_expert_can_use_pure_visual_features_separate_from_conditioned_prior():
     """Task condition must not be part of the history-free visual branch."""
     from idv_agent.model.fast_slow_vla import SharedFastSlowVLA

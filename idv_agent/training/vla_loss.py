@@ -281,11 +281,15 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
         event_logits, event_target, weight=event_weight, reduction="none")
     duration = F.smooth_l1_loss(fast.duration, batch["duration_target"], reduction="none")
     losses = {
-        "fast_move": _masked_mean(move, fast_mask),
-        "fast_camera": _masked_mean(cam_dx + cam_dy, fast_mask),
-        "fast_buttons": _masked_mean(buttons, fast_mask),
-        "fast_interact_event": _masked_mean(interact_event, fast_mask),
-        "fast_duration": _masked_mean(duration, fast_mask),
+        # Keep per-sample fast-head gradient scale invariant when rolling m25
+        # supervises one of four predicted steps instead of all four.  The
+        # factor is a global protocol normalization; class weights remain
+        # head-local and their relative lambda is unchanged.
+        "fast_move": _masked_mean(move, fast_mask) * (horizon / fast.move_logits.shape[1]),
+        "fast_camera": _masked_mean(cam_dx + cam_dy, fast_mask) * (horizon / fast.move_logits.shape[1]),
+        "fast_buttons": _masked_mean(buttons, fast_mask) * (horizon / fast.move_logits.shape[1]),
+        "fast_interact_event": _masked_mean(interact_event, fast_mask) * (horizon / fast.move_logits.shape[1]),
+        "fast_duration": _masked_mean(duration, fast_mask) * (horizon / fast.move_logits.shape[1]),
     }
     zero = fast.move_logits.sum() * 0.0
     losses.update({"slow_intent": zero, "slow_subgoal": zero, "consistency": zero})
