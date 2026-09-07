@@ -165,7 +165,7 @@ move `0.264/0.167/0.364`, camera `0.256/0.225/0.229`, and intent
 `0.1002`; both image conditions fail. The checkpoint is rejected and remains
 fail-closed.
 
-## m26 Protocol Repair (Implemented, Awaiting Smoke)
+## m26 Protocol Repair (Implemented)
 
 The m25 failure diagnosis separated two defects from the model itself:
 
@@ -187,6 +187,21 @@ cross-session shuffle, image-zero drops move/camera/intent by
 `0.0999/0.0596/0.3318`; all satisfy the gate. This is diagnostic evidence
 only: m25 was trained with camera prior `0.5`, so m26 must be retrained before
 any deployment decision.
+
+## Latest Evidence: m26 Visual-Camera Smoke
+
+| Item | Evidence |
+|---|---|
+| Checkpoint | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m26_visual_camera_smoke60_local_idv312\\act.pt` |
+| Metrics / manifest | `C:\\Codespace\\ID_V_Agent\\checkpoints\\m26_visual_camera_smoke60_local_idv312\\metrics.json`, `manifest.json` |
+| Training | 60 steps, 128 train samples, 64 validation samples, `camera_prior_scale=0`, image augmentation, per-head class balance, 50% grounding sampling, base Qwen only |
+| Optimization | loss `3.8622 -> 3.6044`; max gradient norm `76.9136`; all component losses finite; checkpoint loss delta `0`; behavior gate passed; command exit code `0` |
+| Protocol | manifest/checkpoint schema `m26_act.visual_camera_no_prior.v1`; M2/VG disabled |
+
+This smoke validates numerical stability and the visual-only camera protocol,
+but does not establish generalization or deployment readiness. Its 64-sample
+validation camera-dx zero false-turn rate is `0.6750`; full training and the
+complete 182-sample cross-session visual gate are still required.
 
 ## Latest Evidence: m24 Full Grounding-Balanced Training
 
