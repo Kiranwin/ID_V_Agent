@@ -1519,7 +1519,15 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
             if not 1 <= execution_horizon <= output.fast.move_logits.shape[1]:
                 raise ValueError("execution_horizon 超出 fast action chunk")
             mask = batch["fast_loss_mask"].to(output_device).bool()
-            mask = mask[:, None].expand_as(output.fast.move_logits.argmax(-1)).clone()
+            action_shape = output.fast.move_logits.argmax(-1).shape
+            if mask.ndim == 1:
+                mask = mask[:, None].expand(action_shape).clone()
+            elif mask.shape == action_shape:
+                mask = mask.clone()
+            elif mask.ndim == 2 and mask.shape[0] == action_shape[0] and mask.shape[1] == 1:
+                mask = mask.expand(action_shape).clone()
+            else:
+                raise ValueError("fast_loss_mask 必须是 [B]、[B,1] 或 [B,horizon]")
             mask[:, execution_horizon:] = False
             for value in output.fast.move_logits.argmax(-1)[mask].detach().cpu().reshape(-1).tolist():
                 move_pred[int(value)] += 1
