@@ -446,3 +446,78 @@ def test_camera_logits_can_use_predicted_grounding_without_changing_move_or_inte
     assert torch.equal(baseline.fast.move_logits, changed.fast.move_logits)
     assert torch.equal(baseline.slow.intent_logits, changed.slow.intent_logits)
     assert not torch.equal(baseline.fast.camera_dx_logits, changed.fast.camera_dx_logits)
+
+
+def test_m28_joint_planner_uses_predicted_state_for_all_deployed_actions():
+    """Move/camera/Q loss must reach state heads, not a parallel action path."""
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+    from idv_agent.training.vla_loss import VLALossWeights, compute_vla_loss
+
+    torch.manual_seed(107)
+    core = SharedFastSlowVLA(8, temporal_dim=12, history_action_dim=0)
+    output = core(torch.randn(2, 8, 8), _condition(core, 2), run_slow=True)
+    batch = {
+        "fast_loss_mask": torch.ones(2),
+        "move_target": torch.zeros(2, 4, dtype=torch.long),
+        "camera_dx_target": torch.full((2, 4), 2, dtype=torch.long),
+        "camera_dy_target": torch.full((2, 4), 2, dtype=torch.long),
+        "button_target": torch.zeros(2, 4, 6),
+        "duration_target": torch.full((2, 4), 6.0),
+        "slow_loss_mask": torch.zeros(2),
+        "intent_target": torch.full((2,), -100, dtype=torch.long),
+        "subgoal_target": torch.full((2,), -100, dtype=torch.long),
+        "subgoal_weight": torch.zeros(2),
+    }
+    # Deliberately exclude every state auxiliary loss: these gradients prove
+    # the deployed joint action planner itself consumes predicted state.
+    loss = compute_vla_loss(output.fast, output.slow, batch,
+                            VLALossWeights(execution_horizon=1, slow_intent=0.0,
+                                           slow_subgoal=0.0, consistency=0.0))
+    loss["total"].backward()
+    expert = core.visual_expert
+    assert expert.state_trunk[0].weight.grad is not None
+    assert float(expert.state_trunk[0].weight.grad.abs().sum()) > 0
+    assert expert.slow.intent.weight.grad is not None
+    assert float(expert.slow.intent.weight.grad.abs().sum()) > 0
+    assert expert.camera_control_steering.weight.grad is not None
+    assert float(expert.camera_control_steering.weight.grad.abs().sum()) > 0
+    assert expert.planner.move.weight.grad is not None
+    assert expert.planner.camera_dx.weight.grad is not None
+    assert expert.planner.interact_event.weight.grad is not None
+
+
+def test_m28_desired_turn_is_the_executed_h0_camera_planner_logit():
+    """Human desired-turn supervision must target the camera logits sent to ACT."""
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+
+    torch.manual_seed(109)
+    core = SharedFastSlowVLA(8, temporal_dim=12, history_action_dim=0).eval()
+    with torch.no_grad():
+        output = core(torch.randn(2, 8, 8), _condition(core, 2), run_slow=False)
+    assert output.visual is not None and output.visual.camera_control is not None
+    control = output.visual.camera_control
+    assert torch.equal(control.desired_turn_dx_logits, output.fast.camera_dx_logits[:, 0])
+    assert torch.equal(control.desired_turn_dy_logits, output.fast.camera_dy_logits[:, 0])
+
+
+def test_m28_planner_reacts_to_predicted_intent_without_label_injection():
+    """Changing a predicted belief changes the planner input; labels are absent."""
+    from idv_agent.model.vla_heads import StateDecisionExpert
+
+    torch.manual_seed(113)
+    expert = StateDecisionExpert(4, 8).eval()
+    frames = torch.randn(1, 8, 4)
+    with torch.no_grad():
+        output = expert(frames)
+        slow = output.slow
+        grounding = output.grounding
+        control = output.camera_control
+        assert grounding is not None and control is not None
+        altered = type(slow)(slow.intent_logits + torch.tensor([[0., 9., 0., 0., 0., 0., 0., 0.]]),
+                             slow.subgoal_logits, slow.context_embedding, slow.refresh_logits)
+        replanned = expert.planner_from_predicted_state(
+            output.feature, altered, grounding,
+            (control.phase_logits, control.target_id_logits,
+             control.steering_logits, control.path_logits),
+        )
+    assert not torch.equal(output.fast.move_logits, replanned.move_logits)

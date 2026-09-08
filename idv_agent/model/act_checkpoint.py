@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-ACT_CHECKPOINT_SCHEMA = "m27_act.visual_camera_control.v1"
+ACT_CHECKPOINT_SCHEMA = "m28_act.state_conditioned_joint_planner.v1"
 ACT_CAMERA_PRIOR_SCALE = 0.0
 _ACT_ADAPTER_KEYS = frozenset({"condition_projection"})
 
@@ -46,7 +46,7 @@ def load_visual_grounded_act_checkpoint(adapter: torch.nn.Module, core: torch.nn
                                         checkpoint: dict[str, Any]) -> None:
     """Restore a complete m8 ACT checkpoint or fail before partial loading."""
     if checkpoint.get("checkpoint_schema_version") != ACT_CHECKPOINT_SCHEMA:
-        raise ValueError("旧 ACT checkpoint 不兼容；仅允许 m27 visual-camera-control rolling protocol")
+        raise ValueError("旧 ACT checkpoint 不兼容；仅允许 m28 state-conditioned joint-planner rolling protocol")
     if not isinstance(checkpoint.get("adapter"), dict) or not isinstance(checkpoint.get("core"), dict):
         raise ValueError("ACT checkpoint 缺少 adapter/core")
     load_act_adapter_state(adapter, checkpoint["adapter"])

@@ -275,6 +275,73 @@ The next data expansion must add independently held-out, fully labeled route
 examples (search, acquisition, left/right detours, approach, Q prompt) before
 claiming camera-control generalization.  No deployment authorization changes.
 
+## Architecture Coordination Audit: Required m28 Direction (2026-09-08)
+
+The current m27 graph is not yet a true `image -> state -> decision -> action`
+policy.  It has a structural coordination defect:
+
+- `VisualActionExpert.fast` (move/Q/duration and the direct camera paths) and
+  `VisualActionExpert.slow` (intent/subgoal) are independent readouts from the
+  same frozen visual pair feature.  There is no shared trainable state trunk
+  and the action heads do not consume the visual slow intent/subgoal logits.
+- Runtime's one-Hz `SlowCondition` is passed through FiLM into the diagnostic
+  temporal branch, but deployed m27 move/Q are visual-only and camera prior is
+  fixed to zero.  Thus `travel/decipher` is displayed in logs but is not an
+  upstream causal decision condition for the deployed camera action.
+- Grounding/control predictions are fused into final camera logits through a
+  zero-initialized linear residual, but move and Q do not consume these states;
+  `desired_turn_*` is evaluated as an auxiliary head while the executor still
+  uses the replay-camera argmax.  Consequently path-follow can be predicted
+  without controlling the turn actually sent to the game.
+
+Do not solve this only by adding data or loss weights.  The required next
+architecture is an m28 **shared State-Decision Core**:
+
+```text
+8-frame spatial visual feature
+  -> shared state trunk z (no mean-pool / preserves spatial cells)
+  -> predicted belief logits: intent, nav phase, target, side/reachable/prompt,
+     steering mode, path strategy, desired move/turn
+  -> differentiable soft state embedding + z
+  -> one joint h0 planner: move + camera + Q
+  -> executor lookup table / 6-frame rolling re-observation
+```
+
+All planner inputs must be model predictions, never annotation sidecars or
+ground-truth teacher-forced state.  Replay actions remain supervision across
+all rows; annotated `desired_turn` is direct planner supervision where present
+and control-state losses teach why a replay action occurred.  The deployed
+camera must eventually come from this state-conditioned planner, not an
+unconditioned replay argmax.  A later learned recurrent belief filter may add
+state persistence only after contiguous decision sequences are prepared;
+the current decorrelated chunks cannot truthfully train such a transition.
+
+### m28 implementation status
+
+The m28 core is now implemented in `idv_agent/model/vla_heads.py` as
+`StateDecisionExpert` and is the deployed `core.visual_expert`.  It constructs
+shared state `z` from the ordered eight-frame spatial feature sequence; all
+state logits and the joint action planner share it.  The planner takes only
+soft embeddings of its own predicted beliefs.  `desired_turn_dx/dy` aliases
+the planner's executed h0 camera logits.  Checkpoint schema is now
+`m28_act.state_conditioned_joint_planner.v1`; all m27 checkpoints are
+fail-closed.  This is an architecture implementation, not a trained result.
+
+Focused regression: **66 passed** (state/action gradient path, desired-turn
+wire identity, all-predicted-belief planner input, data/label contract,
+camera buckets and checkpoint rejection).  A new m28 numerical smoke must run
+from base Qwen before any full train; the interrupted m27 oversampling full
+run, even if it finishes, is superseded and must not be evaluated as a
+deployment candidate.
+
+Required acceptance for m28 before a full run: (1) state loss and action loss
+share the state trunk with verified nonzero gradients, (2) inference uses the
+same all-predicted soft state path as training, (3) state-ablation/shuffle with
+images held constant measurably degrades annotated desired-turn/move/Q metrics,
+(4) image zero/shuffle and current visual gates still pass, and (5) h0 camera
+is sourced from the planner actually executed.  This is a design decision,
+not implemented yet; m27 and all current checkpoints remain fail-closed.
+
 ## Latest Evidence: m25 Loss-Scale Smoke
 
 | Item | Evidence |

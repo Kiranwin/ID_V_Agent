@@ -498,3 +498,203 @@ class VisualActionExpert(nn.Module):
                                  valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         pair = self.pair_features(frame_features, valid_mask=valid_mask)
         return self.input_norm(pair - self.input_center.to(pair))
+
+
+class StateDecisionExpert(nn.Module):
+    """Shared visual state trunk followed by a joint h0 action planner.
+
+    m28's deployment path is deliberately not a collection of parallel image
+    classifiers.  The complete spatial frame sequence first produces one
+    trainable state ``z``.  Intent, grounding and route-control logits are
+    predicted from that same state.  The planner then consumes only ``z`` and
+    differentiable *predicted* state embeddings to produce move, camera and Q
+    logits together.  Annotation sidecars supervise those state predictions
+    during training but are never arguments to ``forward``.
+    """
+
+    def __init__(self, frame_feature_dim: int, temporal_dim: int,
+                 horizon: int = ACTION_CHUNK_HORIZON, *, max_frames: int = 8):
+        super().__init__()
+        if frame_feature_dim < 1 or temporal_dim < 1 or horizon < 1:
+            raise ValueError("frame_feature_dim/temporal_dim/horizon 必须为正数")
+        self.frame_feature_dim = int(frame_feature_dim)
+        self.temporal_dim = int(temporal_dim)
+        self.max_frames = int(max_frames)
+        if self.max_frames < 1:
+            raise ValueError("max_frames 必须为正数")
+        self.sequence_dim = self.frame_feature_dim * self.max_frames
+        self.pair_dim = self.sequence_dim + self.frame_feature_dim
+        self.visual_feature_scale = 0.25
+        self.register_buffer("input_center", torch.zeros(self.pair_dim), persistent=True)
+        self.input_norm = nn.LayerNorm(self.pair_dim, elementwise_affine=False)
+        # This is a learned projection of the full ordered spatial sequence,
+        # not a mean pool.  Every frame cell and the explicit last-first delta
+        # has a distinct input coordinate.
+        self.state_trunk = nn.Sequential(
+            nn.Linear(self.pair_dim, self.temporal_dim, bias=False),
+            nn.GELU(),
+            nn.LayerNorm(self.temporal_dim),
+        )
+        self.slow = SlowVLAHead(self.temporal_dim, bias=False, direct=True)
+        self.grounding_present = nn.Linear(self.temporal_dim, 1, bias=False)
+        self.grounding_bbox = nn.Linear(self.temporal_dim, 4, bias=False)
+        self.grounding_side = nn.Linear(self.temporal_dim, 4, bias=False)
+        self.grounding_prompt = nn.Linear(self.temporal_dim, 1, bias=False)
+        self.grounding_reachable = nn.Linear(self.temporal_dim, 1, bias=False)
+        self.camera_control_phase = nn.Linear(self.temporal_dim, 4, bias=False)
+        self.camera_control_target_id = nn.Linear(self.temporal_dim, 3, bias=False)
+        self.camera_control_steering = nn.Linear(self.temporal_dim, 4, bias=False)
+        self.camera_control_path = nn.Linear(self.temporal_dim, 4, bias=False)
+
+        # Soft embeddings keep the decision path differentiable while making
+        # it impossible to inject a label id at deployment.
+        self.intent_state = nn.Embedding(len(INTENTS), 16)
+        self.subgoal_state = nn.Embedding(len(SUBGOAL_NAMES), 24)
+        self.present_state = nn.Embedding(2, 4)
+        self.side_state = nn.Embedding(4, 8)
+        self.prompt_state = nn.Embedding(2, 4)
+        self.reachable_state = nn.Embedding(2, 4)
+        self.phase_state = nn.Embedding(4, 8)
+        self.target_state = nn.Embedding(3, 8)
+        self.steering_state = nn.Embedding(4, 8)
+        self.path_state = nn.Embedding(4, 8)
+        # z + intent/subgoal + present/side/prompt/reachable + phase/target/
+        # steering/path + bbox = temporal_dim + 96.
+        planner_dim = self.temporal_dim + 16 + 24 + 4 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 4
+        self.planner = FastVLAHead(planner_dim, history_action_dim=0, horizon=horizon, bias=False)
+        # Sparse Q / held keys retain learned training-set baselines, but
+        # their visual evidence now comes from the shared planner state.
+        self.interact_event_bias = nn.Parameter(torch.zeros(horizon))
+        self.ordinary_button_bias = nn.Parameter(torch.zeros(horizon, 5))
+
+    @staticmethod
+    def _valid_indices(frame_features: torch.Tensor,
+                       valid_mask: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, steps, _ = frame_features.shape
+        if valid_mask is None:
+            return (torch.zeros(batch, dtype=torch.long, device=frame_features.device),
+                    torch.full((batch,), steps - 1, dtype=torch.long, device=frame_features.device))
+        if valid_mask.ndim == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != (batch, steps):
+            raise ValueError("valid_mask shape 必须为 [B,L]")
+        valid = valid_mask.bool()
+        if not bool(valid.any(dim=1).all()):
+            raise ValueError("每个视觉窗口至少需要一帧有效画面")
+        return valid.long().argmax(dim=1), valid.long().sum(dim=1).clamp_min(1) - 1
+
+    def pair_features(self, frame_features: torch.Tensor,
+                      valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        if frame_features.ndim != 3 or frame_features.shape[-1] != self.frame_feature_dim:
+            raise ValueError(f"frame_features 必须是 [B,L,{self.frame_feature_dim}]")
+        first_index, last_index = self._valid_indices(frame_features, valid_mask)
+        rows = torch.arange(frame_features.shape[0], device=frame_features.device)
+        first, last = frame_features[rows, first_index], frame_features[rows, last_index]
+        if frame_features.shape[1] > self.max_frames:
+            raise ValueError(f"视觉窗口长度不能超过 {self.max_frames}")
+        sequence = torch.zeros((frame_features.shape[0], self.max_frames, self.frame_feature_dim),
+                               device=frame_features.device, dtype=frame_features.dtype)
+        sequence[:, :frame_features.shape[1]] = frame_features
+        return torch.cat((sequence.reshape(frame_features.shape[0], -1), last - first), dim=-1)
+
+    def normalized_pair_features(self, frame_features: torch.Tensor,
+                                 valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.input_norm(self.pair_features(frame_features, valid_mask=valid_mask) -
+                               self.input_center.to(frame_features))
+
+    def set_input_center(self, center: torch.Tensor) -> None:
+        center = center.detach().reshape(-1).to(device=self.input_center.device,
+                                                 dtype=self.input_center.dtype)
+        if center.shape != self.input_center.shape or not bool(torch.isfinite(center).all()):
+            raise ValueError(f"visual input center 必须是有限 [{self.pair_dim}] Tensor")
+        self.input_center.copy_(center)
+
+    @staticmethod
+    def _soft_class(logits: torch.Tensor, table: nn.Embedding) -> torch.Tensor:
+        return torch.softmax(logits, dim=-1) @ table.weight
+
+    @staticmethod
+    def _soft_binary(logit: torch.Tensor, table: nn.Embedding) -> torch.Tensor:
+        probability = torch.sigmoid(logit).unsqueeze(-1)
+        return torch.cat((1.0 - probability, probability), dim=-1) @ table.weight
+
+    def planner_from_predicted_state(self, state: torch.Tensor, slow: SlowVLAOutput,
+                                     grounding: GroundingOutput,
+                                     control_logits: tuple[torch.Tensor, torch.Tensor,
+                                                           torch.Tensor, torch.Tensor]) -> FastVLAOutput:
+        """Plan from ``z`` and predicted belief logits only; no label inputs."""
+        phase, target, steering, path = control_logits
+        planner_input = torch.cat((
+            state,
+            self._soft_class(slow.intent_logits, self.intent_state),
+            self._soft_class(slow.subgoal_logits, self.subgoal_state),
+            self._soft_binary(grounding.present_logits, self.present_state),
+            self._soft_class(grounding.side_logits, self.side_state),
+            self._soft_binary(grounding.prompt_logits, self.prompt_state),
+            self._soft_binary(grounding.reachable_logits, self.reachable_state),
+            self._soft_class(phase, self.phase_state),
+            self._soft_class(target, self.target_state),
+            self._soft_class(steering, self.steering_state),
+            self._soft_class(path, self.path_state),
+            grounding.bbox,
+        ), dim=-1)
+        fast = self.planner(planner_input)
+        event_bias = self.interact_event_bias.to(fast.button_logits).view(1, self.planner.horizon)
+        ordinary_bias = self.ordinary_button_bias.to(fast.button_logits).view(1, self.planner.horizon, 5)
+        event_logits = fast.interact_event_logits + event_bias
+        fast.interact_event_logits = event_logits
+        fast.button_logits = fast.button_logits.clone()
+        fast.button_logits[..., 0] = event_logits
+        fast.button_logits[..., 1:] = fast.button_logits[..., 1:] + ordinary_bias
+        return fast
+
+    def forward(self, frame_features: torch.Tensor,
+                valid_mask: Optional[torch.Tensor] = None) -> VisualExpertOutput:
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        pair = self.normalized_pair_features(frame_features, valid_mask=valid_mask)
+        # Keep state/core arithmetic FP32 on Turing, as with m27 direct heads.
+        with torch.autocast(device_type=pair.device.type, enabled=False):
+            state = self.state_trunk((pair * self.visual_feature_scale).float())
+            slow = self.slow(state)
+            grounding = GroundingOutput(
+                present_logits=self.grounding_present(state).squeeze(-1),
+                bbox=torch.sigmoid(self.grounding_bbox(state)),
+                side_logits=self.grounding_side(state),
+                prompt_logits=self.grounding_prompt(state).squeeze(-1),
+                reachable_logits=self.grounding_reachable(state).squeeze(-1),
+            )
+            phase = self.camera_control_phase(state)
+            target = self.camera_control_target_id(state)
+            steering = self.camera_control_steering(state)
+            path = self.camera_control_path(state)
+            fast = self.planner_from_predicted_state(state, slow, grounding,
+                                                     (phase, target, steering, path))
+        # desired_turn is deliberately an alias of the planner h0 output:
+        # human intent labels therefore supervise the camera that deployment
+        # will execute, rather than an auxiliary, disconnected classifier.
+        control = CameraControlOutput(
+            phase_logits=phase, target_id_logits=target, steering_logits=steering,
+            path_logits=path, desired_turn_dx_logits=fast.camera_dx_logits[:, 0],
+            desired_turn_dy_logits=fast.camera_dy_logits[:, 0],
+        )
+        return VisualExpertOutput(fast=fast, slow=slow, feature=state,
+                                  grounding=grounding, camera_control=control)
+
+    def set_interact_event_bias(self, bias: torch.Tensor) -> None:
+        bias = bias.detach().to(device=self.interact_event_bias.device,
+                                dtype=self.interact_event_bias.dtype).reshape(-1)
+        if bias.shape != self.interact_event_bias.shape or not bool(torch.isfinite(bias).all()):
+            raise ValueError(f"interact event bias 必须是有限 [{self.planner.horizon}] Tensor")
+        with torch.no_grad():
+            self.interact_event_bias.copy_(bias)
+
+    def set_ordinary_button_bias(self, bias: torch.Tensor) -> None:
+        bias = bias.detach().to(device=self.ordinary_button_bias.device,
+                                dtype=self.ordinary_button_bias.dtype)
+        if bias.shape != self.ordinary_button_bias.shape or not bool(torch.isfinite(bias).all()):
+            raise ValueError(f"ordinary button bias 必须是有限 [{self.planner.horizon},5] Tensor")
+        with torch.no_grad():
+            self.ordinary_button_bias.copy_(bias)

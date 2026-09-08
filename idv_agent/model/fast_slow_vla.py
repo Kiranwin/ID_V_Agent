@@ -28,7 +28,7 @@ from idv_agent.model.vla_heads import (
     FiLMConditioner,
     SlowVLAHead,
     SlowVLAOutput,
-    VisualActionExpert,
+    StateDecisionExpert,
     VisualExpertOutput,
 )
 from idv_agent.vla.action_chunk import INTENTS
@@ -142,7 +142,11 @@ class SharedFastSlowVLA(nn.Module):
         self.fast_visual_residual = nn.Linear(frame_feature_dim, temporal_dim)
         self.slow_head = SlowVLAHead(temporal_dim)
         self.fast_head = FastVLAHead(temporal_dim, history_action_dim=history_action_dim)
-        self.visual_expert = VisualActionExpert(frame_feature_dim, temporal_dim)
+        # m28: the deployed branch is a state-conditioned joint planner.
+        # ``visual_expert`` is kept as the attribute name to preserve the
+        # calibration/checkpoint plumbing, but it is no longer m27's parallel
+        # direct-head implementation.
+        self.visual_expert = StateDecisionExpert(frame_feature_dim, temporal_dim)
         self.prior_scale = 0.1
         # m26 camera decisions are visual-only.  The temporal/history branch
         # remains diagnostic and cannot alter deployed camera logits.
