@@ -67,7 +67,10 @@ YOLO 框可作为标注工具和辅助字段，但模型推理不能强依赖 YO
 
 ### 阶段 ACT · VLA 动作块监督
 
-ACT 长期协议应加载 VG 阶段输出的 `M2_VG`；但现行临时协议因 M2_VG 已知问题从基础 Qwen 初始化，禁止加载 M2，并将 `initialization=base_without_m2` 写入 manifest。训练仍只优化 `slow_temporal`/`fast_temporal`、FiLM、Slow Head 和 Fast Head。完整协议见 [17-三阶段训练继承协议.md](17-三阶段训练继承协议.md)。
+长期协议可评估加载 VG 阶段输出的 `M2_VG`；但当前 M2/VG 有已知质量问题，ACT 一律从
+基础 Qwen 初始化，禁止传 `--init-checkpoint`，并在 manifest 记录
+`base_without_m2`。ACT 优化视觉 action expert、控制辅助头和 fast/slow 头；部署不读取
+任何标注 JSONL。完整数据契约见 [03-数据格式.md](03-数据格式.md) §7。
 
 在继承后的模型上训练因果动作块：
 
@@ -76,8 +79,57 @@ ACT 长期协议应加载 VG 阶段输出的 `M2_VG`；但现行临时协议因 
 → 4 步 move_dir / camera buckets / buttons / duration
 ```
 
-动作训练只使用通过对齐校验的新 `vla_raw` session。标准模式先训练 M0，其他模式
-在固定 M0 上训练 LoRA。第一版不做 PPO 或在线探索。
+动作训练只使用通过对齐校验的新 `vla_raw` session。当前协议训练与执行只消费第 0 个
+未来宏动作（6 帧约 200ms），然后重新观察；模型保留四步输出张量仅为 shape 兼容。
+标准模式先训练 M0，其他模式在固定 M0 上训练 LoRA。第一版不做 PPO 或在线探索。
+
+#### 当前 ACT 训练输入（MVP）
+
+训练前必须运行 `audit_mvp_training_data`；它验证 v5 schema、时间对齐、整 session split、
+control replay 与 canonical h0 同源、以及权重统计来源。当前 canonical 数据为：
+
+```text
+data/mvp_vla_v5_event_centered_decision_label_v3_rebucket675
+  train: 732 chunks / 79 sessions
+  val:   182 chunks / 20 sessions
+```
+
+训练标签分三层，不能混写：
+
+1. `slow_label + action_chunk[h0]` 是不可变的 Raw Input 行为复刻；相机 bucket 与执行器
+   像素查表同源。
+2. `act_grounding_annotations.jsonl` 是训练期画面事实辅助真值；缺标行使用 mask，不视为
+   no-cipher 负例。
+3. `camera_control_{train,val}.*.annotated.jsonl` 是训练期镜头意图辅助真值；train 与 val
+   文件必须显式分开，模型只消费预测 logits，runtime 不读取 sidecar。
+
+主类损失采用每头独立、训练集 h0 统计的 inverse-sqrt 权重：`clip(w, 0.35, 3.0)`，
+每头均值归一化为 1。控制六头同样独立平衡，六个 CE 先取均值，再由单一
+`camera_control_loss_weight` 调节相对强度；不得对所有头做全局归一化。
+
+图像增强只在训练加载期间启用，验证/部署/feature cache 路径恒为原图。一个 8 帧窗口
+共享同一组 hue、saturation、brightness、contrast、translate 参数，避免伪造时序变化；
+启用 `--image-augmentation` 时禁止 `--raw-feature-cache`。
+
+当前完整训练调用的核心形状如下（按 checkpoint 路径替换）：
+
+```powershell
+python -m idv_agent.scripts.train_vla `
+  --data data/mvp_vla_v5_event_centered_decision_label_v3_rebucket675/train `
+  --val-data data/mvp_vla_v5_event_centered_decision_label_v3_rebucket675/val `
+  --grounding-annotations data/mvp_act_grounding_pool_v1/act_grounding_annotations.jsonl `
+  --val-grounding-annotations data/mvp_act_grounding_pool_v1/act_grounding_annotations.jsonl `
+  --camera-control-annotations data/mvp_act_grounding_pool_v1/camera_control_train.v2.rebucket675.annotated.jsonl `
+  --val-camera-control-annotations data/mvp_act_grounding_pool_v1/camera_control_val.v2.rebucket675.annotated.jsonl `
+  --grounding-annotated-fraction 0.50 `
+  --camera-control-annotated-fraction 0.35 `
+  --execution-horizon 1 --camera-prior-scale 0 `
+  --class-balance --image-augmentation
+```
+
+control 行是 grounding 行的严格子集。上述联合采样把 control / other-grounding / ordinary
+ACT 的目标 draw mass 固定为 `0.35 / 0.15 / 0.50`，而不是让 48 条 control 行被 128 条
+grounding 行稀释成约 18.75%。这提高标签曝光，不代表 48 条已足够泛化。
 
 ## 3. 资源与部署约束
 

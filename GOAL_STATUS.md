@@ -231,6 +231,50 @@ run the 46-row semantic-control report, the full four-condition
 visual-dependency gate, category/over-action acceptance, then sandbox dry-run
 only if every offline criterion passes.  `--send-input` remains disabled.
 
+## Data-to-Training Contract Consolidation (2026-09-08)
+
+The data pipeline and labels were consolidated after the camera-supervision
+diagnosis.  The current single source of truth is `docs/03-数据格式.md` §7;
+`docs/00-当前状态.md` is the concise execution entrypoint and `docs/10`/`14`
+now describe ACT consumption and human annotation without carrying old v2 or
+48-pixel bucket guidance.
+
+The chain is deliberately split into three non-overwritable label layers:
+
+1. **Raw replay behavior**: `events.csv` plus `mouse_deltas.csv` share the
+   frame clock; `extract_session` produces `per_frame_actions.csv`; v5 sums
+   each future six-frame Raw Input window before bucketing.  `action_chunk`
+   and h0 `replay_camera_dx/dy` remain an immutable record of the human
+   demonstration.
+2. **Visual facts**: `act_grounding_annotations.jsonl` contains cipher box,
+   side, Q prompt and reachability.  The pool intentionally includes Q-neighbor
+   frames; only exact decision endpoints attach to an ACT row.  Missing labels
+   are masked, never silently converted to no-cipher negatives.
+3. **Visual control intent**: `camera_control_{train,val}.v2.rebucket675`
+   contains phase/target/steering/path/desired turn.  It is exact-endpoint
+   auxiliary supervision only.  It may differ from replay for detours or
+   recording-latency decisions but it never rewrites replay.  Deployment
+   consumes only the model's predicted logits, never sidecar JSONL.
+
+New command `idv_agent.scripts.audit_mvp_training_data` is the required
+fail-closed dataset readiness check.  It validates the complete v5 record
+contract, session-held-out split, grounding split membership, exact control
+endpoint and replay-h0 provenance, and h0 class-balance artifact convention.
+The real canonical audit passed and is saved at:
+
+`C:\Codespace\ID_V_Agent\reports\mvp_v5_rebucket675_training_data_audit.json`
+
+Evidence: train=732 chunks/79 sessions, val=182/20, zero session overlap;
+grounding=1,076/304 frames; control=48/46 complete rows; control replay
+matches canonical h0; h0 dx counts `[-2,-1,0,+1,+2]=[53,84,467,63,65]`; no
+audit errors.  Focused pipeline/label regression tests: **63 passed**.
+
+This proves the current artifacts are internally consistent, not that the
+48/46 control labels are sufficient to learn generalized obstacle navigation.
+The next data expansion must add independently held-out, fully labeled route
+examples (search, acquisition, left/right detours, approach, Q prompt) before
+claiming camera-control generalization.  No deployment authorization changes.
+
 ## Latest Evidence: m25 Loss-Scale Smoke
 
 | Item | Evidence |
