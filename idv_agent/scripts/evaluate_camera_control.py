@@ -17,7 +17,6 @@ from idv_agent.scripts.train_vla import (
     _dataset_paths,
     _load_act_base_backbone,
     _model_inputs,
-    _scheduled_condition,
     encode_batch,
 )
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
@@ -51,17 +50,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             condition = core.initial_condition(features.shape[0], device=device, mode_id=0)
             condition.mode_id = model_batch["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                slow = core(features, condition, valid_mask=model_batch["frame_valid_mask"],
-                            visual_frame_features=visual_features,
-                            history_actions=model_batch["history_actions"], run_slow=True)
-                if slow.slow is None:
-                    raise RuntimeError("camera-control evaluation requires slow output")
-                next_condition = _scheduled_condition(core, slow.slow, model_batch, teacher_forcing_ratio=0.0)
-                fast = core(features, next_condition, valid_mask=model_batch["frame_valid_mask"],
-                            visual_frame_features=visual_features,
-                            history_actions=model_batch["history_actions"], run_slow=False,
-                            detach_slow_condition=False)
-            control = fast.visual.camera_control if fast.visual is not None else None
+                output = core(features, condition, valid_mask=model_batch["frame_valid_mask"],
+                              visual_frame_features=visual_features,
+                              history_actions=model_batch["history_actions"], run_slow=False)
+            control = output.visual.camera_control if output.visual is not None else None
             if control is None:
                 raise RuntimeError("checkpoint lacks camera-control visual heads")
             values = {

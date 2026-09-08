@@ -535,6 +535,11 @@ class StateDecisionExpert(nn.Module):
             nn.GELU(),
             nn.LayerNorm(self.temporal_dim),
         )
+        # ``task_features`` is the per-frame task/mode projection produced by
+        # the backbone adapter (conditioned feature minus pure visual feature).
+        # It keeps instruction/mode available to m28 without letting the old
+        # FiLM/GRU diagnostic branch become a hidden action controller.
+        self.task_state_projection = nn.Linear(self.frame_feature_dim, self.temporal_dim, bias=False)
         self.slow = SlowVLAHead(self.temporal_dim, bias=False, direct=True)
         self.grounding_present = nn.Linear(self.temporal_dim, 1, bias=False)
         self.grounding_bbox = nn.Linear(self.temporal_dim, 4, bias=False)
@@ -651,13 +656,23 @@ class StateDecisionExpert(nn.Module):
         return fast
 
     def forward(self, frame_features: torch.Tensor,
-                valid_mask: Optional[torch.Tensor] = None) -> VisualExpertOutput:
+                valid_mask: Optional[torch.Tensor] = None,
+                task_features: Optional[torch.Tensor] = None) -> VisualExpertOutput:
         if frame_features.ndim == 2:
             frame_features = frame_features.unsqueeze(0)
+        if task_features is not None:
+            if task_features.ndim == 2:
+                task_features = task_features.unsqueeze(0)
+            if task_features.shape != frame_features.shape:
+                raise ValueError("task_features shape 必须与 frame_features 一致")
         pair = self.normalized_pair_features(frame_features, valid_mask=valid_mask)
         # Keep state/core arithmetic FP32 on Turing, as with m27 direct heads.
         with torch.autocast(device_type=pair.device.type, enabled=False):
             state = self.state_trunk((pair * self.visual_feature_scale).float())
+            if task_features is not None:
+                _first, last = self._valid_indices(frame_features, valid_mask)
+                rows = torch.arange(frame_features.shape[0], device=frame_features.device)
+                state = state + self.task_state_projection(task_features[rows, last].float())
             slow = self.slow(state)
             grounding = GroundingOutput(
                 present_logits=self.grounding_present(state).squeeze(-1),

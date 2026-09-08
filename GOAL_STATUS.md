@@ -77,16 +77,17 @@ checkpoint as deployable merely because its training loss decreases.
 - Camera labels are v5 Raw Input replay labels using the shared pixel bucket
   convention and executor lookup table. Training labels and deployed pixel
   commands remain same-source.
-- The deployed ACT path is the history-free `VisualActionExpert`; temporal
-  history is diagnostic/prior-only and cannot replace visual move, camera, or
-  intent logits. m26 camera is visual-only with `camera_prior_scale=0`.
-- m22 added **training-only** heads on the direct visual-pair feature for
-  cipher presence, normalized box, target side, interaction prompt, and
-  reachability. These heads never consume YOLO/runtime rules and deployment
-  never reads annotation JSONL.
+- The deployed ACT path is m28 `StateDecisionExpert`: ordered 8-frame spatial
+  visual features enter one shared State Trunk `z`; intent/subgoal, grounding,
+  phase/target/steering/path are predicted from `z`; one Joint Planner consumes
+  `z` plus its own soft predicted beliefs and emits move/camera/Q/duration.
+  Runtime never reads annotation JSONL or teacher-forced labels.
+- m28 camera prior is fixed to zero.  `desired_turn_dx/dy` aliases the planner
+  h0 camera logits, so human control labels supervise the action actually
+  eligible for execution.  Replay camera remains immutable behavior evidence.
 - Checkpoint schema for the next ACT run is
-  `m26_act.visual_camera_no_prior.v1`. m19/m22/m23/m24/m25 checkpoints fail
-  closed for the current protocol and are not deployment candidates.
+  `m28_act.state_conditioned_joint_planner.v1`; every m27 and earlier
+  checkpoint fails closed and is historical evidence only.
 
 ## Latest Evidence: m23 Grounding-Balanced Training
 
@@ -221,15 +222,11 @@ control supervision fails unless the latter is supplied.  The next full run
 will use train-only control labels (48) and val-only control labels (46), with
 the 732/182 session split unchanged.
 
-### Next Concrete Action
+### Historical m27 Result — Superseded
 
-Run exactly one local foreground m27 full training from base Qwen, with
-`execution_horizon=1`, image augmentation, M2/VG disabled, joint control
-sampling `0.35`, grounding sampling `0.50`, 366 steps, batch 4, full 732/182
-data, and explicit train/validation auxiliary-label files.  After it exits,
-run the 46-row semantic-control report, the full four-condition
-visual-dependency gate, category/over-action acceptance, then sandbox dry-run
-only if every offline criterion passes.  `--send-input` remains disabled.
+The m27 checkpoint/results above remain useful evidence about sparse control
+coverage and replay ambiguity, but must not be retrained, evaluated as a
+candidate, or deployed.  m28 supersedes its parallel-head architecture.
 
 ## Data-to-Training Contract Consolidation (2026-09-08)
 
@@ -339,8 +336,57 @@ share the state trunk with verified nonzero gradients, (2) inference uses the
 same all-predicted soft state path as training, (3) state-ablation/shuffle with
 images held constant measurably degrades annotated desired-turn/move/Q metrics,
 (4) image zero/shuffle and current visual gates still pass, and (5) h0 camera
-is sourced from the planner actually executed.  This is a design decision,
-not implemented yet; m27 and all current checkpoints remain fail-closed.
+is sourced from the planner actually executed.  The architecture is implemented;
+GPU smoke, full training and deployment evidence are not.  All existing
+checkpoints remain fail-closed.
+
+### m28 post-implementation architecture review
+
+The shared State Trunk fixes the m27 parallel-head disconnection: action loss
+now reaches state/intent/steering and `desired_turn` is the actual h0 camera
+logit.  It does **not** yet prove full control closure:
+
+1. Joint Planner has one shared hidden/state input, but its final move/camera/Q
+   outputs are still factorized linear heads.  Add joint-action acceptance for
+   `move+turn`, `path_follow+move`, and `prompt -> camera=0 + Q`; independent
+   head accuracy is insufficient.
+2. The action-history vector is intentionally excluded from the m28 deployed
+   planner to prevent action-autocorrelation shortcuts.  No current learned
+   body-velocity/belief memory exists; do not add it until continuous decision
+   sequence data and image/history ablations can prove it improves control
+   rather than recreating a prior shortcut.
+3. Raw v5 timestamps prove offline capture/action-label ordering, but runtime
+   does not yet record `capture -> inference -> command send -> next capture`.
+   The first m28 smoke must add a dry-run timing trace before claiming that
+   `action_delay_frames=1` represents actual deployment latency.
+4. Reports proposing discrete diffusion, CFG, Top-k randomness, VQ-VAE action
+   primitives, filtering raw replay, physical-engine constraints, or IRL are
+   explicitly deferred.  We lack verified game physics/reward/continuous
+   state, and stochasticity would worsen safe h0/Q control.  Their applicable
+   insight is state-conditioned joint action plus measured rolling timing.
+
+### m28 alignment repair after full architecture review
+
+The second review found and repaired a hidden m27 compatibility path that
+would otherwise invalidate the m28 claim.  `StateDecisionExpert` originally
+received only pure visual features while task/mode flowed through the old
+FiLM/SlowCondition diagnostic branch.  `ACTPolicy` also ran that old slow loop
+every second and logged its intent, despite the m28 planner not consuming it.
+
+The deployed path is now one pass everywhere: adapter task/mode projection is
+explicitly computed as `conditioned_visual - pure_visual` and projected into
+the m28 State Trunk; runtime no longer runs or logs a SlowCondition loop;
+it logs predicted state intent/phase/steering from the same planner pass that
+produces h0.  Training, standard evaluation, visual-dependency evaluation,
+camera-control evaluation, feature-activity evaluation, zero-camera diagnosis,
+ACT diagnosis, and realtime benchmark were all changed from two-pass legacy
+SlowCondition calls to the same one-pass m28 call.  The realtime benchmark
+now reports `planner_ticks`, not a fictitious independent slow tick.
+
+Regression evidence: **109 passed** across m28 planner, deployment, temporal
+compatibility, benchmark, executor, data and checkpoint contracts.  This
+repairs input/decision-path consistency; it does not replace the still-required
+dry-run timestamp trace, GPU smoke, full train, or MVP gates.
 
 ## Latest Evidence: m25 Loss-Scale Smoke
 

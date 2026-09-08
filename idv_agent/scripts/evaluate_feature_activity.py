@@ -15,7 +15,7 @@ from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import (
     _dataset_paths, _evaluation_stratified_subset, _load_act_base_backbone, _model_inputs,
-    _scheduled_condition, encode_batch,
+    encode_batch,
 )
 from idv_agent.training.feature_activity import feature_activity_gate, summarize_feature_activity
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
@@ -47,17 +47,9 @@ def _decision_pass(adapter, core: SharedFastSlowVLA, batch: dict[str, Any], *,
     condition = core.initial_condition(features.shape[0], device=device, mode_id=0)
     condition.mode_id = model_batch["mode_id"]
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-        slow_pass = core(features, condition, valid_mask=model_batch["frame_valid_mask"],
+        fast_pass = core(features, condition, valid_mask=model_batch["frame_valid_mask"],
                          visual_frame_features=visual_features,
-                         history_actions=model_batch["history_actions"], run_slow=True)
-        if slow_pass.slow is None:
-            raise RuntimeError("feature activity 需要 slow output")
-        next_condition = _scheduled_condition(core, slow_pass.slow, model_batch,
-                                              teacher_forcing_ratio=0.0)
-        fast_pass = core(features, next_condition, valid_mask=model_batch["frame_valid_mask"],
-                         visual_frame_features=visual_features,
-                         history_actions=model_batch["history_actions"], run_slow=False,
-                         detach_slow_condition=False)
+                         history_actions=model_batch["history_actions"], run_slow=False)
     fast = fast_pass.fast
     logits = torch.cat((fast.move_logits.flatten(1), fast.camera_dx_logits.flatten(1),
                         fast.camera_dy_logits.flatten(1), fast.button_logits.flatten(1),

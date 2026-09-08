@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 from idv_agent.scripts.train_vla import (
-    _dataset_paths, _load_act_base_backbone, _model_inputs, _scheduled_condition,
+    _dataset_paths, _load_act_base_backbone, _model_inputs,
     encode_batch,
 )
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
@@ -104,17 +104,9 @@ def _collect(data: str, *, adapter: torch.nn.Module, core: SharedFastSlowVLA,
             condition = core.initial_condition(features.shape[0], device=device, mode_id=0)
             condition.mode_id = model_batch["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-                slow_pass = core(features, condition, valid_mask=model_batch["frame_valid_mask"],
+                fast_pass = core(features, condition, valid_mask=model_batch["frame_valid_mask"],
                                  visual_frame_features=visual_features,
-                                 history_actions=model_batch["history_actions"], run_slow=True)
-                if slow_pass.slow is None:
-                    raise RuntimeError("slow pass 未产生输出")
-                next_condition = _scheduled_condition(core, slow_pass.slow, model_batch,
-                                                      teacher_forcing_ratio=0.0)
-                fast_pass = core(features, next_condition, valid_mask=model_batch["frame_valid_mask"],
-                                 visual_frame_features=visual_features,
-                                 history_actions=model_batch["history_actions"], run_slow=False,
-                                 detach_slow_condition=False)
+                                 history_actions=model_batch["history_actions"], run_slow=False)
             mask = model_batch["fast_loss_mask"].bool()
             logits_rows.append(fast_pass.fast.camera_dx_logits[:, 0].float().cpu()[mask.cpu()])
             target_rows.append(model_batch["camera_dx_target"][:, 0].long().cpu()[mask.cpu()])

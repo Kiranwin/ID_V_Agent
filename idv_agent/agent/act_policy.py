@@ -1,4 +1,4 @@
-"""Runtime ACT policy: cached visual features, slow condition, and chunks."""
+"""Runtime m28 ACT policy: cached visual state and causal h0 chunks."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import torch
 
 from idv_agent.agent.act_action_executor import ACTActionChunkExecutor
 from idv_agent.agent.act_scheduler import ACTChunkScheduler
-from idv_agent.model.fast_slow_vla import SharedFastSlowVLA, SlowCondition
+from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 from idv_agent.model.temporal import FrameFeatureCache, TaskConditionCache
 from idv_agent.vla.action_chunk import BUTTON_NAMES, CAMERA_BUCKETS, INTENTS, MACRO_FRAMES, MOVE_DIRECTIONS
 from idv_agent.configs.game_mode import GAME_MODE_CHOICES
@@ -30,9 +30,10 @@ class ACTActionStep:
 class ACTPolicy:
     """A stateful inference policy for one ACT episode.
 
-    The backbone is called once per observed frame.  Both heads consume the
-    same rolling cache; fast predictions are fixed-rate and never interrupt an
-    active chunk.  ``send`` is normally ``ActionExecutor.execute``.
+    The backbone is called once per observed frame.  m28 derives state and the
+    joint action from the same rolling visual cache; only h0 is submitted and
+    never interrupts an active chunk.  ``send`` is normally
+    ``ActionExecutor.execute``.
     """
 
     def __init__(self, adapter: Any, core: SharedFastSlowVLA, *, instruction: str,
@@ -72,14 +73,15 @@ class ACTPolicy:
         self.window_span = (self.history_frames - 1) * self.history_stride + 1
         self.features = FrameFeatureCache(max_length=self.window_span)
         self.visual_features = FrameFeatureCache(max_length=self.window_span)
-        # ACT cold start is travel/observe, unlike the generic model default.
-        self.condition = core.initial_condition(1, device=self.device,
-                                                mode_id=self.mode_id,
+        # Kept solely for the core's legacy temporal diagnostics.  m28's
+        # deployed StateDecisionExpert receives task_features directly and
+        # does not read or update this condition.
+        self.condition = core.initial_condition(1, device=self.device, mode_id=self.mode_id,
                                                 intent_id=INTENTS.index("travel"))
         self.history_actions = torch.zeros((1, 72), dtype=torch.float32, device=self.device)
-        self._last_slow = 0.0
         self._prediction_count = 0
-        self.slow_period = 1.0 / float(slow_hz)
+        if slow_hz <= 0:
+            raise ValueError("slow_hz 必须为正数")
         self.executor = ACTActionChunkExecutor(
             send=send or (lambda _commands: None), capture_fps=capture_fps,
             tick_hz=fast_hz)
@@ -125,24 +127,6 @@ class ACTPolicy:
         self.visual_features.append(frame_index, timestamp_ns, visual_feature)
         return self.ready
 
-    def _run_slow_if_due(self, now: float) -> None:
-        if not self.ready or now - self._last_slow < self.slow_period:
-            return
-        values, deltas, valid = self._temporal_inputs()
-        visual_values, _, visual_valid = self._visual_temporal_inputs()
-        history = torch.zeros_like(self.history_actions) if self.zero_history else self.history_actions
-        with torch.inference_mode():
-            output = self.core(values.unsqueeze(0), self.condition,
-                               valid_mask=valid.unsqueeze(0), time_deltas=None if deltas is None else deltas.unsqueeze(0),
-                               visual_frame_features=visual_values.unsqueeze(0),
-                               history_actions=history, run_slow=True)
-        self.condition = self.core.condition_from_slow_output(output.slow,
-                                                               self.condition.mode_id)
-        self._last_slow = now
-        print(f"[act:slow] frame={self.features.latest().frame_index} "
-              f"intent={INTENTS[int(self.condition.intent_id[0])]} "
-              f"subgoal={int(self.condition.subgoal_id[0])}")
-
     def _predict_chunk(self, _feature: object) -> list[ACTActionStep]:
         values, deltas, valid = self._temporal_inputs()
         visual_values, _, visual_valid = self._visual_temporal_inputs()
@@ -153,6 +137,9 @@ class ACTPolicy:
                                visual_frame_features=visual_values.unsqueeze(0),
                                history_actions=history, run_slow=False)
         fast = output.fast
+        state_output = output.visual
+        if state_output is None:
+            raise RuntimeError("m28 ACT 需要 StateDecisionExpert 输出")
         moves = fast.move_logits.argmax(-1)[0].tolist()
         dxs = fast.camera_dx_logits.argmax(-1)[0].tolist()
         dys = fast.camera_dy_logits.argmax(-1)[0].tolist()
@@ -172,8 +159,12 @@ class ACTPolicy:
         chunk_text = ";".join(f"{MOVE_DIRECTIONS[s.move_dir]}/{s.camera_dx},{s.camera_dy}/"
                               f"{','.join(n for n,v in zip(BUTTON_NAMES,s.buttons) if v) or '-'}@{s.duration_frames}"
                               for s in steps)
+        intent = INTENTS[int(state_output.slow.intent_id[0])]
+        control = state_output.camera_control
+        phase = int(control.phase_logits.argmax(dim=-1)[0]) if control is not None else -1
+        steering = int(control.steering_logits.argmax(dim=-1)[0]) if control is not None else -1
         print(f"[act] pred={self._prediction_count} frame={latest.frame_index} "
-              f"intent={INTENTS[int(self.condition.intent_id[0])]} "
+              f"intent={intent} phase={phase} steering={steering} "
               f"move={MOVE_DIRECTIONS[first.move_dir]}({first.move_dir}) "
               f"camera=({first.camera_dx},{first.camera_dy}) "
               f"buttons={pressed} duration={first.duration_frames} "
@@ -196,11 +187,10 @@ class ACTPolicy:
         return values, None, valid
 
     def tick(self, *, now: float | None = None) -> bool:
-        """Run due slow/fast ticks. ``now`` is a monotonic seconds timestamp."""
+        """Run the due m28 state/planner tick. ``now`` is monotonic seconds."""
         if not self.ready:
             return False
         current = time.perf_counter() if now is None else float(now)
-        self._run_slow_if_due(current)
         latest = self.features.latest()
         if latest is None:
             return False

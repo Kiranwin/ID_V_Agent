@@ -231,18 +231,17 @@ def run(args: argparse.Namespace) -> dict:
     visual_window = RealtimeWindow(window_span)
     condition = core.initial_condition(1, device=device, mode_id=0)
     condition.mode_id = torch.tensor([0], dtype=torch.long, device=device)
-    slow_period = 1.0 / args.slow_hz
     fast_period = 1.0 / args.fast_hz
     start_time = time.perf_counter()
-    next_fast = next_slow = start_time
-    captures = encoded = fast_ticks = slow_ticks = 0
-    timings = {"capture": [], "encode": [], "fast": [], "slow": [], "total": [], "feature_age": []}
+    next_fast = start_time
+    captures = encoded = fast_ticks = 0
+    timings = {"capture": [], "encode": [], "planner": [], "total": [], "feature_age": []}
     latest_frame = LatestFrameSlot()
     stop = Event()
     capture_done = Event()
     worker_error: list[BaseException] = []
     print(f"[act-realtime] dry_run=True device={device} capture_fps={args.capture_fps} "
-          f"fast_hz={args.fast_hz} slow_hz={args.slow_hz}")
+          f"planner_hz={args.fast_hz}")
     deadline = time.perf_counter() + args.seconds
     cfg = CaptureConfig(fps=args.capture_fps, region=args.region,
                         output_size=args.output_size, window_title=args.title)
@@ -307,48 +306,27 @@ def run(args: argparse.Namespace) -> dict:
     vision_thread = threading.Thread(target=vision_worker, name="act-vision", daemon=True)
     capture_thread.start()
     vision_thread.start()
-    next_fast = next_slow = time.perf_counter()
+    next_fast = time.perf_counter()
     while not stop.is_set() and time.perf_counter() < deadline:
         tick_start = time.perf_counter()
         now = time.perf_counter()
         latest_ts = window.latest_capture_time()
         if latest_ts is not None:
             timings["feature_age"].append(max(0.0, time.perf_counter() - latest_ts) * 1000)
-        if latest_ts is not None and now >= next_slow:
-            t0 = time.perf_counter()
-            if not window.ready(history_frames=args.history_frames,
-                               history_stride=args.history_stride):
-                timings["total"].append((time.perf_counter() - tick_start) * 1000)
-                time.sleep(0.001)
-                continue
-            features, valid, _ = window.snapshot_window(
-                history_frames=args.history_frames, history_stride=args.history_stride)
-            visual_features, _, _ = visual_window.snapshot_window(
-                history_frames=args.history_frames, history_stride=args.history_stride)
-            history = torch.zeros((1, 72), device=device, dtype=torch.float32)
-            with torch.inference_mode():
-                slow_pass = core(features, condition, valid_mask=valid,
-                                 visual_frame_features=visual_features,
-                                 history_actions=history, run_slow=True)
-            _sync(device)
-            timings["slow"].append((time.perf_counter() - t0) * 1000)
-            condition = core.condition_from_slow_output(slow_pass.slow, condition.mode_id)
-            slow_ticks += 1
-            while next_slow <= now:
-                next_slow += slow_period
         if latest_ts is not None and now >= next_fast:
             t0 = time.perf_counter()
             if not window.ready(history_frames=args.history_frames,
                                history_stride=args.history_stride):
                 continue
-            _, steps = _predict(core, window, condition, device, visual_window,
-                                history_frames=args.history_frames,
-                                history_stride=args.history_stride)
+            output, steps = _predict(core, window, condition, device, visual_window,
+                                     history_frames=args.history_frames,
+                                     history_stride=args.history_stride)
             _sync(device)
-            timings["fast"].append((time.perf_counter() - t0) * 1000)
+            timings["planner"].append((time.perf_counter() - t0) * 1000)
             fast_ticks += 1
+            intent = int(output.visual.slow.intent_id[0]) if output.visual is not None else -1
             print(f"[act:{fast_ticks}] frame={window.snapshot()[2][-1]} "
-                  f"condition_intent={int(condition.intent_id[0])} "
+                  f"state_intent={intent} "
                   f"step0={action_step_to_text(steps[0])}")
             while next_fast <= now:
                 next_fast += fast_period
@@ -358,7 +336,7 @@ def run(args: argparse.Namespace) -> dict:
         # capture thread and make the benchmark report zero captures.
         if latest_ts is None:
             time.sleep(0.001)
-        remaining = min(next_fast, next_slow, deadline) - time.perf_counter()
+        remaining = min(next_fast, deadline) - time.perf_counter()
         if remaining > 0:
             time.sleep(min(remaining, 0.005))
     stop.set()
@@ -374,8 +352,8 @@ def run(args: argparse.Namespace) -> dict:
         values = sorted(values)
         return {"n": len(values), "mean_ms": statistics.mean(values),
                 "p95_ms": values[max(0, int(len(values) * .95) - 1)], "max_ms": max(values)}
-    result = {"captures": captures, "encoded": encoded, "fast_ticks": fast_ticks,
-              "slow_ticks": slow_ticks, "device": str(device),
+    result = {"captures": captures, "encoded": encoded, "planner_ticks": fast_ticks,
+              "device": str(device),
               "checkpoint": str(Path(args.checkpoint).resolve()),
               "initialization": parent_manifest["stage"],
               "latency": {key: summarize(value) for key, value in timings.items()}}
@@ -394,7 +372,6 @@ def main(argv=None) -> int:
                    help="可选下采样尺寸，例如 640,384")
     p.add_argument("--capture-fps", type=int, default=30)
     p.add_argument("--fast-hz", type=float, default=15)
-    p.add_argument("--slow-hz", type=float, default=1)
     p.add_argument("--history-frames", type=int, default=ACT_HISTORY_FRAMES)
     p.add_argument("--history-stride", type=int, default=ACT_HISTORY_STRIDE)
     p.add_argument("--seconds", type=float, default=10)
@@ -407,7 +384,7 @@ def main(argv=None) -> int:
         if len(values) != 4:
             p.error("--region 需要 left,top,width,height")
         args.region = values
-    if args.seconds <= 0 or args.capture_fps <= 0 or args.fast_hz <= 0 or args.slow_hz <= 0:
+    if args.seconds <= 0 or args.capture_fps <= 0 or args.fast_hz <= 0:
         p.error("时间和频率参数必须为正数")
     if args.history_frames != ACT_HISTORY_FRAMES:
         p.error(f"ACT v5 必须使用 history_frames={ACT_HISTORY_FRAMES}")

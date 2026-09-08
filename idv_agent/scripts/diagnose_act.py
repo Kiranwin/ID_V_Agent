@@ -19,7 +19,7 @@ from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import (_contiguous_subset, _bounded_subset, _stratified_subset, _dataset_paths,
                                           _load_act_base_backbone, _model_inputs,
-                                          encode_batch, _scheduled_condition, _interact_event_metrics)
+                                          encode_batch, _interact_event_metrics)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
 from idv_agent.training.vla_loss import compute_vla_loss
@@ -75,15 +75,11 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
             condition = core.initial_condition(1, device=device, mode_id=0)
             condition.mode_id = mb["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                slow_pass = core(features, condition, valid_mask=mb["frame_valid_mask"],
-                                 history_actions=mb["history_actions"], run_slow=True)
-                next_condition = _scheduled_condition(core, slow_pass.slow, mb, teacher_forcing_ratio=0.0)
-                fast_pass = core(features, next_condition, valid_mask=mb["frame_valid_mask"],
-                                 history_actions=mb["history_actions"], run_slow=False,
-                                 detach_slow_condition=False)
-                losses = compute_vla_loss(fast_pass.fast, slow_pass.slow, mb)
+                fast_pass = core(features, condition, valid_mask=mb["frame_valid_mask"],
+                                 history_actions=mb["history_actions"], run_slow=False)
+                losses = compute_vla_loss(fast_pass.fast, fast_pass.slow, mb)
             intent_target = int(mb["intent_target"][0])
-            intent_pred = int(slow_pass.slow.intent_logits.argmax(-1)[0])
+            intent_pred = int(fast_pass.slow.intent_logits.argmax(-1)[0])
             # Only rows with slow_loss_mask=1 contribute to the slow loss.
             # Counting every valid intent here would dilute CE by the ~90%
             # of chunks deliberately skipped by the low-frequency slow tick.

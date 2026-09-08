@@ -64,7 +64,10 @@ def test_separated_forward_produces_valid_outputs():
         run_slow=False
     )
 
-    assert output_fast.slow is None
+    # m28 always exposes its visual state intent/subgoal in the same planner
+    # pass.  Only the legacy temporal diagnostic slow branch is absent here.
+    assert output_fast.slow is not None
+    assert output_fast.prior_slow is None
     assert output_fast.fast.move_logits.shape == (batch_size, 4, 9)
 
 

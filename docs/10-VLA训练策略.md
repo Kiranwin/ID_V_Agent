@@ -103,6 +103,11 @@ data/mvp_vla_v5_event_centered_decision_label_v3_rebucket675
 3. `camera_control_{train,val}.*.annotated.jsonl` 是训练期镜头意图辅助真值；train 与 val
    文件必须显式分开，模型只消费预测 logits，runtime 不读取 sidecar。
 
+m28 的唯一 deployed 动作路径是 `StateDecisionExpert`：完整有序视觉窗口先生成共享
+state `z`，从 `z` 预测 intent、grounding 和 navigation control；Joint Planner 再读取
+`z + soft(predicted state)` 联合生成 move/camera/Q。它不是使用标注真值的规则状态机，
+也不是把 `desired_turn` 作为独立、不会执行的旁路头。
+
 主类损失采用每头独立、训练集 h0 统计的 inverse-sqrt 权重：`clip(w, 0.35, 3.0)`，
 每头均值归一化为 1。控制六头同样独立平衡，六个 CE 先取均值，再由单一
 `camera_control_loss_weight` 调节相对强度；不得对所有头做全局归一化。
@@ -130,6 +135,22 @@ python -m idv_agent.scripts.train_vla `
 control 行是 grounding 行的严格子集。上述联合采样把 control / other-grounding / ordinary
 ACT 的目标 draw mass 固定为 `0.35 / 0.15 / 0.50`，而不是让 48 条 control 行被 128 条
 grounding 行稀释成约 18.75%。这提高标签曝光，不代表 48 条已足够泛化。
+
+### m28 的时序与耦合边界
+
+两份实时控制架构审查带来的可执行约束是：实时控制先是观测—状态—动作的闭环，而不是
+语言生成或随机采样问题。当前不引入离散扩散、CFG、Top-k、熵正则、VQ-VAE 或 IRL；
+这些方法不能修复错误的观测—动作对齐或稀缺的路径语义标签。
+
+- h0 是唯一可以执行的动作，固定 6 帧后必须重观测；训练、离线指标和 executor 都以此为准。
+- 需要记录并验收实际 `capture_ts → inference_start/end → command_send → first_post_action_capture`
+  时延；`action_delay_frames=1` 是数据构建约定，不是部署延迟已被证明相等。
+- move/camera 当前由同一 planner state 生成，但最后仍是多个 factorized output head；
+  因此 smoke 必须增加联合动作验收（前进+左右转、path_follow+移动、Q prompt 时停转+Q），
+  不能只看各头独立 accuracy。
+- 当前 m28 不把 action history 作为 deployed planner 的主输入，避免历史复读捷径；若要
+  加入上一已执行宏动作作为本体状态，必须单独做 history-zero/image-zero 消融，证明它没有
+  重新替代图像。
 
 ## 3. 资源与部署约束
 

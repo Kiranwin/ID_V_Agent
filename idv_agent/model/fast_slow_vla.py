@@ -213,7 +213,12 @@ class SharedFastSlowVLA(nn.Module):
         indices = self._last_valid_indices(frame_features, valid_mask)
         rows = torch.arange(frame_features.shape[0], device=frame_features.device)
         current_visual = frame_features[rows, indices]
-        visual = self.visual_expert(visual_frame_features, valid_mask=valid_mask)
+        # The task/mode projection is an explicit m28 State Trunk input.  Do
+        # not route task context through the old slow-condition feedback loop:
+        # that would reintroduce an unmeasured, low-rate action controller.
+        task_features = frame_features - visual_frame_features
+        visual = self.visual_expert(visual_frame_features, valid_mask=valid_mask,
+                                    task_features=task_features)
         slow_temporal = None
         if run_slow:
             slow_temporal = (self.slow_temporal(conditioned, valid_mask=valid_mask,
@@ -242,7 +247,11 @@ class SharedFastSlowVLA(nn.Module):
             interact_event_logits=visual.fast.interact_event_logits,
         )
         prior_slow = self.slow_head(slow_temporal) if run_slow and slow_temporal is not None else None
-        slow = visual.slow if prior_slow is not None else None
+        # m28 state intent/subgoal is part of every deployed planner pass. It
+        # must be available even when the legacy temporal diagnostic branch is
+        # disabled, otherwise callers are tempted to run a second old-style
+        # SlowCondition pass before every action.
+        slow = visual.slow
 
         # The deployment decision feature must include the independent visual
         # expert; diagnostics therefore cannot certify a prior-only GRU path.

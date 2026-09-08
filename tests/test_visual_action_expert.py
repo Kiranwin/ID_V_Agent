@@ -168,8 +168,8 @@ def test_rolling_execution_horizon_preserves_fast_loss_scale_by_action_coverage(
     assert torch.allclose(rolling["fast_move"], full["fast_move"] / 4.0)
 
 
-def test_visual_expert_can_use_pure_visual_features_separate_from_conditioned_prior():
-    """Task condition must not be part of the history-free visual branch."""
+def test_m28_task_features_condition_the_joint_planner_without_old_slow_loop():
+    """Task/mode must reach m28 state directly, not via SlowCondition feedback."""
     from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 
     torch.manual_seed(23)
@@ -181,8 +181,8 @@ def test_visual_expert_can_use_pure_visual_features_separate_from_conditioned_pr
     with torch.no_grad():
         first = core(conditioned_a, condition, visual_frame_features=pure, run_slow=False)
         second = core(conditioned_b, condition, visual_frame_features=pure, run_slow=False)
-    assert torch.equal(first.visual.fast.move_logits, second.visual.fast.move_logits)
-    assert torch.equal(first.visual.slow.intent_logits, second.visual.slow.intent_logits)
+    assert not torch.equal(first.visual.fast.move_logits, second.visual.fast.move_logits)
+    assert not torch.equal(first.visual.slow.intent_logits, second.visual.slow.intent_logits)
 
 
 def test_visual_expert_changes_when_only_pure_visual_features_change():

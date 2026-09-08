@@ -29,6 +29,23 @@ def test_act_policy_cold_start_uses_travel_and_waits_for_full_strided_window():
     assert policy.observe(1, frame_index=21, timestamp_ns=22) is True
 
 
+def test_m28_policy_does_not_run_legacy_slow_condition_loop(monkeypatch):
+    core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
+    policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard", device="cpu")
+    for i in range(22):
+        policy.observe(1, frame_index=i, timestamp_ns=i + 1)
+    calls = []
+    original = core.forward
+
+    def tracked(*args, **kwargs):
+        calls.append(bool(kwargs.get("run_slow", False)))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(core, "forward", tracked)
+    policy.tick(now=0.0)
+    assert calls == [False]
+
+
 def test_act_policy_alignment_controls_window_and_time_deltas():
     core = SharedFastSlowVLA(4, temporal_dim=8, history_action_dim=72)
     policy = ACTPolicy(_Adapter(), core, instruction="find", mode="standard",
@@ -96,6 +113,8 @@ def test_act_policy_logs_action_chunk_metadata(capsys):
     assert "pred=" in output
     assert "frame=" in output
     assert "intent=" in output
+    assert "phase=" in output
+    assert "steering=" in output
     assert "move=" in output
     assert "camera=" in output
     assert "buttons=" in output

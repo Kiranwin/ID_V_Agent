@@ -27,7 +27,6 @@ from idv_agent.scripts.train_vla import (
     _evaluation_stratified_subset,
     _load_act_base_backbone,
     _model_inputs,
-    _scheduled_condition,
     encode_batch,
 )
 from idv_agent.training.checkpoint_manifest import load_manifest
@@ -284,19 +283,10 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
             condition_state = core.initial_condition(features.shape[0], device=device, mode_id=0)
             condition_state.mode_id = model_batch["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                slow_pass = core(features, condition_state,
+                fast_pass = core(features, condition_state,
                                  valid_mask=model_batch["frame_valid_mask"],
                                  visual_frame_features=visual_features,
-                                 history_actions=model_batch["history_actions"], run_slow=True)
-                if slow_pass.slow is None:
-                    raise RuntimeError("slow pass 未产生 SlowVLAOutput")
-                next_condition = _scheduled_condition(core, slow_pass.slow, model_batch,
-                                                      teacher_forcing_ratio=0.0)
-                fast_pass = core(features, next_condition,
-                                 valid_mask=model_batch["frame_valid_mask"],
-                                 visual_frame_features=visual_features,
-                                 history_actions=model_batch["history_actions"], run_slow=False,
-                                 detach_slow_condition=False)
+                                 history_actions=model_batch["history_actions"], run_slow=False)
             sample_mask = model_batch["fast_loss_mask"] > 0
             # m25 executes a single six-frame macro action before observing a
             # new image.  Gate accuracy must assess exactly that deployed

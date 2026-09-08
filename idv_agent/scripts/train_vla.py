@@ -703,36 +703,18 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
     # mode for convenience, so replace it with the batched ids here.
     condition.mode_id = model_batch["mode_id"]
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-        # First pass updates the slow state from the current visual window.
-        slow_pass = core(frame_features, condition,
-                         valid_mask=model_batch["frame_valid_mask"],
-                         visual_frame_features=visual_frame_features,
-                         history_actions=model_batch["history_actions"], run_slow=True)
-        if slow_pass.slow is None:  # defensive; run_slow=True above is required
-            raise RuntimeError("slow pass 未产生 SlowVLAOutput")
-        # Second pass is the actual fast decision.  During training the
-        # discrete condition follows scheduled sampling; validation/inference
-        # uses ratio=0 and therefore consumes the slow prediction.
-        next_condition = _scheduled_condition(
-            core, slow_pass.slow, model_batch,
-            teacher_forcing_ratio=teacher_forcing_ratio,
-        )
-        fast_pass = core(frame_features, next_condition,
-                         valid_mask=model_batch["frame_valid_mask"],
-                         visual_frame_features=visual_frame_features,
-                         history_actions=model_batch["history_actions"], run_slow=False,
-                         detach_slow_condition=False)
-        output = FastSlowVLAOutput(
-            temporal_feature=fast_pass.temporal_feature,
-            fast=fast_pass.fast,
-            slow=slow_pass.slow,
-            visual=fast_pass.visual,
-            prior_fast=fast_pass.prior_fast,
-            prior_slow=slow_pass.prior_slow,
-        )
+        # m28 has one state-to-action pass.  The planner receives its own
+        # predicted soft beliefs inside StateDecisionExpert; labels never
+        # enter this call through scheduled sampling or SlowCondition.
+        output = core(frame_features, condition,
+                      valid_mask=model_batch["frame_valid_mask"],
+                      visual_frame_features=visual_frame_features,
+                      history_actions=model_batch["history_actions"], run_slow=False)
+        if output.slow is None or output.visual is None:
+            raise RuntimeError("m28 state/planner pass 未产生完整输出")
         loss_kwargs = {
             "visual_fast": output.visual.fast,
-            "visual_slow": slow_pass.visual.slow,
+            "visual_slow": output.visual.slow,
         }
         effective_weights = loss_weights
         if effective_weights is not None and getattr(core, "visual_only_deployment", False):
