@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from idv_agent.model.vla_heads import FastVLAOutput, GroundingOutput, SlowVLAOutput
+from idv_agent.model.vla_heads import CameraControlOutput, FastVLAOutput, GroundingOutput, SlowVLAOutput
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,14 @@ class VLALossWeights:
     grounding_side_global_counts: Optional[torch.Tensor] = None
     grounding_prompt_global_counts: Optional[torch.Tensor] = None
     grounding_reachable_global_counts: Optional[torch.Tensor] = None
+    camera_control: float = 1.0
+    camera_control_class_balance: bool = False
+    camera_control_phase_global_counts: Optional[torch.Tensor] = None
+    camera_control_target_id_global_counts: Optional[torch.Tensor] = None
+    camera_control_steering_global_counts: Optional[torch.Tensor] = None
+    camera_control_path_global_counts: Optional[torch.Tensor] = None
+    desired_turn_dx_global_counts: Optional[torch.Tensor] = None
+    desired_turn_dy_global_counts: Optional[torch.Tensor] = None
     # Deployment re-observes after this many six-frame actions.  Restrict fast
     # action supervision to exactly the actions that may be executed from the
     # current visual window; keep the 4-step default for legacy callers.
@@ -187,11 +195,44 @@ def compute_grounding_loss(grounding: GroundingOutput, batch: dict,
     return {"grounding_total": sum(losses.values()), **losses}
 
 
+def compute_camera_control_loss(control: CameraControlOutput, batch: dict,
+                                weights: VLALossWeights = VLALossWeights()) -> dict[str, torch.Tensor]:
+    """Masked human control semantics that supervise visual camera features."""
+    mask = batch["camera_control_mask"].to(control.phase_logits.device)
+    heads = (
+        ("camera_control_phase", control.phase_logits, "camera_control_phase_target",
+         weights.camera_control_phase_global_counts),
+        ("camera_control_target_id", control.target_id_logits, "camera_control_target_id_target",
+         weights.camera_control_target_id_global_counts),
+        ("camera_control_steering", control.steering_logits, "camera_control_steering_target",
+         weights.camera_control_steering_global_counts),
+        ("camera_control_path", control.path_logits, "camera_control_path_target",
+         weights.camera_control_path_global_counts),
+        ("desired_turn_dx", control.desired_turn_dx_logits, "desired_turn_dx_target",
+         weights.desired_turn_dx_global_counts),
+        ("desired_turn_dy", control.desired_turn_dy_logits, "desired_turn_dy_target",
+         weights.desired_turn_dy_global_counts),
+    )
+    losses: dict[str, torch.Tensor] = {}
+    for name, logits, target_name, global_counts in heads:
+        target = batch[target_name].to(device=logits.device, dtype=torch.long)
+        class_weight = None
+        if weights.camera_control_class_balance:
+            counts = _validated_global_counts(
+                global_counts, logits.shape[-1], f"{name}_global_counts",
+                torch.bincount(target.reshape(-1), minlength=logits.shape[-1]))
+            class_weight = balanced_class_weights(counts).to(device=logits.device, dtype=logits.dtype)
+        values = F.cross_entropy(logits, target, weight=class_weight, reduction="none")
+        losses[name] = _masked_mean(values, mask)
+    return {"camera_control_total": sum(losses.values()), **losses}
+
+
 def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
                      batch: dict, weights: VLALossWeights = VLALossWeights(), *,
                      visual_fast: Optional[FastVLAOutput] = None,
                      visual_slow: Optional[SlowVLAOutput] = None,
-                     grounding: Optional[GroundingOutput] = None) -> dict[str, torch.Tensor]:
+                     grounding: Optional[GroundingOutput] = None,
+                     camera_control: Optional[CameraControlOutput] = None) -> dict[str, torch.Tensor]:
     fast_mask = batch["fast_loss_mask"].to(fast.move_logits.device)
     requested_horizon = int(weights.execution_horizon)
     if requested_horizon < 1:
@@ -357,4 +398,14 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
         zero = fast.move_logits.sum() * 0.0
         losses.update({"grounding_total": zero, "grounding_present": zero, "grounding_bbox": zero,
                        "grounding_side": zero, "grounding_prompt": zero, "grounding_reachable": zero})
+    if camera_control is not None:
+        control_losses = compute_camera_control_loss(camera_control, batch, weights)
+        losses.update(control_losses)
+        total = total + weights.camera_control * control_losses["camera_control_total"]
+    else:
+        zero = fast.move_logits.sum() * 0.0
+        losses.update({"camera_control_total": zero, "camera_control_phase": zero,
+                       "camera_control_target_id": zero, "camera_control_steering": zero,
+                       "camera_control_path": zero, "desired_turn_dx": zero,
+                       "desired_turn_dy": zero})
     return {"total": total, **losses}

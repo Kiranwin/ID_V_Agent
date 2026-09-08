@@ -239,3 +239,50 @@ def test_grounding_sampling_weights_fail_when_requested_without_annotations():
 
     with pytest.raises(ValueError, match="没有带 grounding 标注"):
         _grounding_sampling_weights(Dataset(), annotated_fraction=0.5)
+
+
+def test_camera_control_index_requires_completed_semantic_label(tmp_path):
+    from idv_agent.training.vla_dataset import CameraControlAnnotationIndex
+
+    row = {
+        "schema_version": "act.camera_control_annotation.v2", "id": "ep_00000021",
+        "split": "train", "session": "ep", "frame": 21, "image_path": "frame.jpg",
+        "existing_grounding": {"cipher_bbox_xyxy_norm": None, "target_side": "none",
+                               "interact_prompt": 0, "cipher_reachable": 0},
+        "replay_camera_dx": -1, "replay_camera_dy": 0,
+        "camera_control_phase": "target_align", "camera_target_id": "target_cipher",
+        "camera_steering_mode": "path_follow", "path_strategy": "detour_right",
+        "desired_turn_dx": -1, "desired_turn_dy": 0, "status": "complete",
+    }
+    path = tmp_path / "control.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    index = CameraControlAnnotationIndex(path)
+    value = index.lookup("ep", 21)
+    assert value["camera_control_mask"].item() == 1
+    assert value["desired_turn_dx_target"].item() == 1  # bucket -1 -> index 1
+    assert value["camera_control_steering_target"].item() == 1  # path_follow
+    assert index.lookup("ep", 22)["camera_control_mask"].item() == 0
+
+
+def test_camera_control_loss_updates_visual_control_heads_and_masks_rows():
+    from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+    from idv_agent.training.vla_loss import VLALossWeights, compute_camera_control_loss
+
+    torch.manual_seed(12)
+    core = SharedFastSlowVLA(8, temporal_dim=12)
+    output = core(torch.randn(2, 3, 8), core.initial_condition(2), run_slow=False)
+    control = output.visual.camera_control
+    batch = {
+        "camera_control_mask": torch.tensor([1., 0.]),
+        "camera_control_phase_target": torch.tensor([2, 0]),
+        "camera_control_target_id_target": torch.tensor([0, 0]),
+        "camera_control_steering_target": torch.tensor([1, 0]),
+        "camera_control_path_target": torch.tensor([2, 0]),
+        "desired_turn_dx_target": torch.tensor([1, 0]),
+        "desired_turn_dy_target": torch.tensor([2, 0]),
+    }
+    losses = compute_camera_control_loss(control, batch, VLALossWeights())
+    assert torch.isfinite(losses["camera_control_total"])
+    losses["camera_control_total"].backward()
+    assert core.visual_expert.camera_control_steering.weight.grad is not None
+    assert torch.isfinite(core.visual_expert.camera_control_steering.weight.grad).all()

@@ -76,6 +76,7 @@ class VisualExpertOutput:
     slow: SlowVLAOutput
     feature: torch.Tensor
     grounding: Optional["GroundingOutput"] = None
+    camera_control: Optional["CameraControlOutput"] = None
 
 
 @dataclass
@@ -86,6 +87,17 @@ class GroundingOutput:
     side_logits: torch.Tensor
     prompt_logits: torch.Tensor
     reachable_logits: torch.Tensor
+
+
+@dataclass
+class CameraControlOutput:
+    """Visual-only predictions of human camera/path control semantics."""
+    phase_logits: torch.Tensor
+    target_id_logits: torch.Tensor
+    steering_logits: torch.Tensor
+    path_logits: torch.Tensor
+    desired_turn_dx_logits: torch.Tensor
+    desired_turn_dy_logits: torch.Tensor
 
 
 class FiLMConditioner(nn.Module):
@@ -289,6 +301,12 @@ class VisualActionExpert(nn.Module):
         self.grounding_side = nn.Linear(self.pair_dim, 4, bias=False)
         self.grounding_prompt = nn.Linear(self.pair_dim, 1, bias=False)
         self.grounding_reachable = nn.Linear(self.pair_dim, 1, bias=False)
+        self.camera_control_phase = nn.Linear(self.pair_dim, 4, bias=False)
+        self.camera_control_target_id = nn.Linear(self.pair_dim, 3, bias=False)
+        self.camera_control_steering = nn.Linear(self.pair_dim, 4, bias=False)
+        self.camera_control_path = nn.Linear(self.pair_dim, 4, bias=False)
+        self.desired_turn_dx = nn.Linear(self.pair_dim, len(CAMERA_BUCKETS), bias=False)
+        self.desired_turn_dy = nn.Linear(self.pair_dim, len(CAMERA_BUCKETS), bias=False)
         # Predicted grounding is a learned visual condition for camera only.
         # The five logits are produced from pixels by the modules above; this
         # path has no annotation/runtime input. Zero initialization keeps the
@@ -299,8 +317,15 @@ class VisualActionExpert(nn.Module):
             self.camera_grounding_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
         self.camera_grounding_dy = nn.Linear(
             self.camera_grounding_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        self.camera_control_dim = 4 + 3 + 4 + 4 + 2 * len(CAMERA_BUCKETS)
+        self.camera_control_dx = nn.Linear(
+            self.camera_control_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        self.camera_control_dy = nn.Linear(
+            self.camera_control_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
         nn.init.zeros_(self.camera_grounding_dx.weight)
         nn.init.zeros_(self.camera_grounding_dy.weight)
+        nn.init.zeros_(self.camera_control_dx.weight)
+        nn.init.zeros_(self.camera_control_dy.weight)
 
     @staticmethod
     def _valid_indices(frame_features: torch.Tensor,
@@ -350,6 +375,14 @@ class VisualActionExpert(nn.Module):
             prompt_logits=self.grounding_prompt(feature).squeeze(-1),
             reachable_logits=self.grounding_reachable(feature).squeeze(-1),
         )
+        camera_control = CameraControlOutput(
+            phase_logits=self.camera_control_phase(feature),
+            target_id_logits=self.camera_control_target_id(feature),
+            steering_logits=self.camera_control_steering(feature),
+            path_logits=self.camera_control_path(feature),
+            desired_turn_dx_logits=self.desired_turn_dx(feature),
+            desired_turn_dy_logits=self.desired_turn_dy(feature),
+        )
         camera = self.camera_summary(frame_features, valid_mask=valid_mask)
         batch = camera.shape[0]
         pair_dx = self.camera_visual_pair_dx(feature).view(
@@ -367,9 +400,18 @@ class VisualActionExpert(nn.Module):
             batch, self.fast.horizon, len(CAMERA_BUCKETS))
         grounding_dy = self.camera_grounding_dy(grounding_feature).view(
             batch, self.fast.horizon, len(CAMERA_BUCKETS))
-        fast.camera_dx_logits = pair_dx + summary_dx + grounding_dx
-        fast.camera_dy_logits = pair_dy + summary_dy + grounding_dy
-        return VisualExpertOutput(fast=fast, slow=slow, feature=feature, grounding=grounding)
+        control_feature = torch.cat((camera_control.phase_logits, camera_control.target_id_logits,
+                                     camera_control.steering_logits, camera_control.path_logits,
+                                     camera_control.desired_turn_dx_logits,
+                                     camera_control.desired_turn_dy_logits), dim=-1)
+        control_dx = self.camera_control_dx(control_feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        control_dy = self.camera_control_dy(control_feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        fast.camera_dx_logits = pair_dx + summary_dx + grounding_dx + control_dx
+        fast.camera_dy_logits = pair_dy + summary_dy + grounding_dy + control_dy
+        return VisualExpertOutput(fast=fast, slow=slow, feature=feature, grounding=grounding,
+                                  camera_control=camera_control)
 
     def set_interact_event_bias(self, bias: torch.Tensor) -> None:
         """Initialize only the independent one-shot interaction baseline."""

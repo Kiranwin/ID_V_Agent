@@ -29,7 +29,14 @@ from idv_agent.model.act_checkpoint import (
 )
 from idv_agent.model.qwen_backbone_adapter import load_qwen3vl_backbone
 from idv_agent.training.checkpoint_manifest import build_manifest, write_manifest
-from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
+from idv_agent.training.vla_dataset import (
+    CAMERA_CONTROL_PATH_TO_INDEX,
+    CAMERA_CONTROL_PHASE_TO_INDEX,
+    CAMERA_CONTROL_STEERING_TO_INDEX,
+    CAMERA_CONTROL_TARGET_TO_INDEX,
+    VLASequenceCollator,
+    VLASequenceDataset,
+)
 from idv_agent.training.image_augmentation import (
     apply_window_augmentation as _augment_image,
     sample_window_augmentation as _sample_image_augmentation_params,
@@ -514,8 +521,20 @@ def _model_inputs(batch: dict[str, Any], device: torch.device) -> dict[str, torc
             "slow_loss_mask", "fast_loss_mask", "frame_valid_mask", "history_actions",
             "grounding_mask", "grounding_present_target", "grounding_bbox_mask",
             "grounding_bbox_target", "grounding_side_target", "grounding_prompt_target",
-            "grounding_reachable_target")
-    return {key: batch[key].to(device) for key in keys}
+            "grounding_reachable_target", "camera_control_mask", "camera_control_phase_target",
+            "camera_control_target_id_target", "camera_control_steering_target",
+            "camera_control_path_target", "desired_turn_dx_target", "desired_turn_dy_target")
+    result = {key: batch[key].to(device) for key in keys if key in batch}
+    # Compatibility for diagnostic callers predating camera-control labels.
+    # Real VLASequenceCollator batches always carry these fields.
+    if "camera_control_mask" not in result:
+        batch_size = int(batch["mode_id"].shape[0])
+        result["camera_control_mask"] = torch.zeros(batch_size, device=device)
+        for key in ("camera_control_phase_target", "camera_control_target_id_target",
+                    "camera_control_steering_target", "camera_control_path_target",
+                    "desired_turn_dx_target", "desired_turn_dy_target"):
+            result[key] = torch.zeros(batch_size, dtype=torch.long, device=device)
+    return result
 
 
 def _drop_history_actions(history_actions: torch.Tensor, *, probability: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -671,10 +690,12 @@ def forward_loss(adapter, core, batch, *, device, amp_enabled: bool, loss_weight
             # this ACT schema; applying visual_aux would double its gradient.
             effective_weights = replace(effective_weights, visual_aux=0.0)
         losses = (compute_vla_loss(output.fast, output.slow, model_batch,
-                                   weights=effective_weights, grounding=output.visual.grounding, **loss_kwargs)
+                                   weights=effective_weights, grounding=output.visual.grounding,
+                                   camera_control=output.visual.camera_control, **loss_kwargs)
                   if effective_weights is not None else
                   compute_vla_loss(output.fast, output.slow, model_batch,
-                                   grounding=output.visual.grounding, **loss_kwargs))
+                                   grounding=output.visual.grounding,
+                                   camera_control=output.visual.camera_control, **loss_kwargs))
     return losses, output
 
 
@@ -731,6 +752,37 @@ def _grounding_class_balance_statistics(dataset) -> dict[str, torch.Tensor]:
         counts["side"][int(sample["grounding_side_target"])] += 1
     if annotated < 1:
         raise ValueError("grounding 类别平衡需要至少一个已标注训练样本")
+    return counts
+
+
+def _camera_control_class_balance_statistics(dataset) -> dict[str, torch.Tensor]:
+    """Count only complete human camera/path labels, independently per head."""
+    counts = {
+        "phase": torch.zeros(len(CAMERA_CONTROL_PHASE_TO_INDEX), dtype=torch.float32),
+        "target_id": torch.zeros(len(CAMERA_CONTROL_TARGET_TO_INDEX), dtype=torch.float32),
+        "steering": torch.zeros(len(CAMERA_CONTROL_STEERING_TO_INDEX), dtype=torch.float32),
+        "path": torch.zeros(len(CAMERA_CONTROL_PATH_TO_INDEX), dtype=torch.float32),
+        "desired_turn_dx": torch.zeros(5, dtype=torch.float32),
+        "desired_turn_dy": torch.zeros(5, dtype=torch.float32),
+    }
+    annotated = 0
+    fields = {
+        "phase": "camera_control_phase_target",
+        "target_id": "camera_control_target_id_target",
+        "steering": "camera_control_steering_target",
+        "path": "camera_control_path_target",
+        "desired_turn_dx": "desired_turn_dx_target",
+        "desired_turn_dy": "desired_turn_dy_target",
+    }
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        if not bool(sample["camera_control_mask"]):
+            continue
+        annotated += 1
+        for name, field in fields.items():
+            counts[name][int(sample[field])] += 1
+    if annotated < 1:
+        raise ValueError("camera-control 类别平衡需要至少一个完成标注")
     return counts
 
 
@@ -808,6 +860,28 @@ def _grounding_class_balance_manifest(statistics: dict[str, torch.Tensor], *,
             "act_schema": VLA_SCHEMA_VERSION_V5,
             "act_paths": [str(Path(path).resolve()) for path in data_paths],
             "grounding_annotations": str(Path(annotation_path).resolve()),
+            "annotated_sample_count": sample_count,
+        },
+        "heads": {
+            name: {"counts": values.tolist(), "weights": balanced_class_weights(values).tolist()}
+            for name, values in statistics.items()
+        },
+    }
+
+
+def _camera_control_class_balance_manifest(statistics: dict[str, torch.Tensor], *,
+                                           data_paths: list[str], annotation_paths: list[str],
+                                           sample_count: int) -> dict[str, object]:
+    """Persist human-control head tables with exact source provenance."""
+    return {
+        "method": "inverse_sqrt_clamped_mean1",
+        "clamp": [0.35, 3.0],
+        "normalized_per_head": True,
+        "computed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": {
+            "act_schema": VLA_SCHEMA_VERSION_V5,
+            "act_paths": [str(Path(path).resolve()) for path in data_paths],
+            "camera_control_annotations": [str(Path(path).resolve()) for path in annotation_paths],
             "annotated_sample_count": sample_count,
         },
         "heads": {
@@ -898,8 +972,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if args.init_checkpoint:
         raise ValueError("M2_VG 初始化当前已禁用；请不要传 --init-checkpoint")
     grounding_annotations = getattr(args, "grounding_annotations", "") or None
+    camera_control_annotations = [item.strip() for item in
+                                  str(getattr(args, "camera_control_annotations", "") or "").replace(";", ",").split(",")
+                                  if item.strip()]
     dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True,
-                                 grounding_annotations=grounding_annotations)
+                                 grounding_annotations=grounding_annotations,
+                                 camera_control_annotations=camera_control_annotations or None)
     sampling = getattr(args, "sampling", "uniform")
     if sampling not in ("uniform", "stratified"):
         raise ValueError("sampling 必须是 uniform 或 stratified")
@@ -941,7 +1019,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                              collate_fn=VLASequenceCollator(max_frames=8))
     val_paths = _dataset_paths(getattr(args, "val_data", None))
     val_dataset = (VLASequenceDataset(val_paths, verify_images=True,
-                                      grounding_annotations=grounding_annotations)
+                                      grounding_annotations=grounding_annotations,
+                                      camera_control_annotations=camera_control_annotations or None)
                    if val_paths else None)
     max_val_samples = int(getattr(args, "max_val_samples", 64) or 0)
     if val_dataset is not None and max_val_samples > 0:
@@ -969,6 +1048,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     class_balance_manifest = None
     grounding_class_balance_statistics = None
     grounding_class_balance_manifest = None
+    camera_control_class_balance_statistics = None
+    camera_control_class_balance_manifest = None
     button_global_counts = None
     if args.move_direction_balance:
         global_counts = torch.zeros(9, dtype=torch.float32)
@@ -990,6 +1071,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             grounding_class_balance_statistics, data_paths=_dataset_paths(args.data),
             annotation_path=grounding_annotations,
             sample_count=int(grounding_class_balance_statistics["present"].sum()))
+    if camera_control_annotations and float(getattr(args, "camera_control_loss_weight", 1.0)) > 0:
+        camera_control_class_balance_statistics = _camera_control_class_balance_statistics(dataset)
+        camera_control_class_balance_manifest = _camera_control_class_balance_manifest(
+            camera_control_class_balance_statistics, data_paths=_dataset_paths(args.data),
+            annotation_paths=camera_control_annotations,
+            sample_count=int(camera_control_class_balance_statistics["phase"].sum()))
     if getattr(args, "button_global_balance", False):
         button_global_counts = torch.zeros((6, 2), dtype=torch.float32)
         for index in range(len(dataset)):
@@ -1020,6 +1107,20 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                                                                    if grounding_class_balance_statistics else None),
                                    grounding_reachable_global_counts=(grounding_class_balance_statistics["reachable"]
                                                                       if grounding_class_balance_statistics else None),
+                                   camera_control=float(getattr(args, "camera_control_loss_weight", 1.0)),
+                                   camera_control_class_balance=camera_control_class_balance_statistics is not None,
+                                   camera_control_phase_global_counts=(camera_control_class_balance_statistics["phase"]
+                                                                       if camera_control_class_balance_statistics else None),
+                                   camera_control_target_id_global_counts=(camera_control_class_balance_statistics["target_id"]
+                                                                           if camera_control_class_balance_statistics else None),
+                                   camera_control_steering_global_counts=(camera_control_class_balance_statistics["steering"]
+                                                                          if camera_control_class_balance_statistics else None),
+                                   camera_control_path_global_counts=(camera_control_class_balance_statistics["path"]
+                                                                      if camera_control_class_balance_statistics else None),
+                                   desired_turn_dx_global_counts=(camera_control_class_balance_statistics["desired_turn_dx"]
+                                                                  if camera_control_class_balance_statistics else None),
+                                   desired_turn_dy_global_counts=(camera_control_class_balance_statistics["desired_turn_dy"]
+                                                                  if camera_control_class_balance_statistics else None),
                                    execution_horizon=int(getattr(args, "execution_horizon", 1)))
 
     # Materialize the direct raw-grid feature contract before constructing the
@@ -1132,6 +1233,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"slow_subgoal={float(losses['slow_subgoal'].detach().cpu()):.4f} "
                 f"interact={interact_pred}/{interact_target} "
                 f"grounding={float(losses['grounding_total'].detach().cpu()):.4f} "
+                f"control={float(losses['camera_control_total'].detach().cpu()):.4f} "
                 f"move_nonstop_hit={move_hit:.3f} intent_pred={intent_pred} "
                 f"tf={_teacher_forcing_ratio(args, step - 1):.3f}", flush=True,
             )
@@ -1197,6 +1299,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "grounding_sampling": grounding_sampling,
                   "grounding_annotations": (str(Path(grounding_annotations).resolve())
                                              if grounding_annotations else None),
+                  "camera_control_loss_weight": float(getattr(args, "camera_control_loss_weight", 1.0)),
+                  "camera_control_annotations": [str(Path(path).resolve())
+                                                 for path in camera_control_annotations],
                   "prior_scale": float(core.prior_scale), "prior_logits_bounded": True,
                   "camera_prior_scale": float(core.camera_prior_scale),
                   "visual_input_center": visual_center,
@@ -1211,6 +1316,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "move_direction_balance": args.move_direction_balance,
                   "class_balance": class_balance_manifest,
                   "grounding_class_balance": grounding_class_balance_manifest,
+                  "camera_control_class_balance": camera_control_class_balance_manifest,
                   "image_augmentation": image_augmentation,
                   "global_move_counts": global_counts.tolist() if global_counts is not None else None,
                   "global_button_counts": button_global_counts.tolist() if button_global_counts is not None else None,
@@ -1720,6 +1826,10 @@ def main(argv=None) -> int:
                         help="训练期视觉 grounding 辅助 loss 权重；0 可用于消融")
     parser.add_argument("--grounding-annotated-fraction", type=float, default=0.0,
                         help="训练抽样中带 grounding 标注的目标比例；0 禁用，建议 0.5")
+    parser.add_argument("--camera-control-annotations", default="",
+                        help="逗号分隔的完成 camera-control JSONL；仅训练期辅助监督")
+    parser.add_argument("--camera-control-loss-weight", type=float, default=1.0,
+                        help="路径/转向语义辅助 loss 权重；0 禁用")
     parser.add_argument("--visual-center-samples", type=int, default=64,
                         help="从训练集分层抽取的 raw visual center 校准样本数")
     parser.add_argument("--move-stop-weight", type=float, default=0.5)

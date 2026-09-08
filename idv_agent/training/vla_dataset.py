@@ -19,6 +19,15 @@ SUBGOAL_SOURCE_WEIGHT = {"rule": 0.5, "human_override": 1.0, "unknown": 0.0}
 HISTORY_ACTION_WIDTH = 9  # move + camera dx/dy + six button states
 HISTORY_ACTION_STEPS = 8
 GROUNDING_SIDE_TO_INDEX = {"none": 0, "left": 1, "center": 2, "right": 3}
+CAMERA_CONTROL_ANNOTATION_SCHEMA = "act.camera_control_annotation.v2"
+CONTROL_PHASES = ("search", "target_acquire", "target_align", "hold")
+TARGET_IDS = ("target_cipher", "other_visible", "none")
+STEERING_MODES = ("target_center", "path_follow", "search_sweep", "hold")
+PATH_STRATEGIES = ("direct", "detour_left", "detour_right", "unknown")
+CAMERA_CONTROL_PHASE_TO_INDEX = {value: index for index, value in enumerate(CONTROL_PHASES)}
+CAMERA_CONTROL_TARGET_TO_INDEX = {value: index for index, value in enumerate(TARGET_IDS)}
+CAMERA_CONTROL_STEERING_TO_INDEX = {value: index for index, value in enumerate(STEERING_MODES)}
+CAMERA_CONTROL_PATH_TO_INDEX = {value: index for index, value in enumerate(PATH_STRATEGIES)}
 
 
 def _empty_grounding_targets() -> dict[str, torch.Tensor]:
@@ -32,6 +41,28 @@ def _empty_grounding_targets() -> dict[str, torch.Tensor]:
         "grounding_prompt_target": torch.tensor(0.0),
         "grounding_reachable_target": torch.tensor(0.0),
     }
+
+
+def _empty_camera_control_targets() -> dict[str, torch.Tensor]:
+    """Return masked training-only path/camera semantic supervision."""
+    return {
+        "camera_control_mask": torch.tensor(0.0),
+        "camera_control_phase_target": torch.tensor(0, dtype=torch.long),
+        "camera_control_target_id_target": torch.tensor(0, dtype=torch.long),
+        "camera_control_steering_target": torch.tensor(0, dtype=torch.long),
+        "camera_control_path_target": torch.tensor(0, dtype=torch.long),
+        "desired_turn_dx_target": torch.tensor(0, dtype=torch.long),
+        "desired_turn_dy_target": torch.tensor(0, dtype=torch.long),
+    }
+
+
+def _annotation_paths(paths: str | Path | Iterable[str | Path]) -> list[Path]:
+    if isinstance(paths, (str, Path)):
+        paths = [item.strip() for item in str(paths).replace(";", ",").split(",") if item.strip()]
+    resolved = [Path(path) for path in paths]
+    if not resolved:
+        raise ValueError("camera-control 标注路径为空")
+    return resolved
 
 
 class GroundingAnnotationIndex:
@@ -92,6 +123,62 @@ class GroundingAnnotationIndex:
         return _empty_grounding_targets()
 
 
+class CameraControlAnnotationIndex:
+    """Read completed human path/control annotations for visual ACT training.
+
+    The labels describe intended visual control and are never exposed to
+    runtime.  A record is keyed exactly by the v5 observation endpoint; h0
+    replay remains in the JSONL only as auditable evidence.
+    """
+
+    def __init__(self, paths: str | Path | Iterable[str | Path]):
+        # Import lazily: the preparer uses the training CLI for data discovery,
+        # while this dataset is imported by that CLI.  Loading is still fail
+        # closed before any annotation becomes a tensor.
+        from idv_agent.scripts.prepare_camera_control_annotations import validate as validate_camera_control_annotations
+
+        self.paths = _annotation_paths(paths)
+        self.rows: dict[tuple[str, int], dict[str, torch.Tensor]] = {}
+        for path in self.paths:
+            validate_camera_control_annotations(path, require_complete=True)
+            for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if not raw.strip():
+                    continue
+                try:
+                    row = json.loads(raw)
+                    session, frame = str(row["session"]), int(row["frame"])
+                    phase = CAMERA_CONTROL_PHASE_TO_INDEX[row["camera_control_phase"]]
+                    target = CAMERA_CONTROL_TARGET_TO_INDEX[row["camera_target_id"]]
+                    steering = CAMERA_CONTROL_STEERING_TO_INDEX[row["camera_steering_mode"]]
+                    path_target = CAMERA_CONTROL_PATH_TO_INDEX[row["path_strategy"]]
+                    dx = CAMERA_TO_INDEX[int(row["desired_turn_dx"])]
+                    dy = CAMERA_TO_INDEX[int(row["desired_turn_dy"])]
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(f"{path}:{line_no} camera-control 标注字段无效") from exc
+                if row.get("schema_version") != CAMERA_CONTROL_ANNOTATION_SCHEMA:
+                    raise ValueError(f"{path}:{line_no} camera-control schema 无效")
+                key = (session, frame)
+                if key in self.rows:
+                    raise ValueError(f"{path}:{line_no} camera-control 标注重复: {key}")
+                self.rows[key] = {
+                    "camera_control_mask": torch.tensor(1.0),
+                    "camera_control_phase_target": torch.tensor(phase, dtype=torch.long),
+                    "camera_control_target_id_target": torch.tensor(target, dtype=torch.long),
+                    "camera_control_steering_target": torch.tensor(steering, dtype=torch.long),
+                    "camera_control_path_target": torch.tensor(path_target, dtype=torch.long),
+                    "desired_turn_dx_target": torch.tensor(dx, dtype=torch.long),
+                    "desired_turn_dy_target": torch.tensor(dy, dtype=torch.long),
+                }
+        if not self.rows:
+            raise ValueError("camera-control 标注为空")
+
+    def lookup(self, session: str, observation_end_frame: int) -> dict[str, torch.Tensor]:
+        row = self.rows.get((str(session), int(observation_end_frame)))
+        if row is not None:
+            return {key: value.clone() for key, value in row.items()}
+        return _empty_camera_control_targets()
+
+
 class VLASequenceDataset(Dataset):
     """Read one or more v5 JSONL files without loading model-specific pixels.
 
@@ -102,7 +189,8 @@ class VLASequenceDataset(Dataset):
 
     def __init__(self, jsonl_paths: str | Path | Iterable[str | Path],
                  *, verify_images: bool = True,
-                 grounding_annotations: str | Path | None = None):
+                 grounding_annotations: str | Path | None = None,
+                 camera_control_annotations: str | Path | Iterable[str | Path] | None = None):
         if isinstance(jsonl_paths, (str, Path)):
             jsonl_paths = [jsonl_paths]
         self.records: list[tuple[Path, dict]] = []
@@ -133,6 +221,8 @@ class VLASequenceDataset(Dataset):
             raise ValueError("VLASequenceDataset 没有有效样本")
         self.grounding = (GroundingAnnotationIndex(grounding_annotations)
                           if grounding_annotations is not None else None)
+        self.camera_control = (CameraControlAnnotationIndex(camera_control_annotations)
+                               if camera_control_annotations is not None else None)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -188,6 +278,11 @@ class VLASequenceDataset(Dataset):
                                               int(record["alignment"]["observation_end_frame"])))
         else:
             item.update(_empty_grounding_targets())
+        if self.camera_control is not None:
+            item.update(self.camera_control.lookup(record["episode_id"],
+                                                   int(record["alignment"]["observation_end_frame"])))
+        else:
+            item.update(_empty_camera_control_targets())
         return item
 
 
@@ -219,6 +314,9 @@ class VLASequenceCollator:
             "grounding_mask", "grounding_present_target", "grounding_bbox_mask",
             "grounding_bbox_target", "grounding_side_target", "grounding_prompt_target",
             "grounding_reachable_target",
+            "camera_control_mask", "camera_control_phase_target",
+            "camera_control_target_id_target", "camera_control_steering_target",
+            "camera_control_path_target", "desired_turn_dx_target", "desired_turn_dy_target",
         )
         batch_dict = {key: torch.stack([sample[key] for sample in samples]) for key in tensor_keys}
         batch_dict.update({
