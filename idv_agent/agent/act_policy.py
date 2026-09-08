@@ -16,6 +16,7 @@ from idv_agent.model.temporal import FrameFeatureCache, TaskConditionCache
 from idv_agent.vla.action_chunk import BUTTON_NAMES, CAMERA_BUCKETS, INTENTS, MACRO_FRAMES, MOVE_DIRECTIONS
 from idv_agent.configs.game_mode import GAME_MODE_CHOICES
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
+from idv_agent.agent.mvp_closed_loop import ClosedLoopTraceWriter
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,10 @@ class ACTPolicy:
                  capture_fps: float = 30.0, fast_hz: float = 15.0,
                  slow_hz: float = 1.0, history_frames: int = 8, history_stride: int = 3,
                  max_feature_age_s: float = 0.5,
-                 use_time_deltas: bool = False, zero_history: bool = False):
+                 use_time_deltas: bool = False, zero_history: bool = False,
+                 closed_loop_trace: str | Path | None = None,
+                 closed_loop_episode_id: str | None = None,
+                 closed_loop_observer: Callable[[Any], dict[str, Any]] | None = None):
         if mode not in GAME_MODE_CHOICES:
             raise ValueError(f"未知模式: {mode}")
         if not instruction.strip():
@@ -65,6 +69,14 @@ class ACTPolicy:
         self.history_stride = int(history_stride)
         self.use_time_deltas = bool(use_time_deltas)
         self.zero_history = bool(zero_history)
+        self.closed_loop_observer = closed_loop_observer
+        self.closed_loop_trace = (ClosedLoopTraceWriter(closed_loop_trace,
+            episode_id=closed_loop_episode_id or f"act-{id(self)}")
+            if closed_loop_trace is not None else None)
+        self._latest_external_observation = None
+        self._pending_closed_loop = None
+        self._pending_closed_loop_action = None
+        self._last_observed_frame = -1
         self.interact_event_threshold = float(getattr(core, "interact_event_threshold", 0.0))
         if not torch.isfinite(torch.tensor(self.interact_event_threshold)):
             raise ValueError("core.interact_event_threshold 必须是有限数")
@@ -80,11 +92,12 @@ class ACTPolicy:
                                                 intent_id=INTENTS.index("travel"))
         self.history_actions = torch.zeros((1, 72), dtype=torch.float32, device=self.device)
         self._prediction_count = 0
+        self.last_run_stats: dict[str, Any] = {}
         if slow_hz <= 0:
             raise ValueError("slow_hz 必须为正数")
         self.executor = ACTActionChunkExecutor(
             send=send or (lambda _commands: None), capture_fps=capture_fps,
-            tick_hz=fast_hz)
+            tick_hz=fast_hz, on_step_applied=self._on_step_applied)
         self.scheduler = ACTChunkScheduler(
             predict=self._predict_chunk, executor=self.executor, fast_hz=fast_hz,
             max_feature_age_s=max_feature_age_s)
@@ -113,6 +126,10 @@ class ACTPolicy:
 
     def observe(self, image: Any, *, frame_index: int, timestamp_ns: int) -> bool:
         """Encode and cache one frame; return whether the history is warm."""
+        if self.closed_loop_observer is not None:
+            self._latest_external_observation = dict(self.closed_loop_observer(image))
+        self._last_observed_frame = int(frame_index)
+        self._flush_closed_loop(frame_index)
         with torch.inference_mode():
             encode_pair = getattr(self.adapter, "encode_frames_with_visual", None)
             if encode_pair is not None:
@@ -126,6 +143,34 @@ class ACTPolicy:
         self.features.append(frame_index, timestamp_ns, feature)
         self.visual_features.append(frame_index, timestamp_ns, visual_feature)
         return self.ready
+
+    def _on_step_applied(self, step: object) -> None:
+        if self.closed_loop_trace is None or self._latest_external_observation is None:
+            return
+        buttons = tuple(getattr(step, "buttons", (0,) * 6))
+        self._pending_closed_loop = (self._last_observed_frame,
+                                     dict(self._latest_external_observation))
+        self._pending_closed_loop_action = {
+            "move_dir": int(getattr(step, "move_dir", 0)),
+            "camera_dx": int(getattr(step, "camera_dx", 0)),
+            "camera_dy": int(getattr(step, "camera_dy", 0)),
+            "buttons": [int(v) for v in buttons],
+            "interact": int(buttons[0]) if buttons else 0,
+        }
+
+    def _flush_closed_loop(self, frame_index: int) -> None:
+        if self.closed_loop_trace is None or self._pending_closed_loop is None:
+            return
+        if self.closed_loop_observer is None:
+            return
+        start_frame, before = self._pending_closed_loop
+        if int(frame_index) < int(start_frame) + MACRO_FRAMES:
+            return
+        self.closed_loop_trace.append(before=before,
+                                     action=self._pending_closed_loop_action or {},
+                                     after=dict(self._latest_external_observation or {}))
+        self._pending_closed_loop = None
+        self._pending_closed_loop_action = None
 
     def _predict_chunk(self, _feature: object) -> list[ACTActionStep]:
         values, deltas, valid = self._temporal_inputs()
@@ -202,6 +247,9 @@ class ACTPolicy:
 
     def shutdown(self) -> None:
         self.scheduler.shutdown()
+        if self.closed_loop_trace is not None:
+            self.closed_loop_trace.close()
+            self.closed_loop_trace = None
 
     def run_capture(self, capture_config: CaptureConfig, *, duration_s: float,
                     max_frames: int | None = None) -> int:
@@ -213,6 +261,10 @@ class ACTPolicy:
         frame_interval = 1.0 / self.executor.capture_fps
         deadline = time.perf_counter() + float(duration_s)
         frame_count = 0
+        empty_grabs = 0
+        reused_frames = 0
+        started_at = time.perf_counter()
+        last_frame = None
         next_capture = time.perf_counter()
         try:
             with ScreenCapture(capture_config) as capture:
@@ -226,13 +278,31 @@ class ACTPolicy:
                     next_capture += frame_interval
                     frame = capture.grab()
                     if frame is None:
-                        continue
+                        empty_grabs += 1
+                        if last_frame is None:
+                            continue
+                        frame = last_frame
+                        reused_frames += 1
+                    else:
+                        last_frame = frame
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     timestamp_ns = time.perf_counter_ns()
                     self.observe(Image.fromarray(rgb), frame_index=frame_count,
                                   timestamp_ns=timestamp_ns)
-                    self.tick(now=timestamp_ns / 1_000_000_000.0)
+                    # The feature timestamp is the capture instant; tick at
+                    # the post-encode monotonic time so freshness and action
+                    # scheduling include inference latency.
+                    self.tick(now=time.perf_counter())
                     frame_count += 1
         finally:
             self.shutdown()
+            self.last_run_stats = {
+                "requested_duration_s": float(duration_s),
+                "elapsed_s": time.perf_counter() - started_at,
+                "processed_frames": int(frame_count),
+                "predictions": int(self._prediction_count),
+                "empty_grabs": int(empty_grabs),
+                "reused_frames": int(reused_frames),
+                "device": str(self.device),
+            }
         return frame_count

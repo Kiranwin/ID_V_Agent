@@ -20,7 +20,7 @@ from idv_agent.scripts.train_vla import (_contiguous_subset, _dataset_paths, _lo
                                           encode_batch, _model_inputs)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
-from idv_agent.training.vla_loss import compute_vla_loss
+from idv_agent.training.vla_loss import VLALossWeights, compute_vla_loss
 from idv_agent.vla.action_chunk import INTENTS
 
 
@@ -56,6 +56,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
     )
     core.interact_event_threshold = event_threshold
+    execution_horizon = int(act_manifest.get("training", {}).get("execution_horizon", 1))
+    if not 1 <= execution_horizon <= 4:
+        raise ValueError("checkpoint execution_horizon 必须在 1..4")
+    core.execution_horizon = execution_horizon
     adapter.eval()
     core.eval()
     frame_cache: dict[tuple[str, int, str], torch.Tensor] = {}
@@ -84,7 +88,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                               valid_mask=model_batch["frame_valid_mask"],
                               visual_frame_features=visual_features,
                               history_actions=model_batch["history_actions"], run_slow=False)
-                losses = compute_vla_loss(output.fast, output.slow, model_batch)
+                from dataclasses import replace
+                losses = compute_vla_loss(
+                    output.fast, output.slow, model_batch,
+                    weights=replace(VLALossWeights(), execution_horizon=execution_horizon),
+                )
             sample_mask = model_batch["fast_loss_mask"] > 0
             move_pred = output.fast.move_logits.argmax(-1)
             dx_pred = output.fast.camera_dx_logits.argmax(-1)
@@ -94,7 +102,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             dx_target = model_batch["camera_dx_target"]
             dy_target = model_batch["camera_dy_target"]
             button_target = model_batch["button_target"]
-            mask = sample_mask.unsqueeze(1).expand_as(move_target)
+            mask = sample_mask.unsqueeze(1).expand_as(move_target).clone()
+            mask[:, execution_horizon:] = False
             for index in range(9):
                 sums["move_pred_counts"][index] += int(((move_pred == index) & mask).sum())
                 sums["move_target_counts"][index] += int(((move_target == index) & mask).sum())

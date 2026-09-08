@@ -55,6 +55,17 @@ def test_chunk_executor_holds_step_across_fast_ticks():
     assert executor.active
 
 
+def test_chunk_executor_does_not_charge_pre_start_delay_to_new_step():
+    calls = []
+    executor = ACTActionChunkExecutor(send=lambda cmds: calls.extend(cmds),
+                                      capture_fps=30, tick_hz=15)
+    executor.submit([_step(move=1, duration=6)])
+    executor.tick(dt_s=0.25)
+    assert executor.active
+    assert sum(getattr(c, "kind", None) == "press" for c in calls) == 1
+    assert sum(getattr(c, "kind", None) == "release" for c in calls) == 0
+
+
 def test_chunk_executor_sends_interact_as_one_shot_tap_not_held_key():
     calls = []
     executor = ACTActionChunkExecutor(send=lambda cmds: calls.extend(cmds),

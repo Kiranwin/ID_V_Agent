@@ -11,6 +11,35 @@ import torch.nn.functional as F
 from idv_agent.model.vla_heads import CameraControlOutput, FastVLAOutput, GroundingOutput, SlowVLAOutput
 
 
+def gradient_attribution(losses: dict[str, torch.Tensor], modules: dict[str, torch.nn.Module],
+                         *, names: tuple[str, ...] | None = None) -> dict[str, dict[str, float]]:
+    """Measure per-loss gradient norm reaching named modules.
+
+    This is a read-only diagnostic over an already-built computation graph.
+    Each loss is differentiated independently with ``allow_unused=True``;
+    parameters are never updated.  It makes a shared-state gradient spike
+    attributable to a loss/module pair instead of a single aggregate norm.
+    """
+    selected = tuple(names or losses.keys())
+    result: dict[str, dict[str, float]] = {}
+    for loss_name in selected:
+        value = losses.get(loss_name)
+        if value is None or not value.requires_grad:
+            result[loss_name] = {module_name: 0.0 for module_name in modules}
+            continue
+        row: dict[str, float] = {}
+        for module_name, module in modules.items():
+            params = [parameter for parameter in module.parameters() if parameter.requires_grad]
+            gradients = torch.autograd.grad(value, params, retain_graph=True,
+                                            allow_unused=True) if params else ()
+            row[module_name] = float(torch.sqrt(sum(
+                gradient.detach().float().pow(2).sum() for gradient in gradients
+                if gradient is not None
+            )).cpu()) if any(gradient is not None for gradient in gradients) else 0.0
+        result[loss_name] = row
+    return result
+
+
 @dataclass(frozen=True)
 class VLALossWeights:
     move: float = 1.0
@@ -60,6 +89,10 @@ class VLALossWeights:
     camera_control_path_global_counts: Optional[torch.Tensor] = None
     desired_turn_dx_global_counts: Optional[torch.Tensor] = None
     desired_turn_dy_global_counts: Optional[torch.Tensor] = None
+    # On annotated decision frames the human control sidecar is the declared
+    # execution target.  Replay remains the target on unannotated rows, but
+    # must not compete with desired-turn supervision on the same logits.
+    camera_control_overrides_replay: bool = True
     # Deployment re-observes after this many six-frame actions.  Restrict fast
     # action supervision to exactly the actions that may be executed from the
     # current visual window; keep the 4-step default for legacy callers.
@@ -300,6 +333,10 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
                              weight=camera_dx_weight, reduction="none")
     cam_dy = F.cross_entropy(fast.camera_dy_logits.transpose(1, 2), batch["camera_dy_target"],
                              weight=camera_dy_weight, reduction="none")
+    camera_replay_mask = fast_mask
+    if camera_control is not None and weights.camera_control_overrides_replay:
+        control_mask = batch["camera_control_mask"].to(fast.camera_dx_logits.device)
+        camera_replay_mask = fast_mask * (1.0 - control_mask[:, None].clamp(0.0, 1.0))
     button_target = batch["button_target"].to(fast.button_logits.dtype)
     event_target = button_target[..., 0]
     ordinary_button_target = button_target[..., 1:]
@@ -336,7 +373,7 @@ def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],
         # factor is a global protocol normalization; class weights remain
         # head-local and their relative lambda is unchanged.
         "fast_move": _masked_mean(move, fast_mask) * (horizon / fast.move_logits.shape[1]),
-        "fast_camera": _masked_mean(cam_dx + cam_dy, fast_mask) * (horizon / fast.move_logits.shape[1]),
+        "fast_camera": _masked_mean(cam_dx + cam_dy, camera_replay_mask) * (horizon / fast.move_logits.shape[1]),
         "fast_buttons": _masked_mean(buttons, fast_mask) * (horizon / fast.move_logits.shape[1]),
         "fast_interact_event": _masked_mean(interact_event, fast_mask) * (horizon / fast.move_logits.shape[1]),
         "fast_duration": _masked_mean(duration, fast_mask) * (horizon / fast.move_logits.shape[1]),

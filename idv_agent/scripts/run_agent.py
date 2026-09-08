@@ -44,6 +44,18 @@ def build_policy(args, device):
     if args.mode == "act":
         if not args.act_checkpoint:
             raise ValueError("ACT 模式必须提供 --act-checkpoint")
+        closed_loop_observer = None
+        if args.closed_loop_trace is not None:
+            # This is an external observation of the next captured frame. It
+            # is intentionally separate from ACT logits; decoding state still
+            # requires a supplied frame-state detector/annotation.
+            from idv_agent.agent.perception import CipherMachineDetector
+            detector = CipherMachineDetector(
+                template_path=str(args.cipher_template) if args.cipher_template else None,
+                yolo_model_path=str(args.yolo_model) if args.yolo_model else None,
+                debug=args.debug_yolo,
+            )
+            closed_loop_observer = lambda frame: detector.detect(frame).as_spatial()
         policy = ACTPolicy.from_checkpoint(
             args.act_checkpoint, model_path=args.model_path,
             instruction=args.instruction, mode=args.game_mode, device=device,
@@ -53,6 +65,9 @@ def build_policy(args, device):
             use_time_deltas=args.use_time_deltas,
             zero_history=args.zero_history,
             max_feature_age_s=args.max_feature_age_s,
+            closed_loop_trace=args.closed_loop_trace,
+            closed_loop_episode_id=args.closed_loop_episode_id,
+            closed_loop_observer=closed_loop_observer,
         )
         return policy, policy
     raise ValueError(f"未知 mode: {args.mode}")
@@ -128,7 +143,7 @@ def main(argv=None) -> int:
                    help="可选：配合 --trajectory-log 保存对应帧 JPEG（用于示范轨迹训练）")
     p.add_argument("--send-input", action="store_true", help="真发送键鼠（仅沙盒！）")
     p.add_argument("--dry-run", action="store_true", help="显式声明仅记录命令（默认行为）")
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="cuda")
     p.add_argument("--act-checkpoint", type=Path, default=None,
                    help="M3_ACT 动作块 checkpoint")
     p.add_argument("--act-init-checkpoint", type=Path, default=None,
@@ -147,6 +162,9 @@ def main(argv=None) -> int:
     p.add_argument("--zero-history", action="store_true",
                    help="诊断模式：每次推理都使用全零 history，不读取执行器历史")
     p.add_argument("--max-feature-age-s", type=float, default=0.5)
+    p.add_argument("--closed-loop-trace", type=Path, default=None,
+                   help="ACT 闭环证据 JSONL；需要由外部观察器接入阶段字段")
+    p.add_argument("--closed-loop-episode-id", default=None)
     test_group = p.add_mutually_exclusive_group()
     test_group.add_argument("--test-image", action="append", default=None,
                             help="离线测试单张图片；可重复传入多张")
@@ -169,6 +187,12 @@ def main(argv=None) -> int:
 
     import torch
     device = torch.device(args.device)
+    if args.mode == "act" and device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "ACT 需要 CUDA；当前 torch.cuda.is_available()=False。"
+            "请在安装了 CUDA 版 PyTorch 的 idv312 环境中运行，"
+            "或先用 benchmark/CPU 小模型诊断，不能把 CPU 的低帧数当作 ACT 结果。"
+        )
     if args.send_input:
         # 提前阻止“看似启动成功、实际运行在非管理员会话”的危险误用。
         import ctypes
@@ -199,6 +223,10 @@ def main(argv=None) -> int:
         count = act_policy.run_capture(capture_cfg, duration_s=args.duration,
                                        max_frames=int(args.fps * args.duration))
         print(f"[run_agent] 结束，帧数={count}")
+        if act_policy.last_run_stats:
+            print(f"[act:stats] {act_policy.last_run_stats}")
+            if count < 22:
+                print("[act:warning] 少于 22 个有效观察帧，v5 的 8 帧/stride=3 窗口未预热；本次没有形成有效 ACT 决策证据。")
         act_executor.shutdown()
         return 0
     executor = ActionExecutor(dry_run=not args.send_input)

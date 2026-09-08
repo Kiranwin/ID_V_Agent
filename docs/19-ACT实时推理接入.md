@@ -39,3 +39,55 @@ python -m idv_agent.scripts.run_agent `
 对齐复现：直接使用默认参数，不传 `--use-time-deltas`、不传 `--zero-history`；观察完整 4-step `chunk=` 序列与 logits 差异。
 
 实机发送只在确认处于官方自定义剧本/训练模式后显式加入 `--send-input`。建议先用默认 dry-run 检查动作日志，再进行发送测试。
+
+ACT 必须使用 CUDA。`run_agent --mode act` 默认 `--device cuda`，若当前
+`torch.cuda.is_available()` 为假会在启动时直接报错；不要用 CPU 运行 Qwen3-VL-4B
+并把很低的帧数当作模型结果。v5 ACT 在 30 FPS 下需要先积累 22 帧才会产生第一决策。
+
+## MVP 真值闭环记录
+
+ACT 可将每个 h0 动作与 6 帧后的外部观察写入闭环 trace。运行时必须提供
+`--closed-loop-trace`；如果提供 YOLO 或密码机模板，下一观察会通过独立的
+`CipherMachineDetector` 生成空间字段。它不读取 ACT 的预测作为“结果”。
+
+先做 dry-run（不会发送输入）：
+
+```powershell
+python -m idv_agent.scripts.run_agent `
+  --mode act `
+  --act-checkpoint checkpoints/<m28-checkpoint>/act.pt `
+  --model-path <Qwen目录> `
+  --title "第五人格" `
+  --closed-loop-trace outputs/mvp_closed_loop.jsonl `
+  --closed-loop-episode-id sandbox_dryrun_001 `
+  --device cuda `
+  --duration 30
+```
+
+只有在确认处于官方自定义剧本/训练模式、管理员终端和窗口区域正确后，才允许真实沙盒发送：
+
+```powershell
+python -m idv_agent.scripts.run_agent `
+  --mode act `
+  --act-checkpoint checkpoints/<m28-checkpoint>/act.pt `
+  --model-path <Qwen目录> `
+  --title "第五人格" `
+  --yolo-model <cipher-detector.pt> `
+  --closed-loop-trace outputs/mvp_closed_loop.jsonl `
+  --closed-loop-episode-id sandbox_001 `
+  --device cuda `
+  --duration 30 `
+  --send-input
+```
+
+运行结束后验收：
+
+```powershell
+python -m idv_agent.scripts.evaluate_mvp_closed_loop `
+  --trace outputs/mvp_closed_loop.jsonl `
+  --output reports/mvp_closed_loop.json
+```
+
+当前 detector 能提供 `visible`、位置和距离；要让 `decode_entry` 通过，
+`after` 必须由外部帧状态观察器写入 `frame_state=decoding`。仅有 Q 按下日志、
+ACT 自己的 `interact=1` 或人类回放不能证明进入破译。

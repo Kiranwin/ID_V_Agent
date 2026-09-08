@@ -42,7 +42,7 @@ class ACTActionChunkExecutor:
     def __init__(self, send: Callable[[Iterable[Command]], None], *,
                  keymap: SurvivorKeymap = DEFAULT_SURVIVOR_KEYMAP,
                  capture_fps: float = 30.0, tick_hz: float = 15.0,
-                 dry_run: bool = True):
+                 dry_run: bool = True, on_step_applied: Callable[[object], None] | None = None):
         if float(capture_fps) != 30.0:
             raise ValueError("v5 ACT 必须使用 capture_fps=30")
         if tick_hz <= 0:
@@ -52,6 +52,7 @@ class ACTActionChunkExecutor:
         self.capture_fps = float(capture_fps)
         self.tick_period = 1.0 / float(tick_hz)
         self.dry_run = bool(dry_run)
+        self.on_step_applied = on_step_applied
         self._queue: list[object] = []
         self._active: _ActiveStep | None = None
         self._held: set[str] = set()
@@ -110,6 +111,8 @@ class ACTActionChunkExecutor:
             self.send(commands)
         self._held = target
         self._history.append(step)
+        if self.on_step_applied is not None:
+            self.on_step_applied(step)
 
     @property
     def history_actions(self) -> tuple[object, ...]:
@@ -132,10 +135,15 @@ class ACTActionChunkExecutor:
         if dt <= 0:
             raise ValueError("dt_s 必须为正数")
         self._virtual_time += dt
+        # A step submitted between ticks starts at this tick's wall-clock
+        # instant.  Do not charge elapsed time from before its start against
+        # its duration; doing so could press and release a 200 ms action in
+        # one delayed tick.
         if self._active is None and self._queue:
             step = self._queue.pop(0)
             self._active = _ActiveStep(step, int(step.duration_frames) / self.capture_fps)
             self._apply(step)
+            return self.active
         if self._active is not None:
             self._active.remaining_s -= dt
             while self._active is not None and self._active.remaining_s <= 1e-9:

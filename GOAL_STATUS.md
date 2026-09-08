@@ -30,6 +30,81 @@ checkpoint as deployable merely because its training loss decreases.
 5. After a material result, update this file with evidence paths, pass/fail
    gates, the next concrete action, and any newly created backups.
 
+## Root-Cause Review Addendum (2026-09-08)
+
+Read-only diagnosis requested by the user was completed in the primary
+`vla-train` checkout at `ecae81f` (including m28 commit `7bd3106`). No model,
+dataset, training run, or deployment permission changed. Detailed evidence
+and the proposed repair order are recorded in `docs/18-架构变更历史.md`, section
+“MVP 根因复核：监督冲突、评估口径与执行时间”.
+
+New confirmed issues to resolve before interpreting another full run:
+
+- m28 replay-camera CE and desired-turn CE both supervise the same executed
+  h0 logits without arbitration. Canonical train labels disagree on dx in
+  15/48 rows, dy in 12/48, either axis in 23/48 (val: 13/46, 17/46, 25/46).
+  A CPU gradient probe confirms opposing updates on conflicting classes.
+  Preserve raw replay evidence while defining one explicit execution target.
+- The standard `evaluate_vla.py` still scores all four action steps and uses
+  the default four-step loss. This differs from h0 training/deployment; it
+  does not invalidate the separate h0 training/visual-dependency reports.
+- A CPU scheduler/executor probe with 250-ms tick intervals emits W press
+  and release in the same tick: elapsed time before a queued step starts is
+  incorrectly charged to that new 200-ms step. `run_capture` also passes a
+  pre-encode timestamp to tick, excluding encode latency from freshness.
+  Actual GPU/capture latency remains unmeasured; no game inputs were sent.
+
+Effective full-train supervision is 128 grounding endpoints and 48 control
+endpoints (31 sessions), including only 6 search and 2 left-detour control
+labels. The latest m28 128-sample smoke actually consumes 9 control rows;
+its validation move predictions are forward on all 64 samples. This smoke
+is not a full-task architecture result. Historical m26 h0 train/val camera
+zero false-turn rates are 0.6146/0.6218, and held-out Q event recall is 7/20;
+visual dependence alone did not establish reliable actions.
+
+Keep m28 architecture fixed while resolving these independently testable
+contracts, then perform the existing per-loss/per-module gradient trace and
+an explicit small-set h0 fit check. Preserve all current offline gates and
+deployment restrictions. A no-input dry-run cannot by itself demonstrate
+agent-caused decoding entry; eventual sandbox success requires actual
+action-to-next-observation evidence after prerequisites and authorization.
+
+## Closed-Loop Evidence Contract (2026-09-08)
+
+Implemented `idv_agent.agent.mvp_closed_loop` and
+`idv_agent.scripts.evaluate_mvp_closed_loop`. A trace row now requires
+`before`, the actually submitted h0 `action`, and the first post-action
+`after` observation. The verifier reports `find_cipher`, `approach_cipher`,
+`q_prompt`, and `decode_entry` separately. Only rows marked
+`source=live_sandbox` and `causal=true` can pass `mvp_pass`; human replay is
+diagnostic evidence only. This adds an acceptance contract, not a live game
+result; no sandbox trace has been recorded yet.
+
+ACT runtime integration is now wired: `ACTPolicy` accepts
+`closed_loop_trace`, `closed_loop_episode_id`, and an external
+`closed_loop_observer`; the executor callback records the submitted h0 and the
+trace writer flushes it only after at least 6 newly observed frames. `run_agent`
+exposes `--closed-loop-trace` and `--closed-loop-episode-id`, and the usage and
+evaluation commands are documented in `docs/19-ACT实时推理接入.md`. The current
+CLI observer supplies detector fields when a template/YOLO model is given;
+`decode_entry` still requires an external frame-state observer to provide
+`frame_state=decoding`. No live sandbox run has been performed.
+
+Runtime diagnostic (2026-09-08): a user run ended with `帧数=4`. The CLI had
+defaulted ACT to `--device cpu`; this machine reports
+`torch.cuda.is_available()=False`. Qwen3-VL-4B CPU inference therefore consumed
+the short run before the required 22-frame warmup, so that invocation produced
+no valid ACT decision or closed-loop evidence. The CLI now defaults to CUDA,
+fails early when ACT is requested without CUDA, and prints capture statistics
+(`processed_frames`, `predictions`, `empty_grabs`, `reused_frames`, `device`).
+
+Model repair (2026-09-08): m28 training now exposes and records explicit
+`slow_intent_weight`, `slow_subgoal_weight`, and `consistency_weight` values.
+Defaults are `0.25`, `0.125`, and `0.1`; action/camera/Q weights are unchanged.
+This targets the observed m28 smoke peak dominated by `slow_intent`/`slow_subgoal`
+without using gradient clipping as a substitute for a model fix. No new smoke
+has run yet because this session has no CUDA device.
+
 ## Current Working Context
 
 | Item | Current value |

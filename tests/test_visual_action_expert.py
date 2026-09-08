@@ -168,6 +168,40 @@ def test_rolling_execution_horizon_preserves_fast_loss_scale_by_action_coverage(
     assert torch.allclose(rolling["fast_move"], full["fast_move"] / 4.0)
 
 
+def test_camera_control_target_replaces_replay_target_on_annotated_rows():
+    from idv_agent.model.vla_heads import FastVLAOutput, CameraControlOutput
+    from idv_agent.training.vla_loss import VLALossWeights, compute_vla_loss
+    fast = FastVLAOutput(
+        move_logits=torch.zeros(1, 1, 2), camera_dx_logits=torch.zeros(1, 1, 5),
+        camera_dy_logits=torch.zeros(1, 1, 5), button_logits=torch.zeros(1, 1, 6),
+        duration=torch.ones(1, 1), confidence=torch.zeros(1), stop_or_replan=torch.zeros(1),
+        intent_context_logits=torch.zeros(1, 8), interact_event_logits=torch.zeros(1, 1),
+    )
+    control = CameraControlOutput(
+        phase_logits=torch.zeros(1, 4), target_id_logits=torch.zeros(1, 3),
+        steering_logits=torch.zeros(1, 4), path_logits=torch.zeros(1, 4),
+        desired_turn_dx_logits=fast.camera_dx_logits[:, 0],
+        desired_turn_dy_logits=fast.camera_dy_logits[:, 0],
+    )
+    batch = {
+        "fast_loss_mask": torch.ones(1), "move_target": torch.zeros(1, 1, dtype=torch.long),
+        "camera_dx_target": torch.tensor([[2]]), "camera_dy_target": torch.tensor([[2]]),
+        "button_target": torch.zeros(1, 1, 6), "duration_target": torch.ones(1, 1),
+        "camera_control_mask": torch.ones(1),
+        "camera_control_phase_target": torch.zeros(1, dtype=torch.long),
+        "camera_control_target_id_target": torch.zeros(1, dtype=torch.long),
+        "camera_control_steering_target": torch.zeros(1, dtype=torch.long),
+        "camera_control_path_target": torch.zeros(1, dtype=torch.long),
+        "desired_turn_dx_target": torch.tensor([4]), "desired_turn_dy_target": torch.tensor([2]),
+    }
+    losses = compute_vla_loss(fast, None, batch,
+                              VLALossWeights(execution_horizon=1), camera_control=control)
+    # replay camera loss is masked out; the remaining camera-control loss is finite
+    # and is the only camera supervision on this annotated row.
+    assert torch.allclose(losses["fast_camera"], torch.zeros_like(losses["fast_camera"]))
+    assert losses["desired_turn_dx"].item() > 0
+
+
 def test_m28_task_features_condition_the_joint_planner_without_old_slow_loop():
     """Task/mode must reach m28 state directly, not via SlowCondition feedback."""
     from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
@@ -500,6 +534,20 @@ def test_m28_joint_planner_uses_predicted_state_for_all_deployed_actions():
     assert expert.planner.move.weight.grad is not None
     assert expert.planner.camera_dx.weight.grad is not None
     assert expert.planner.interact_event.weight.grad is not None
+
+
+def test_gradient_attribution_separates_loss_and_shared_modules():
+    from idv_agent.training.vla_loss import gradient_attribution
+    first = torch.nn.Linear(3, 4)
+    second = torch.nn.Linear(4, 2)
+    x = torch.randn(2, 3)
+    hidden = first(x)
+    losses = {"state": hidden.square().mean(), "action": second(hidden).square().mean()}
+    report = gradient_attribution(losses, {"state_trunk": first, "planner": second})
+    assert report["state"]["state_trunk"] > 0
+    assert report["action"]["state_trunk"] > 0
+    assert report["state"]["planner"] == 0
+    assert report["action"]["planner"] > 0
 
 
 def test_m28_desired_turn_is_the_executed_h0_camera_planner_logit():

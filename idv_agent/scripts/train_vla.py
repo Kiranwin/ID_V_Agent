@@ -1138,6 +1138,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             button_global_counts[:, 1] += target.sum(dim=0)
             button_global_counts[:, 0] += (target.shape[0] - target.sum(dim=0))
     loss_weights = VLALossWeights(move_stop_weight=args.move_stop_weight,
+                                   slow_intent=float(getattr(args, "slow_intent_weight", 0.25)),
+                                   slow_subgoal=float(getattr(args, "slow_subgoal_weight", 0.125)),
+                                   consistency=float(getattr(args, "consistency_weight", 0.1)),
                                    button_positive_weight=args.button_positive_weight,
                                    visual_aux=float(getattr(args, "visual_aux", 1.0)),
                                    move_direction_balance=args.move_direction_balance,
@@ -1349,6 +1352,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "grad_initial_scale": grad_initial_scale,
                   "history_dropout_p": history_dropout_p,
                   "visual_aux": float(getattr(args, "visual_aux", 1.0)),
+                  "slow_intent_weight": float(getattr(args, "slow_intent_weight", 0.25)),
+                  "slow_subgoal_weight": float(getattr(args, "slow_subgoal_weight", 0.125)),
+                  "consistency_weight": float(getattr(args, "consistency_weight", 0.1)),
                   "grounding_loss_weight": float(getattr(args, "grounding_loss_weight", 1.0)),
                   "grounding_sampling": grounding_sampling,
                   "camera_control_annotated_fraction": camera_control_annotated_fraction,
@@ -1938,6 +1944,12 @@ def main(argv=None) -> int:
                         help="m26 固定为 0；不允许 history/temporal prior 改写 camera logits")
     parser.add_argument("--visual-aux", type=float, default=1.0,
                         help="history-free visual action expert 的显式监督权重")
+    parser.add_argument("--slow-intent-weight", type=float, default=0.25,
+                        help="m28 shared state intent CE 权重")
+    parser.add_argument("--slow-subgoal-weight", type=float, default=0.125,
+                        help="m28 shared state subgoal CE 权重")
+    parser.add_argument("--consistency-weight", type=float, default=0.1,
+                        help="slow/fast intent consistency KL 权重")
     parser.add_argument("--grounding-annotations", default="",
                         help="训练期同 session ACT grounding JSONL；部署不会读取该文件")
     parser.add_argument("--val-grounding-annotations", default="",
