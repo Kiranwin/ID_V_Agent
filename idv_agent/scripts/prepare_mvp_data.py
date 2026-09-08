@@ -16,7 +16,13 @@ from collections import Counter
 from pathlib import Path
 
 from idv_agent.scripts.build_vla_chunks import build
-from idv_agent.vla.action_chunk import VLA_SCHEMA_VERSION_V5, validate_v4_record, validate_v5_record
+from idv_agent.vla.action_chunk import (
+    CAMERA_BUCKET_COMMAND_PX,
+    CAMERA_BUCKET_EDGES_PX,
+    VLA_SCHEMA_VERSION_V5,
+    validate_v4_record,
+    validate_v5_record,
+)
 
 KEEP = {"travel", "decipher"}
 V4_CHUNK_FILENAMES = ("vla_chunks_v4.jsonl", "train_vla_chunks_v4.jsonl")
@@ -298,6 +304,8 @@ def prepare_v5(root: Path, output: Path, *, val_ratio: float, seed: int,
     train_stats, val_stats = _stats(train), _stats(val)
     missing = {side: sorted(KEEP - set(stats["intents"])) for side, stats in (("train", train_stats), ("val", val_stats))}
     report = {"schema": "mvp.v5", "chunk_schema": "vla.action_chunk.v5",
+              "camera_bucket_edges_px": list(CAMERA_BUCKET_EDGES_PX),
+              "camera_bucket_command_px": {str(key): value for key, value in CAMERA_BUCKET_COMMAND_PX.items()},
               "keep_intents": sorted(KEEP), "travel_scope": travel_scope,
               "max_session_chunks": max_session_chunks, "seed": seed,
               "event_centered": bool(event_centered),

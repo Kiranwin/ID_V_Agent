@@ -40,7 +40,7 @@ checkpoint as deployable merely because its training loss decreases.
 | Hardware | Local RTX 2080 Ti; FP16 + GradScaler; no BF16 |
 | ACT initialization | Base Qwen only; M2/VG is disabled for ACT |
 | Raw MVP source | `C:\Codespace\ID_V_Agent\data\new_vla_raw_sessions` |
-| Canonical ACT dataset | `C:\Codespace\ID_V_Agent\data\mvp_vla_v5_event_centered_decision_label_v2` |
+| Canonical ACT dataset | `C:\Codespace\ID_V_Agent\data\mvp_vla_v5_event_centered_decision_label_v3_rebucket675` |
 | ACT split | train=732 chunks / 79 sessions; val=182 chunks / 20 sessions; no session overlap |
 
 ## Data and Annotation State
@@ -61,6 +61,16 @@ checkpoint as deployable merely because its training loss decreases.
 - Data backups are retained inside the annotation-pool directory, including
   `labels.before_reannotation_20260906_221910` and timestamped prior auxiliary
   JSONL files. Do not delete them without an explicit request.
+- Camera-control semantic labels are complete: train=48/48 and val=46/46.
+  The canonical rebucketed replay-evidence copies are
+  `camera_control_{train,val}.v2.rebucket675.annotated.jsonl`; they preserve
+  all human `desired_turn_*`/path fields and update only replay evidence.
+- On 2026-09-08 all 99 raw-session `vla_chunks_v5.jsonl` files were rebuilt
+  with shared edges `[12.0, 67.5]`: `±13..±67 → ±1`, `|px|≥68 → ±2`.
+  Every v5 audit passed (983 chunks).  The old v2 MVP directory is retained;
+  new canonical v3 has the same session split and 732/182 chunks.  H0 class
+  weights and provenance are frozen in
+  `class_balance_h0_rebucket675.json` under the v3 dataset root.
 
 ## Current Architecture
 
