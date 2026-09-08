@@ -96,6 +96,30 @@ def test_grounding_loss_ignores_unannotated_rows():
     assert torch.allclose(first["grounding_total"], second["grounding_total"])
 
 
+def test_grounding_total_is_head_mean_for_shared_m28_state_trunk():
+    """Adding grounding heads must not multiply m28's shared-state gradient."""
+    from idv_agent.model.vla_heads import GroundingOutput
+    from idv_agent.training.vla_loss import compute_grounding_loss
+
+    output = GroundingOutput(
+        present_logits=torch.zeros(1, requires_grad=True),
+        bbox=torch.zeros(1, 4, requires_grad=True),
+        side_logits=torch.zeros(1, 4, requires_grad=True),
+        prompt_logits=torch.zeros(1, requires_grad=True),
+        reachable_logits=torch.zeros(1, requires_grad=True),
+    )
+    batch = {
+        "grounding_mask": torch.ones(1), "grounding_present_target": torch.ones(1),
+        "grounding_bbox_mask": torch.ones(1), "grounding_bbox_target": torch.ones(1, 4),
+        "grounding_side_target": torch.ones(1, dtype=torch.long),
+        "grounding_prompt_target": torch.ones(1), "grounding_reachable_target": torch.ones(1),
+    }
+    losses = compute_grounding_loss(output, batch)
+    heads = [losses[name] for name in ("grounding_present", "grounding_bbox", "grounding_side",
+                                       "grounding_prompt", "grounding_reachable")]
+    assert torch.allclose(losses["grounding_total"], sum(heads) / len(heads))
+
+
 def test_grounding_loss_uses_head_local_balanced_global_counts():
     """Prompt/reachability must not inherit a different head's class prior."""
     from idv_agent.model.vla_heads import GroundingOutput

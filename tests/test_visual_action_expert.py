@@ -185,6 +185,22 @@ def test_m28_task_features_condition_the_joint_planner_without_old_slow_loop():
     assert not torch.equal(first.visual.slow.intent_logits, second.visual.slow.intent_logits)
 
 
+def test_m28_task_state_merge_is_normalized_before_state_heads():
+    from idv_agent.model.vla_heads import StateDecisionExpert
+
+    expert = StateDecisionExpert(4, 8).eval()
+    assert expert.task_state_norm.elementwise_affine is False
+    assert expert.state_fusion_norm.elementwise_affine is False
+    frames = torch.randn(2, 8, 4)
+    # Large task residuals must remain finite and cannot bypass the shared
+    # post-fusion normalization into the state/action heads.
+    with torch.no_grad():
+        output = expert(frames, task_features=torch.full_like(frames, 1e5))
+    assert torch.isfinite(output.feature).all()
+    assert torch.isfinite(output.slow.intent_logits).all()
+    assert torch.isfinite(output.fast.move_logits).all()
+
+
 def test_visual_expert_changes_when_only_pure_visual_features_change():
     from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
 

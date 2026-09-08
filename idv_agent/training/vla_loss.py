@@ -192,7 +192,12 @@ def compute_grounding_loss(grounding: GroundingOutput, batch: dict,
         "grounding_prompt": _masked_mean(prompt, mask),
         "grounding_reachable": _masked_mean(reachable, mask),
     }
-    return {"grounding_total": sum(losses.values()), **losses}
+    # m28 makes every visual state head share one State Trunk.  Summing five
+    # independently normalized losses silently multiplied the trunk gradient
+    # and caused the first GPU smoke's step-10 spike.  Average per-head losses
+    # so ``weights.grounding`` is the only explicit lambda relative to action
+    # and control losses; individual head class weights remain unchanged.
+    return {"grounding_total": sum(losses.values()) / len(losses), **losses}
 
 
 def compute_camera_control_loss(control: CameraControlOutput, batch: dict,

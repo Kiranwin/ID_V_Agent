@@ -388,6 +388,39 @@ compatibility, benchmark, executor, data and checkpoint contracts.  This
 repairs input/decision-path consistency; it does not replace the still-required
 dry-run timestamp trace, GPU smoke, full train, or MVP gates.
 
+## m28 GPU Smoke Series: Numerical Gate Not Yet Passed (2026-09-08)
+
+Before the first m28 smoke, the complete CPU suite passed **311** tests and
+the canonical data readiness audit passed.  After correcting the historical
+checkpoint error-message test and adding m28 loss-scale guards, the complete
+suite passes **313** tests.  All runs used base Qwen only, the audited v3
+rebucket675 128/64 smoke subset, h0-only execution, image augmentation,
+train/val sidecar separation, joint control sampling 0.35 / grounding 0.50,
+and `lr=1e-4`.
+
+| Smoke checkpoint | Targeted change | Loss initial → final | Max unscaled grad | Result |
+|---|---|---:|---:|---|
+| `m28_state_joint_smoke60_local_idv312` | initial shared state planner | 8.3708 → 2.3236 | 246.49 (step 10) | reject |
+| `m28_state_joint_groundingmean_smoke60_local_idv312` | grounding 5-head mean instead of sum | 5.7619 → 1.6586 | 176.85 (step 4) | reject |
+| `m28_state_joint_tasknorm_smoke60_local_idv312` | normalized/bounded task injection | 5.7928 → 2.1314 | 178.89 (step 4) | reject |
+| `m28_state_joint_fusionnorm_smoke60_local_idv312` | post-fusion shared-state LayerNorm | 5.7885 → 2.2246 | 137.20 (step 4) | reject |
+
+Every run had finite loss/components, no invalid gradient tensors, and
+checkpoint reload delta `0`; the training-behavior gate rejects them solely
+because its max gradient norm is `100`.  The corrections materially reduce
+the peak (`246.49 → 137.20`) but do not meet the fail-closed threshold.
+The persistent peak batch is not control-supervised; after grounding is
+averaged it is dominated by state loss (`slow_intent≈5.73`,
+`slow_subgoal≈1.71`) rather than a non-finite numerical failure.
+
+**Decision:** do not relax the 100 threshold, lower learning rate as a
+cosmetic workaround, or start full training.  The next code task is a
+per-module / per-loss gradient attribution trace at the peak batch, separating
+the m28 State Trunk, task-state injection, intent/subgoal heads, soft belief
+embeddings, and Joint Planner.  Use this trace to change one explicit loss
+lambda or gradient path, then run one new 60-step smoke.  All m28 smoke
+checkpoints remain non-deployment diagnostics.
+
 ## Latest Evidence: m25 Loss-Scale Smoke
 
 | Item | Evidence |

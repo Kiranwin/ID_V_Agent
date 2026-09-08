@@ -540,6 +540,9 @@ class StateDecisionExpert(nn.Module):
         # It keeps instruction/mode available to m28 without letting the old
         # FiLM/GRU diagnostic branch become a hidden action controller.
         self.task_state_projection = nn.Linear(self.frame_feature_dim, self.temporal_dim, bias=False)
+        self.task_state_norm = nn.LayerNorm(self.frame_feature_dim, elementwise_affine=False)
+        self.state_fusion_norm = nn.LayerNorm(self.temporal_dim, elementwise_affine=False)
+        self.task_state_scale = 0.25
         self.slow = SlowVLAHead(self.temporal_dim, bias=False, direct=True)
         self.grounding_present = nn.Linear(self.temporal_dim, 1, bias=False)
         self.grounding_bbox = nn.Linear(self.temporal_dim, 4, bias=False)
@@ -672,7 +675,17 @@ class StateDecisionExpert(nn.Module):
             if task_features is not None:
                 _first, last = self._valid_indices(frame_features, valid_mask)
                 rows = torch.arange(frame_features.shape[0], device=frame_features.device)
-                state = state + self.task_state_projection(task_features[rows, last].float())
+                # The adapter's conditioned-minus-pure vector has a model-
+                # dependent magnitude.  Normalize it before the shared-state
+                # injection and bound its contribution, otherwise the task
+                # path can dominate the first multi-task backward pass.
+                task = self.task_state_norm(task_features[rows, last].float())
+                state = state + self.task_state_scale * self.task_state_projection(task)
+            # Both visual and task residuals update during ACT.  Keep their
+            # merged state on the same bounded scale before every state head
+            # and the planner consume it; otherwise a few early task-path
+            # updates can make intent CE dominate the shared-state gradient.
+            state = self.state_fusion_norm(state)
             slow = self.slow(state)
             grounding = GroundingOutput(
                 present_logits=self.grounding_present(state).squeeze(-1),
