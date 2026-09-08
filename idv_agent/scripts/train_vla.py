@@ -171,6 +171,47 @@ def _grounding_sampling_weights(dataset, *, annotated_fraction: float) -> tuple[
                      "target_annotated_fraction": fraction}
 
 
+def _joint_annotation_sampling_weights(dataset, *, control_annotated_fraction: float,
+                                       grounding_annotated_fraction: float) -> tuple[torch.Tensor, dict[str, int | float]]:
+    """Set explicit draw mass for control, other-grounding, and ordinary rows.
+
+    Camera-control rows are a strict subset of grounding rows.  Reusing the
+    old grounding-only sampler made their effective probability only
+    ``grounding_fraction * control/grounding`` (18.75% here), too sparse for
+    the route-steering heads to learn.  This keeps ordinary ACT data dominant
+    while ensuring human path semantics appear in a meaningful share of steps.
+    """
+    control_fraction = float(control_annotated_fraction)
+    grounding_fraction = float(grounding_annotated_fraction)
+    if not 0.0 < control_fraction < 1.0:
+        raise ValueError("camera-control annotated fraction 必须在 (0,1)")
+    if grounding_fraction == 0.0:
+        grounding_fraction = control_fraction
+    if not control_fraction <= grounding_fraction < 1.0:
+        raise ValueError("camera-control fraction 必须 <= grounding fraction < 1")
+    control = torch.tensor([bool(dataset[index]["camera_control_mask"]) for index in range(len(dataset))])
+    grounding = torch.tensor([bool(dataset[index]["grounding_mask"]) for index in range(len(dataset))])
+    grounding_only = grounding & ~control
+    ordinary = ~grounding
+    counts = {"control": int(control.sum()), "grounding_only": int(grounding_only.sum()),
+              "ordinary": int(ordinary.sum())}
+    if counts["control"] == 0:
+        raise ValueError("训练集没有 camera-control 完成标注，不能启用 control 过采样")
+    if counts["ordinary"] == 0:
+        raise ValueError("训练集全部带 grounding 标注，无需 annotation 过采样")
+    grounding_only_mass = grounding_fraction - control_fraction
+    if grounding_only_mass > 0 and counts["grounding_only"] == 0:
+        raise ValueError("没有 grounding-only 样本，grounding fraction 必须等于 control fraction")
+    weights = torch.zeros(len(dataset), dtype=torch.float32)
+    weights[control] = control_fraction / counts["control"]
+    if grounding_only_mass:
+        weights[grounding_only] = grounding_only_mass / counts["grounding_only"]
+    weights[ordinary] = (1.0 - grounding_fraction) / counts["ordinary"]
+    return weights, {**counts, "target_control_fraction": control_fraction,
+                     "target_grounding_fraction": grounding_fraction,
+                     "target_grounding_only_fraction": grounding_only_mass}
+
+
 def _evaluation_stratified_subset(dataset, limit: int):
     """Pick deterministic cross-episode examples that cover rare output labels.
 
@@ -981,9 +1022,20 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if args.init_checkpoint:
         raise ValueError("M2_VG 初始化当前已禁用；请不要传 --init-checkpoint")
     grounding_annotations = getattr(args, "grounding_annotations", "") or None
+    val_grounding_annotations = (getattr(args, "val_grounding_annotations", "") or grounding_annotations)
     camera_control_annotations = [item.strip() for item in
                                   str(getattr(args, "camera_control_annotations", "") or "").replace(";", ",").split(",")
                                   if item.strip()]
+    val_camera_control_annotations = [item.strip() for item in
+                                      str(getattr(args, "val_camera_control_annotations", "") or "").replace(";", ",").split(",")
+                                      if item.strip()]
+    # Control semantics are scarce and deliberately human-authored.  Keep the
+    # split explicit: exact episode/frame matching prevents accidental tensor
+    # attachment today, but a manifest must prove that validation labels were
+    # never a training input when the split evolves.
+    if getattr(args, "val_data", None) and camera_control_annotations and not val_camera_control_annotations:
+        raise ValueError("--val-data 与 --camera-control-annotations 一起使用时，必须显式提供 "
+                         "--val-camera-control-annotations")
     dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True,
                                  grounding_annotations=grounding_annotations,
                                  camera_control_annotations=camera_control_annotations or None)
@@ -1011,8 +1063,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if image_augmentation and raw_feature_cache is not None:
         raise ValueError("--image-augmentation 与 --raw-feature-cache 不兼容；请关闭其中之一")
     grounding_annotated_fraction = float(getattr(args, "grounding_annotated_fraction", 0.0))
+    camera_control_annotated_fraction = float(getattr(args, "camera_control_annotated_fraction", 0.0))
     grounding_sampling = None
-    if grounding_annotated_fraction:
+    if camera_control_annotated_fraction:
+        if not camera_control_annotations:
+            raise ValueError("--camera-control-annotated-fraction 需要 --camera-control-annotations")
+        weights, grounding_sampling = _joint_annotation_sampling_weights(
+            dataset, control_annotated_fraction=camera_control_annotated_fraction,
+            grounding_annotated_fraction=grounding_annotated_fraction)
+        sampler = WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True,
+                                        generator=torch.Generator().manual_seed(int(getattr(args, "seed", 0))))
+        loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                            collate_fn=VLASequenceCollator(max_frames=8))
+    elif grounding_annotated_fraction:
         if grounding_annotations is None:
             raise ValueError("--grounding-annotated-fraction 需要 --grounding-annotations")
         weights, grounding_sampling = _grounding_sampling_weights(
@@ -1028,8 +1091,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                              collate_fn=VLASequenceCollator(max_frames=8))
     val_paths = _dataset_paths(getattr(args, "val_data", None))
     val_dataset = (VLASequenceDataset(val_paths, verify_images=True,
-                                      grounding_annotations=grounding_annotations,
-                                      camera_control_annotations=camera_control_annotations or None)
+                                      grounding_annotations=val_grounding_annotations,
+                                      camera_control_annotations=val_camera_control_annotations or None)
                    if val_paths else None)
     max_val_samples = int(getattr(args, "max_val_samples", 64) or 0)
     if val_dataset is not None and max_val_samples > 0:
@@ -1306,11 +1369,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                   "visual_aux": float(getattr(args, "visual_aux", 1.0)),
                   "grounding_loss_weight": float(getattr(args, "grounding_loss_weight", 1.0)),
                   "grounding_sampling": grounding_sampling,
+                  "camera_control_annotated_fraction": camera_control_annotated_fraction,
                   "grounding_annotations": (str(Path(grounding_annotations).resolve())
-                                             if grounding_annotations else None),
+                                            if grounding_annotations else None),
+                  "val_grounding_annotations": (str(Path(val_grounding_annotations).resolve())
+                                                if val_grounding_annotations else None),
                   "camera_control_loss_weight": float(getattr(args, "camera_control_loss_weight", 1.0)),
                   "camera_control_annotations": [str(Path(path).resolve())
                                                  for path in camera_control_annotations],
+                  "val_camera_control_annotations": [str(Path(path).resolve())
+                                                      for path in val_camera_control_annotations],
                   "prior_scale": float(core.prior_scale), "prior_logits_bounded": True,
                   "camera_prior_scale": float(core.camera_prior_scale),
                   "visual_input_center": visual_center,
@@ -1887,14 +1955,20 @@ def main(argv=None) -> int:
                         help="history-free visual action expert 的显式监督权重")
     parser.add_argument("--grounding-annotations", default="",
                         help="训练期同 session ACT grounding JSONL；部署不会读取该文件")
+    parser.add_argument("--val-grounding-annotations", default="",
+                        help="验证集 grounding JSONL；省略时沿用 --grounding-annotations（旧调用兼容）")
     parser.add_argument("--grounding-loss-weight", type=float, default=1.0,
                         help="训练期视觉 grounding 辅助 loss 权重；0 可用于消融")
     parser.add_argument("--grounding-annotated-fraction", type=float, default=0.0,
                         help="训练抽样中带 grounding 标注的目标比例；0 禁用，建议 0.5")
     parser.add_argument("--camera-control-annotations", default="",
                         help="逗号分隔的完成 camera-control JSONL；仅训练期辅助监督")
+    parser.add_argument("--val-camera-control-annotations", default="",
+                        help="逗号分隔的验证集 completed camera-control JSONL；与训练标注显式隔离")
     parser.add_argument("--camera-control-loss-weight", type=float, default=1.0,
                         help="路径/转向语义辅助 loss 权重；0 禁用")
+    parser.add_argument("--camera-control-annotated-fraction", type=float, default=0.0,
+                        help="训练抽样中 completed control 标注的目标比例；建议 0.35，需同时设置 grounding 比例")
     parser.add_argument("--visual-center-samples", type=int, default=64,
                         help="从训练集分层抽取的 raw visual center 校准样本数")
     parser.add_argument("--move-stop-weight", type=float, default=0.5)

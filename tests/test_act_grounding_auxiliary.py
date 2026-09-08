@@ -316,3 +316,22 @@ def test_camera_control_metrics_masks_unannotated_rows():
     assert metrics["annotated"] == 1
     assert all(metrics[name]["accuracy"] == 1.0 for name in
                ("phase", "target_id", "steering", "path", "desired_turn_dx", "desired_turn_dy"))
+
+
+def test_joint_annotation_sampling_gives_control_requested_mass():
+    from idv_agent.scripts.train_vla import _joint_annotation_sampling_weights
+
+    class Dataset:
+        rows = ((1, 1), (1, 1), (0, 1), (0, 1), (0, 0), (0, 0), (0, 0), (0, 0))
+        def __len__(self): return len(self.rows)
+        def __getitem__(self, index):
+            control, grounding = self.rows[index]
+            return {"camera_control_mask": torch.tensor(float(control)),
+                    "grounding_mask": torch.tensor(float(grounding))}
+
+    weights, report = _joint_annotation_sampling_weights(
+        Dataset(), control_annotated_fraction=.35, grounding_annotated_fraction=.5)
+    assert torch.isclose(weights[:2].sum(), torch.tensor(.35))
+    assert torch.isclose(weights[2:4].sum(), torch.tensor(.15))
+    assert torch.isclose(weights[4:].sum(), torch.tensor(.5))
+    assert report["control"] == 2 and report["grounding_only"] == 2

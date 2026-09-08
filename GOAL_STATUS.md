@@ -180,6 +180,57 @@ head and masks all unannotated rows.  Next: train all 732 chunks / validate all
 182 chunks with the new schema and then run control, visual-dependency, class,
 and sandbox gates before any dry-run deployment.
 
+## m27 Control-Sampling Audit and Full-Run Decision (2026-09-08)
+
+The first completed full m27 run is retained at
+`C:\Codespace\ID_V_Agent\checkpoints\m27_control_rebucket675_full366_local_idv312\act.pt`.
+It trained 366 steps, but its four-condition visual-dependency report at
+`C:\Codespace\ID_V_Agent\reports\m27_control_rebucket675_full366_visual_dependency.json`
+fails camera: image-zero drop `0.0310 < 0.05` and cross-session image-shuffle
+does not lower camera accuracy.  It remains **rejected / fail-closed**.
+
+Its held-out semantic-control report is
+`C:\Codespace\ID_V_Agent\reports\m27_control_rebucket675_full366_control_eval.json`.
+On its 46 labeled validation frames, `desired_turn_dx` accuracy is `0.2609`
+and steering accuracy is `0.3261`; this is insufficient evidence of useful
+route-aware visual control.
+
+The original full command made a real sampling mistake: control rows were a
+subset of the 128 grounding rows, so ordinary 50% grounding oversampling gave
+the 48 control rows only about `18.75%` of draws.  The trainer now implements
+joint sampling with explicit mass for control / other-grounding / ordinary ACT
+rows.  With `control=0.35`, `grounding=0.50`, the full train population is
+`48 / 80 / 604`, with target draw masses `0.35 / 0.15 / 0.50`; class weights
+remain independently derived from the complete 48 training control labels.
+
+The numerical smoke using the new sampler completed at
+`C:\Codespace\ID_V_Agent\checkpoints\m27_control_oversample35_smoke60_local_idv312`:
+loss `7.4780 -> 4.5355` (min `2.0378`), max gradient `77.1086`, finite
+components, checkpoint delta `0`, and training-behavior gate passed.  It is
+not a semantic result: `--max-samples=128` left only **9** control rows in the
+bounded source subset, so repeated 35% sampling only replayed those nine.
+The 46-row held-out result (`...\reports\m27_control_oversample35_smoke60_control_eval.json`)
+is `desired_turn_dx=0.2174`, below the previous full result, but cannot test
+the intended full-48-label training regime.  Do not draw an architectural
+conclusion from that truncated smoke and do not deploy it.
+
+To make data isolation auditable rather than relying on exact frame keys, the
+trainer now has explicit `--val-grounding-annotations` and
+`--val-camera-control-annotations`.  A train run with `--val-data` and camera
+control supervision fails unless the latter is supplied.  The next full run
+will use train-only control labels (48) and val-only control labels (46), with
+the 732/182 session split unchanged.
+
+### Next Concrete Action
+
+Run exactly one local foreground m27 full training from base Qwen, with
+`execution_horizon=1`, image augmentation, M2/VG disabled, joint control
+sampling `0.35`, grounding sampling `0.50`, 366 steps, batch 4, full 732/182
+data, and explicit train/validation auxiliary-label files.  After it exits,
+run the 46-row semantic-control report, the full four-condition
+visual-dependency gate, category/over-action acceptance, then sandbox dry-run
+only if every offline criterion passes.  `--send-input` remains disabled.
+
 ## Latest Evidence: m25 Loss-Scale Smoke
 
 | Item | Evidence |
