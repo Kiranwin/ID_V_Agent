@@ -41,3 +41,15 @@ def test_manifest_rejects_missing_parent_for_downstream():
             "precision": "fp32", "training": {}, "schema_versions": [],
             "artifacts": {},
         })
+
+
+def test_base_initialized_act_manifest_may_omit_parent_only_with_explicit_marker():
+    from idv_agent.training.checkpoint_manifest import validate_manifest
+
+    manifest = {
+        "manifest_schema_version": "checkpoint.manifest.v1", "stage": "M3_ACT", "parent": None,
+        "base_model": "base", "adapters": ["act_heads"], "frozen": [], "trainable": [],
+        "data": {}, "counts": {"train": 1, "val": 0}, "precision": "fp32", "training": {},
+        "schema_versions": [], "artifacts": {}, "initialization": "base_without_m2",
+    }
+    assert validate_manifest(manifest)["initialization"] == "base_without_m2"

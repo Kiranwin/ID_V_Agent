@@ -42,11 +42,10 @@ def build_policy(args, device):
         rp = RulePolicy(RuleAgent(visual_servo=CipherVisualServo()))
         return rp, None
     if args.mode == "act":
-        if not args.act_checkpoint or not args.act_init_checkpoint:
-            raise ValueError("ACT 模式必须提供 --act-checkpoint 与 --act-init-checkpoint")
+        if not args.act_checkpoint:
+            raise ValueError("ACT 模式必须提供 --act-checkpoint")
         policy = ACTPolicy.from_checkpoint(
             args.act_checkpoint, model_path=args.model_path,
-            init_checkpoint=args.act_init_checkpoint,
             instruction=args.instruction, mode=args.game_mode, device=device,
             capture_fps=args.fps, fast_hz=args.fast_hz, slow_hz=args.slow_hz,
             history_frames=args.history_frames,
@@ -133,9 +132,9 @@ def main(argv=None) -> int:
     p.add_argument("--act-checkpoint", type=Path, default=None,
                    help="M3_ACT 动作块 checkpoint")
     p.add_argument("--act-init-checkpoint", type=Path, default=None,
-                   help="ACT 的 M2_VG 初始化目录")
+                   help="已废弃：ACT 当前不加载 M2_VG")
     p.add_argument("--model-path", default=None,
-                   help="Qwen 基础模型目录；不传则使用 M2 manifest")
+                   help="Qwen 基础模型目录（ACT 当前必填，不加载 M2 manifest）")
     p.add_argument("--instruction", default="找到密码机，靠近并进入破译")
     p.add_argument("--game-mode", choices=["standard", "joint_hunt", "blackjack"], default="standard")
     p.add_argument("--fast-hz", type=float, default=15.0)

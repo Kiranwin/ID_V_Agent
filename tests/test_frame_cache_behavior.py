@@ -130,6 +130,16 @@ def test_encode_batch_applies_one_augmentation_draw_to_one_history_window(tmp_pa
     assert seen == [params, params, params]
 
 
+def test_encode_batch_rejects_persistent_feature_cache_when_augmenting(tmp_path):
+    from idv_agent.scripts.train_vla import encode_batch
+
+    path = tmp_path / "frame.png"
+    Image.new("RGB", (1, 1), (1, 0, 0)).save(path)
+    with pytest.raises(ValueError, match="frame_cache"):
+        encode_batch(_Adapter(), _batch(path, ["same"]), device=torch.device("cpu"),
+                     frame_cache={}, augment_images=True)
+
+
 def test_qwen_batch_singleton_keeps_batch_dimension():
     from types import SimpleNamespace
     from idv_agent.model.qwen_backbone_adapter import Qwen3VLBackboneAdapter
@@ -150,14 +160,14 @@ def test_qwen_batch_singleton_keeps_batch_dimension():
             return {"pixel_values": torch.as_tensor(images).reshape(1, 1, 2),
                     "image_grid_thw": torch.tensor([[1, 1, 1]])}
 
-    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor())
+    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor(), act_feature_dim=8)
     adapter.visual_projection = torch.nn.Linear(2, 2, bias=False)
     adapter.visual_projection.weight.data.copy_(torch.eye(2))
-    adapter.condition_projection = torch.nn.Linear(4, 2, bias=False)
+    adapter.condition_projection = torch.nn.Linear(4, 8, bias=False)
     adapter.condition_projection.weight.data.zero_()
     task = TaskConditionCache(torch.zeros(2), torch.zeros(2), task_id="t")
     result = adapter.encode_frames([[[1.0, 2.0]]], task)
-    assert result.shape == (1, 2)
+    assert result.shape == (1, 8)
 
 
 def test_evaluate_moves_cpu_targets_before_gpu_mask_indexing(monkeypatch):
@@ -217,14 +227,14 @@ def test_qwen_batch_splits_unmerged_flattened_visual_tokens():
                 "image_grid_thw": torch.tensor([[1, 2, 2]]),
             }
 
-    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor())
+    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor(), act_feature_dim=8)
     adapter.visual_projection = torch.nn.Linear(2, 2, bias=False)
     adapter.visual_projection.weight.data.copy_(torch.eye(2))
-    adapter.condition_projection = torch.nn.Linear(4, 2, bias=False)
+    adapter.condition_projection = torch.nn.Linear(4, 8, bias=False)
     adapter.condition_projection.weight.data.zero_()
     task = TaskConditionCache(torch.zeros(2), torch.zeros(2), task_id="t")
     result = adapter.encode_frames([[[1.0, 2.0]], [[3.0, 4.0]]], task)
-    assert result.shape == (2, 2)
+    assert result.shape == (2, 8)
     raw = adapter.encode_raw_frames([[[1.0, 2.0]], [[3.0, 4.0]]])
     assert raw.shape == (2, 64, 2)
     assert torch.equal(result, adapter.project_raw_features(raw, task))
@@ -249,9 +259,9 @@ def test_raw_feature_projection_matches_encode_frames_exactly():
             return {"pixel_values": torch.as_tensor(images).reshape(1, 1, 2),
                     "image_grid_thw": torch.tensor([[1, 1, 1]])}
 
-    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor())
+    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor(), act_feature_dim=8)
     adapter.visual_projection = torch.nn.Linear(2, 2, bias=False)
-    adapter.condition_projection = torch.nn.Linear(4, 2, bias=False)
+    adapter.condition_projection = torch.nn.Linear(4, 8, bias=False)
     task = TaskConditionCache(torch.tensor([1., 2.]), torch.tensor([3., 4.]), task_id="t")
     images = [[[1., 2.]], [[3., 4.]]]
     direct = adapter.encode_frames(images, task)
@@ -275,9 +285,9 @@ def test_raw_feature_projection_matches_single_frame_exactly():
         def image_processor(self, *, images, return_tensors="pt"):
             return {"pixel_values": torch.as_tensor(images).reshape(1, 1, 2),
                     "image_grid_thw": torch.tensor([[1, 1, 1]])}
-    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor())
+    adapter = Qwen3VLBackboneAdapter(Model(), processor=Processor(), act_feature_dim=8)
     adapter.visual_projection = torch.nn.Linear(2, 2, bias=False)
-    adapter.condition_projection = torch.nn.Linear(4, 2, bias=False)
+    adapter.condition_projection = torch.nn.Linear(4, 8, bias=False)
     task = TaskConditionCache(torch.tensor([1., 2.]), torch.tensor([3., 4.]), task_id="t")
     image = [[[1., 2.]]]
     assert torch.equal(adapter.encode_frame(image, task),

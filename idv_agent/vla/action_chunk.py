@@ -38,7 +38,10 @@ CAMERA_BUCKETS = (-2, -1, 0, 1, 2)
 # v5 camera labels are quantized from a macro action's net Raw Input pixels,
 # not from a normalized per-frame value.  The same constants also define the
 # only legal ACT execution magnitudes, keeping labels and deployment aligned.
-CAMERA_BUCKET_EDGES_PX = (12.0, 48.0)
+# Adjacent command representatives are 0/25/110 px.  Class boundaries sit at
+# their midpoints, so a 49--67 px correction remains fine (-/+1), while only
+# 68 px or more is a coarse (-/+2) turn.
+CAMERA_BUCKET_EDGES_PX = (12.0, 67.5)
 CAMERA_BUCKET_COMMAND_PX = {-2: -110.0, -1: -25.0, 0: 0.0, 1: 25.0, 2: 110.0}
 BUTTON_NAMES = ("interact", "vault", "item", "heal", "sprint", "crouch")
 # Top-level tactical intent; sub-intents are optional metadata, not model heads.

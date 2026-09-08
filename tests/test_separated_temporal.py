@@ -64,7 +64,10 @@ def test_separated_forward_produces_valid_outputs():
         run_slow=False
     )
 
-    assert output_fast.slow is None
+    # m28 always exposes its visual state intent/subgoal in the same planner
+    # pass.  Only the legacy temporal diagnostic slow branch is absent here.
+    assert output_fast.slow is not None
+    assert output_fast.prior_slow is None
     assert output_fast.fast.move_logits.shape == (batch_size, 4, 9)
 
 
@@ -91,7 +94,7 @@ def test_single_pass_gradient_flow_is_independent_when_condition_is_fixed():
         run_slow=True, detach_slow_condition=False
     )
 
-    fast_loss = output.fast.move_logits.sum()
+    fast_loss = output.prior_fast.move_logits.sum()
     fast_loss.backward(retain_graph=True)
 
     fast_temporal_has_grad = any(
@@ -108,7 +111,7 @@ def test_single_pass_gradient_flow_is_independent_when_condition_is_fixed():
 
     core.zero_grad()
 
-    slow_loss = output.slow.intent_logits.sum()
+    slow_loss = output.prior_slow.intent_logits.sum()
     slow_loss.backward()
 
     fast_temporal_has_grad = any(
@@ -161,8 +164,8 @@ def test_two_pass_training_scheme_still_couples_fast_loss_into_slow_head():
         p.grad is not None and p.grad.abs().sum() > 0
         for p in core.slow_head.parameters()
     )
-    assert slow_temporal_has_grad, "FiLM path should still couple fast loss into slow_temporal"
-    assert slow_head_has_grad, "FiLM path should still couple fast loss into slow_head"
+    assert not slow_temporal_has_grad, "visual-only deployment output must not couple into slow_temporal"
+    assert not slow_head_has_grad, "visual-only deployment output must not couple into slow_head"
 
     # detach_slow_condition=True on the second pass removes this coupling.
     core.zero_grad()
@@ -173,7 +176,7 @@ def test_two_pass_training_scheme_still_couples_fast_loss_into_slow_head():
         p.grad is not None and p.grad.abs().sum() > 0
         for p in core.slow_temporal.parameters()
     )
-    assert not slow_temporal_has_grad, "detach_slow_condition=True should block the FiLM coupling"
+    assert not slow_temporal_has_grad, "visual-only deployment output should stay independent"
 
 
 if __name__ == "__main__":

@@ -80,7 +80,11 @@ def _buttons(rows):
     names = {str(r.get("category_name", "")).upper() for r in rows}
     held = "+".join(str(r.get("held_keys", "")) for r in rows).lower()
     values = [0] * len(BUTTON_NAMES)
-    values[0] = int(any(n.startswith("INTERACT_") for n in names) or "key:q" in held)
+    # Q starts automatic decoding with one edge-triggered tap.  The decoder
+    # remains active for many later frames, so INTERACT_HOLD is state metadata
+    # and must not become repeated physical Q presses.
+    values[0] = int(any(_num(r.get("decode_start"), 0.0) > 0 for r in rows)
+                    or any(n == "INTERACT_TAP" for n in names))
     values[1] = int("VAULT" in names or "key:space" in held)
     values[2] = int(any(n.startswith("ITEM_") for n in names) or "key:f" in held)
     values[3] = int("key:e" in held)
@@ -256,12 +260,35 @@ def _slow_label_for_frame(frame_idx: int, segments: list[dict], states: dict[int
             "subgoal_source": "unknown"}
 
 
+def _event_decision_label(frame_idx: int, segments: list[dict],
+                          states: dict[int, dict], action: dict) -> tuple[dict, str]:
+    """Build the canonical decision label for a Q edge.
+
+    A manually edited intent segment can lag the actual Q transition by a
+    frame or contain the edge in ``travel``.  The event itself is the
+    authoritative transition into decoding, so the decision label must be
+    ``decipher/start_decoding`` while retaining the source segment for audit.
+    """
+    source = _slow_label_for_frame(frame_idx, segments, states, action)
+    source_segment_id = str(source.get("segment_id", ""))
+    label = {
+        "valid": True,
+        "segment_id": source_segment_id,
+        "intent": "decipher",
+        "subgoal": "start_decoding",
+        "subgoal_source": "rule",
+        "subgoal_rule_version": "subgoal.v1",
+    }
+    return label, source_segment_id
+
+
 def build(session: Path, output: Path, *, stride: int = 3,
           anchor_stride: int | None = None, history_stride: int | None = None,
           history: int = HISTORY_FRAMES, horizon: int = ACTION_CHUNK_HORIZON,
           macro_frames: int = MACRO_FRAMES, action_delay_frames: int = DEFAULT_ACTION_DELAY_FRAMES,
           outcome: str = "unknown", schema_version: str = VLA_SCHEMA_VERSION,
-          slow_period_s: float = 1.0) -> int:
+          slow_period_s: float = 1.0, anchor_frames: list[int] | None = None,
+          event_centered: bool = False) -> int:
     if horizon != ACTION_CHUNK_HORIZON:
         raise ValueError("VLA 要求固定 horizon=4")
     if schema_version == VLA_SCHEMA_VERSION and history != HISTORY_FRAMES:
@@ -272,6 +299,12 @@ def build(session: Path, output: Path, *, stride: int = 3,
         raise ValueError("v5 必须使用 history=8")
     if schema_version not in {VLA_SCHEMA_VERSION, VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5}:
         raise ValueError(f"不支持 schema_version={schema_version!r}")
+    if anchor_frames is not None and event_centered:
+        raise ValueError("anchor_frames 与 event_centered 不能同时使用")
+    if event_centered and schema_version != VLA_SCHEMA_VERSION_V5:
+        raise ValueError("event_centered 仅支持 v5")
+    if event_centered and action_delay_frames != DEFAULT_ACTION_DELAY_FRAMES:
+        raise ValueError("event_centered 必须使用默认 action_delay_frames=1，保证 action_start=q_frame")
     if slow_period_s <= 0:
         raise ValueError("slow_period_s 必须为正数")
     # ``stride`` remains a compatibility alias.  New callers must be able to
@@ -281,7 +314,10 @@ def build(session: Path, output: Path, *, stride: int = 3,
         # v5's canonical sampling separates anchor decorrelation from the
         # temporal spacing inside the observation window.  Legacy v3/v4
         # callers retain the old ``stride`` alias behavior.
-        anchor_stride = 12 if schema_version == VLA_SCHEMA_VERSION_V5 else stride
+        # Four six-frame future macro actions occupy exactly 24 frames. Use
+        # that interval so every future frame belongs to a label window while
+        # adjacent default samples still have disjoint target ranges.
+        anchor_stride = 24 if schema_version == VLA_SCHEMA_VERSION_V5 else stride
     if history_stride is None:
         history_stride = stride
     if schema_version == VLA_SCHEMA_VERSION_V5 and history_stride != 3:
@@ -391,10 +427,28 @@ def build(session: Path, output: Path, *, stride: int = 3,
     # window; it must not change action-history semantics.
     history_action_span = (history * MACRO_FRAMES
                            if schema_version == VLA_SCHEMA_VERSION_V5 else 0)
-    first_anchor = max((history - 1) * history_stride,
-                       history_action_span - 1 if history_action_span else 0)
-    for anchor in range(first_anchor,
-                        len(frames) - action_delay_frames - total_future, anchor_stride):
+    # The runtime can make a cold-start prediction once the eight-frame visual
+    # window is warm; its missing action history is explicitly zero padded.
+    # Do not delay the first v5 sample until eight historical macros exist, or
+    # early Q interactions cannot ever become training targets.
+    first_anchor = ((history - 1) * history_stride
+                    if schema_version != VLA_SCHEMA_VERSION_V5
+                    else (history - 1) * history_stride)
+    if event_centered:
+        event_anchors = sorted({int(row["frame_idx"]) - 2
+                                for row in actions.values()
+                                if _num(row.get("decode_start"), 0.0) > 0})
+        anchors = [anchor for anchor in event_anchors
+                   if first_anchor <= anchor
+                   and anchor + action_delay_frames + total_future < len(frames)]
+    elif anchor_frames is not None:
+        anchors = sorted({int(anchor) for anchor in anchor_frames})
+    else:
+        anchors = range(first_anchor,
+                        len(frames) - action_delay_frames - total_future, anchor_stride)
+    for anchor in anchors:
+        if anchor < first_anchor or anchor + action_delay_frames + total_future >= len(frames):
+            raise ValueError(f"anchor={anchor} 无法形成完整 v5 观测/未来动作窗口")
         history_frames = []
         for offset in range(history - 1, -1, -1):
             idx = anchor - offset * history_stride
@@ -419,14 +473,24 @@ def build(session: Path, output: Path, *, stride: int = 3,
         action_end_ts = int(_num(actions[action_end_frame].get("timestamp_ns"), field=f"action[{action_end_frame}].timestamp_ns"))
         history_actions = []
         if schema_version == VLA_SCHEMA_VERSION_V5:
-            history_start = anchor - history_action_span + 1
-            for history_step in range(history):
-                first = history_start + history_step * MACRO_FRAMES
-                indices = list(range(first, first + MACRO_FRAMES))
-                history_action = _action(
-                    [actions[i] for i in indices], indices, pixel_camera=True)
-                history_action.pop("duration_frames", None)
-                history_actions.append(history_action)
+            if anchor < history_action_span - 1:
+                # The deployed policy starts with an all-zero 72-D history.
+                # Preserve the complete v5 action shape, including pixel
+                # provenance, so collation and cache signatures are identical.
+                history_actions = [{
+                    "move_dir": 0, "camera_dx": 0, "camera_dy": 0,
+                    "buttons": [0] * len(BUTTON_NAMES),
+                    "camera_dx_px": 0.0, "camera_dy_px": 0.0,
+                } for _ in range(history)]
+            else:
+                history_start = anchor - history_action_span + 1
+                for history_step in range(history):
+                    first = history_start + history_step * MACRO_FRAMES
+                    indices = list(range(first, first + MACRO_FRAMES))
+                    history_action = _action(
+                        [actions[i] for i in indices], indices, pixel_camera=True)
+                    history_action.pop("duration_frames", None)
+                    history_actions.append(history_action)
         else:
             for offset in range(history - 1, -1, -1):
                 idx = anchor - offset * history_stride
@@ -455,16 +519,35 @@ def build(session: Path, output: Path, *, stride: int = 3,
                 "action_end_timestamp_ns": action_end_ts,
             },
             "quality": {"source": "teacher", "outcome": outcome},
-            "auxiliary": {"legacy_action_schema": False},
+            "auxiliary": {"legacy_action_schema": False,
+                           "sampling_mode": ("event_centered" if event_centered else "periodic")},
         }
         if schema_version == VLA_SCHEMA_VERSION:
             # v3 keeps the legacy optional field; v4 uses slow_label.intent
             # as the single canonical intent source.
             record["intent"] = ""
         if schema_version in {VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5}:
-            slow_label = _slow_label_for_frame(anchor, intent_segments, frame_states, actions.get(anchor, {}))
+            # Event-centered samples observe the pre-trigger context at
+            # ``q-2`` but make the first action at ``q``.  The top-level slow
+            # label is the decision-time label, otherwise a travel label at
+            # q-2 would supervise the Q-triggered decipher transition.
+            decision_label_frame = action_start_frame if event_centered else anchor
+            decision_action = actions.get(decision_label_frame, {})
+            if (event_centered
+                    and _num(decision_action.get("decode_start"), 0.0) > 0):
+                slow_label, source_segment_id = _event_decision_label(
+                    decision_label_frame, intent_segments, frame_states,
+                    decision_action,
+                )
+            else:
+                slow_label = _slow_label_for_frame(
+                    decision_label_frame, intent_segments, frame_states,
+                    decision_action,
+                )
+                source_segment_id = str(slow_label.get("segment_id", ""))
             record["slow_label"] = slow_label
-            anchor_ts = obs_end_ts
+            anchor_ts = int(_num(actions[decision_label_frame].get("timestamp_ns"),
+                                 field=f"action[{decision_label_frame}].timestamp_ns"))
             segment_id = slow_label.get("segment_id") if slow_label.get("valid") else None
             slow_due = bool(slow_label.get("valid")) and (
                 last_slow_ts is None
@@ -475,6 +558,14 @@ def build(session: Path, output: Path, *, stride: int = 3,
                 last_slow_ts = anchor_ts
                 last_slow_segment = segment_id
             record["loss_mask"] = {"slow": int(slow_due), "fast": 1}
+            if event_centered:
+                record["auxiliary"]["decision_label_frame"] = decision_label_frame
+                record["auxiliary"]["decision_label_source"] = (
+                    "decode_start_event"
+                    if _num(decision_action.get("decode_start"), 0.0) > 0
+                    else "intent_segment"
+                )
+                record["auxiliary"]["source_segment_id"] = source_segment_id
             (validate_v5_record(record) if schema_version == VLA_SCHEMA_VERSION_V5
              else validate_v4_record(record))
         else:
@@ -506,6 +597,8 @@ def main(argv=None):
     parser.add_argument("--schema-version", choices=(VLA_SCHEMA_VERSION, VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5),
                         default=VLA_SCHEMA_VERSION)
     parser.add_argument("--slow-period-s", type=float, default=1.0)
+    parser.add_argument("--event-centered", action="store_true",
+                        help="v5 仅构建 Q 事件中心样本：anchor=q_frame-2，动作从 Q 帧开始")
     args = parser.parse_args(argv)
     history = args.history if args.history is not None else (
         8 if args.schema_version in {VLA_SCHEMA_VERSION_V4, VLA_SCHEMA_VERSION_V5} else HISTORY_FRAMES
@@ -518,7 +611,8 @@ def main(argv=None):
           action_delay_frames=args.action_delay_frames,
           outcome=args.outcome,
           schema_version=args.schema_version,
-          slow_period_s=args.slow_period_s)
+          slow_period_s=args.slow_period_s,
+          event_centered=args.event_centered)
     return 0
 
 

@@ -11,10 +11,18 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import tempfile
 from collections import Counter
 from pathlib import Path
 
-from idv_agent.vla.action_chunk import validate_v4_record, validate_v5_record
+from idv_agent.scripts.build_vla_chunks import build
+from idv_agent.vla.action_chunk import (
+    CAMERA_BUCKET_COMMAND_PX,
+    CAMERA_BUCKET_EDGES_PX,
+    VLA_SCHEMA_VERSION_V5,
+    validate_v4_record,
+    validate_v5_record,
+)
 
 KEEP = {"travel", "decipher"}
 V4_CHUNK_FILENAMES = ("vla_chunks_v4.jsonl", "train_vla_chunks_v4.jsonl")
@@ -101,7 +109,8 @@ def _session_records(path: Path, travel_scope: str) -> list[dict]:
     return out
 
 
-def _session_records_v5(path: Path, travel_scope: str) -> list[dict]:
+def _session_records_v5(path: Path, travel_scope: str,
+                        source_root: Path | None = None) -> list[dict]:
     rows = list(_read_v5(path))
     if travel_scope == "pre_decipher":
         starts = [int(r.get("anchor_frame", 0)) for r in rows
@@ -117,9 +126,36 @@ def _session_records_v5(path: Path, travel_scope: str) -> list[dict]:
         if first is not None and intent == "travel" and int(row.get("anchor_frame", 0)) >= first:
             continue
         row = json.loads(json.dumps(row))
-        row["source_root"] = str(path.parent.resolve())
+        row["source_root"] = str((source_root or path.parent).resolve())
         out.append(row)
     return out
+
+
+def _action_window(row: dict) -> tuple[int, int]:
+    alignment = row["alignment"]
+    return int(alignment["action_start_frame"]), int(alignment["action_end_frame"])
+
+
+def _merge_event_centered_rows(periodic: list[dict], event_centered: list[dict]) -> list[dict]:
+    """Prefer Q-event samples and remove periodic rows with overlapping futures."""
+    event_windows = [_action_window(row) for row in event_centered]
+    retained = []
+    for row in periodic:
+        # A periodic sample that contains Q necessarily uses an anchor before
+        # the UI event.  Event-centered training must never keep that causal
+        # mismatch as a button target; if the event window cannot be built,
+        # drop the event rather than teaching a pre-UI Q shortcut.
+        if any(int(action.get("buttons", [0])[0])
+               for action in row.get("action_chunk", [])):
+            continue
+        start, end = _action_window(row)
+        if any(start <= event_end and event_start <= end
+               for event_start, event_end in event_windows):
+            continue
+        retained.append(row)
+    merged = retained + event_centered
+    return sorted(merged, key=lambda row: (row["episode_id"], int(row["anchor_frame"]),
+                                           row.get("auxiliary", {}).get("sampling_mode", "periodic")))
 
 
 def _split(sessions: list[tuple[str, list[dict]]], val_ratio: float, seed: int,
@@ -232,19 +268,30 @@ def prepare(root: Path, output: Path, *, val_ratio: float, seed: int,
 
 def prepare_v5(root: Path, output: Path, *, val_ratio: float, seed: int,
                val_sessions: set[str] | None, travel_scope: str,
-               max_session_chunks: int | None = None) -> dict:
+               max_session_chunks: int | None = None,
+               event_centered: bool = False) -> dict:
     sessions = []
     candidates = ((path for path in root.iterdir() if path.is_dir())
                   if root.is_dir() else ())
-    for session_dir in sorted(candidates, key=lambda p: p.name):
-        path = _find_v5_chunks(session_dir)
-        if path is None:
-            continue
-        rows = _session_records_v5(path, travel_scope)
-        if max_session_chunks is not None and len(rows) > max_session_chunks:
-            continue
-        if rows:
-            sessions.append((path.parent.name, rows))
+    with tempfile.TemporaryDirectory(prefix="vla_event_centered_") as temp_dir:
+        temp_root = Path(temp_dir)
+        for session_dir in sorted(candidates, key=lambda p: p.name):
+            path = _find_v5_chunks(session_dir)
+            if path is None:
+                continue
+            rows = _session_records_v5(path, travel_scope)
+            if event_centered:
+                event_path = temp_root / f"{session_dir.name}.jsonl"
+                build(session_dir, event_path, history=8, history_stride=3,
+                      macro_frames=6, schema_version=VLA_SCHEMA_VERSION_V5,
+                      event_centered=True)
+                event_rows = _session_records_v5(event_path, travel_scope,
+                                                 source_root=session_dir)
+                rows = _merge_event_centered_rows(rows, event_rows)
+            if max_session_chunks is not None and len(rows) > max_session_chunks:
+                continue
+            if rows:
+                sessions.append((path.parent.name, rows))
     train, val = _split(sessions, val_ratio, seed, val_sessions)
     if not train or not val:
         raise ValueError("train/val session split is empty")
@@ -257,8 +304,11 @@ def prepare_v5(root: Path, output: Path, *, val_ratio: float, seed: int,
     train_stats, val_stats = _stats(train), _stats(val)
     missing = {side: sorted(KEEP - set(stats["intents"])) for side, stats in (("train", train_stats), ("val", val_stats))}
     report = {"schema": "mvp.v5", "chunk_schema": "vla.action_chunk.v5",
+              "camera_bucket_edges_px": list(CAMERA_BUCKET_EDGES_PX),
+              "camera_bucket_command_px": {str(key): value for key, value in CAMERA_BUCKET_COMMAND_PX.items()},
               "keep_intents": sorted(KEEP), "travel_scope": travel_scope,
               "max_session_chunks": max_session_chunks, "seed": seed,
+              "event_centered": bool(event_centered),
               "train": train_stats, "val": val_stats, "missing_intents": missing,
               "session_overlap": sorted(set(train_stats["sessions"]) & set(val_stats["sessions"])),
               "gate_pass": not any(missing.values()) and not (set(train_stats["sessions"]) & set(val_stats["sessions"]))}
@@ -277,11 +327,14 @@ def main(argv=None) -> int:
     p.add_argument("--travel-scope", choices=("all", "pre_decipher"), default="pre_decipher")
     p.add_argument("--max-session-chunks", type=int, default=500,
                    help="只纳入筛选后不超过该数量的短 session；0 表示不限制")
+    p.add_argument("--event-centered", action="store_true",
+                   help="为每个 Q 事件加入 anchor=q-2 样本，并删除未来窗口重叠的周期样本")
     args = p.parse_args(argv)
     report = prepare_v5(args.sessions_root, args.output, val_ratio=args.val_ratio, seed=args.seed,
                      val_sessions={s.strip() for s in args.val_sessions.split(",") if s.strip()} or None,
                      travel_scope=args.travel_scope,
-                     max_session_chunks=(args.max_session_chunks or None))
+                     max_session_chunks=(args.max_session_chunks or None),
+                     event_centered=args.event_centered)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["gate_pass"] else 2
 

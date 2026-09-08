@@ -28,6 +28,8 @@ from idv_agent.model.vla_heads import (
     FiLMConditioner,
     SlowVLAHead,
     SlowVLAOutput,
+    StateDecisionExpert,
+    VisualExpertOutput,
 )
 from idv_agent.vla.action_chunk import INTENTS
 from idv_agent.configs.subgoal import SUBGOAL_NAMES
@@ -58,6 +60,53 @@ class FastSlowVLAOutput:
     temporal_feature: torch.Tensor
     fast: FastVLAOutput
     slow: Optional[SlowVLAOutput]
+    prior_temporal_feature: Optional[torch.Tensor] = None
+    visual: Optional[VisualExpertOutput] = None
+    prior_fast: Optional[FastVLAOutput] = None
+    prior_slow: Optional[SlowVLAOutput] = None
+
+
+def fuse_fast_outputs(visual: FastVLAOutput, prior: FastVLAOutput,
+                      prior_scale: float = 0.5, *, bound_prior: bool = False) -> FastVLAOutput:
+    """Bound history/temporal prior so it cannot erase visual logits."""
+    scale = float(prior_scale)
+    if not 0.0 <= scale <= 1.0:
+        raise ValueError("prior_scale 必须在 [0,1]")
+    prior_logits = (lambda value: torch.tanh(value) if bound_prior else value)
+    visual_event = (visual.interact_event_logits if visual.interact_event_logits is not None
+                    else visual.button_logits[..., 0])
+    prior_event = (prior.interact_event_logits if prior.interact_event_logits is not None
+                   else prior.button_logits[..., 0])
+    event_logits = visual_event + scale * prior_logits(prior_event)
+    button_logits = visual.button_logits + scale * prior_logits(prior.button_logits)
+    button_logits = button_logits.clone()
+    button_logits[..., 0] = event_logits
+    return FastVLAOutput(
+        move_logits=visual.move_logits + scale * prior_logits(prior.move_logits),
+        camera_dx_logits=visual.camera_dx_logits + scale * prior_logits(prior.camera_dx_logits),
+        camera_dy_logits=visual.camera_dy_logits + scale * prior_logits(prior.camera_dy_logits),
+        button_logits=button_logits,
+        duration=(visual.duration + scale * (prior.duration - 6.0)).clamp(1.0, 30.0),
+        confidence=(visual.confidence + scale * (prior.confidence - 0.5)).clamp(0.0, 1.0),
+        stop_or_replan=(visual.stop_or_replan + scale * (prior.stop_or_replan - 0.5)).clamp(0.0, 1.0),
+        intent_context_logits=visual.intent_context_logits + scale * prior_logits(prior.intent_context_logits),
+        interact_event_logits=event_logits,
+    )
+
+
+def fuse_slow_outputs(visual: SlowVLAOutput, prior: SlowVLAOutput,
+                      prior_scale: float = 0.5, *, bound_prior: bool = False) -> SlowVLAOutput:
+    """Fuse tactical logits while retaining visual evidence as the base path."""
+    scale = float(prior_scale)
+    if not 0.0 <= scale <= 1.0:
+        raise ValueError("prior_scale 必须在 [0,1]")
+    prior_logits = (lambda value: torch.tanh(value) if bound_prior else value)
+    return SlowVLAOutput(
+        intent_logits=visual.intent_logits + scale * prior_logits(prior.intent_logits),
+        subgoal_logits=visual.subgoal_logits + scale * prior_logits(prior.subgoal_logits),
+        context_embedding=visual.context_embedding + scale * prior.context_embedding,
+        refresh_logits=visual.refresh_logits + scale * prior_logits(prior.refresh_logits),
+    )
 
 
 class SharedFastSlowVLA(nn.Module):
@@ -85,8 +134,27 @@ class SharedFastSlowVLA(nn.Module):
         self.conditioner = FiLMConditioner(frame_feature_dim)
         self.slow_temporal = SharedTemporalEncoder(frame_feature_dim, temporal_dim)
         self.fast_temporal = SharedTemporalEncoder(frame_feature_dim, temporal_dim)
+        # A direct current-frame path keeps visual evidence available to the
+        # decision heads even when FiLM/GRU dynamics learn a strong prior.
+        # This path is intentionally fed from the unconditioned frame feature
+        # and is added after each temporal encoder.
+        self.slow_visual_residual = nn.Linear(frame_feature_dim, temporal_dim)
+        self.fast_visual_residual = nn.Linear(frame_feature_dim, temporal_dim)
         self.slow_head = SlowVLAHead(temporal_dim)
         self.fast_head = FastVLAHead(temporal_dim, history_action_dim=history_action_dim)
+        # m28: the deployed branch is a state-conditioned joint planner.
+        # ``visual_expert`` is kept as the attribute name to preserve the
+        # calibration/checkpoint plumbing, but it is no longer m27's parallel
+        # direct-head implementation.
+        self.visual_expert = StateDecisionExpert(frame_feature_dim, temporal_dim)
+        self.prior_scale = 0.1
+        # m26 camera decisions are visual-only.  The temporal/history branch
+        # remains diagnostic and cannot alter deployed camera logits.
+        self.camera_prior_scale = 0.0
+        # ACT deployment consumes the directly supervised visual branch.  The
+        # temporal/history branch remains exposed for diagnostics, but does
+        # not form a second copy of the deployed logits.
+        self.visual_only_deployment = True
 
     @staticmethod
     def initial_condition(batch_size: int, device: torch.device | str = "cpu",
@@ -113,6 +181,7 @@ class SharedFastSlowVLA(nn.Module):
         valid_mask: Optional[torch.Tensor] = None,
         time_deltas: Optional[torch.Tensor] = None,
         history_actions: Optional[torch.Tensor] = None,
+        visual_frame_features: Optional[torch.Tensor] = None,
         run_slow: bool = False,
         detach_slow_condition: bool = True,
     ) -> FastSlowVLAOutput:
@@ -126,6 +195,12 @@ class SharedFastSlowVLA(nn.Module):
         """
         if frame_features.ndim == 2:
             frame_features = frame_features.unsqueeze(0)
+        if visual_frame_features is None:
+            visual_frame_features = frame_features
+        elif visual_frame_features.ndim == 2:
+            visual_frame_features = visual_frame_features.unsqueeze(0)
+        if visual_frame_features.shape != frame_features.shape:
+            raise ValueError("visual_frame_features shape 必须与 frame_features 一致")
         condition = slow_condition.detached() if detach_slow_condition else slow_condition
         conditioned = self.conditioner(
             frame_features,
@@ -135,14 +210,67 @@ class SharedFastSlowVLA(nn.Module):
             condition.mode_id,
         )
         # Separated paths: slow and fast each run their own GRU.
-        slow_temporal = self.slow_temporal(conditioned, valid_mask=valid_mask, time_deltas=time_deltas) if run_slow else None
-        fast_temporal = self.fast_temporal(conditioned, valid_mask=valid_mask, time_deltas=time_deltas)
+        indices = self._last_valid_indices(frame_features, valid_mask)
+        rows = torch.arange(frame_features.shape[0], device=frame_features.device)
+        current_visual = frame_features[rows, indices]
+        # The task/mode projection is an explicit m28 State Trunk input.  Do
+        # not route task context through the old slow-condition feedback loop:
+        # that would reintroduce an unmeasured, low-rate action controller.
+        task_features = frame_features - visual_frame_features
+        visual = self.visual_expert(visual_frame_features, valid_mask=valid_mask,
+                                    task_features=task_features)
+        slow_temporal = None
+        if run_slow:
+            slow_temporal = (self.slow_temporal(conditioned, valid_mask=valid_mask,
+                                                time_deltas=time_deltas)
+                             + self.slow_visual_residual(current_visual))
+        fast_temporal = (self.fast_temporal(conditioned, valid_mask=valid_mask,
+                                            time_deltas=time_deltas)
+                         + self.fast_visual_residual(current_visual))
 
-        fast = self.fast_head(fast_temporal, history_actions=history_actions)
-        slow = self.slow_head(slow_temporal) if run_slow and slow_temporal is not None else None
+        prior_fast = self.fast_head(fast_temporal, history_actions=history_actions)
+        # m11 deployment is deliberately visual-only.  The temporal/history
+        # prior remains observable for diagnostics but cannot replace image
+        # evidence at inference time.
+        camera_prior = float(self.camera_prior_scale)
+        fast = FastVLAOutput(
+            move_logits=visual.fast.move_logits,
+            camera_dx_logits=visual.fast.camera_dx_logits + camera_prior *
+                              torch.tanh(prior_fast.camera_dx_logits),
+            camera_dy_logits=visual.fast.camera_dy_logits + camera_prior *
+                              torch.tanh(prior_fast.camera_dy_logits),
+            button_logits=visual.fast.button_logits,
+            duration=visual.fast.duration,
+            confidence=visual.fast.confidence,
+            stop_or_replan=visual.fast.stop_or_replan,
+            intent_context_logits=visual.fast.intent_context_logits,
+            interact_event_logits=visual.fast.interact_event_logits,
+        )
+        prior_slow = self.slow_head(slow_temporal) if run_slow and slow_temporal is not None else None
+        # m28 state intent/subgoal is part of every deployed planner pass. It
+        # must be available even when the legacy temporal diagnostic branch is
+        # disabled, otherwise callers are tempted to run a second old-style
+        # SlowCondition pass before every action.
+        slow = visual.slow
 
-        # Return fast_temporal as the canonical temporal feature for compatibility
-        return FastSlowVLAOutput(temporal_feature=fast_temporal, fast=fast, slow=slow)
+        # The deployment decision feature must include the independent visual
+        # expert; diagnostics therefore cannot certify a prior-only GRU path.
+        decision_feature = visual.feature
+        return FastSlowVLAOutput(temporal_feature=decision_feature, fast=fast, slow=slow,
+                                 prior_temporal_feature=fast_temporal,
+                                 visual=visual, prior_fast=prior_fast, prior_slow=prior_slow)
+
+    @staticmethod
+    def _last_valid_indices(frame_features: torch.Tensor,
+                            valid_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if valid_mask is None:
+            return torch.full((frame_features.shape[0],), frame_features.shape[1] - 1,
+                              dtype=torch.long, device=frame_features.device)
+        if valid_mask.ndim == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != frame_features.shape[:2]:
+            raise ValueError("valid_mask shape 必须与 frame_features 的 [B,L] 一致")
+        return valid_mask.long().sum(dim=1).clamp_min(1) - 1
 
     @staticmethod
     def condition_from_slow_output(

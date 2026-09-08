@@ -137,6 +137,10 @@ class SharedTemporalEncoder(nn.Module):
         self.delta_proj = nn.Linear(1, self.input_dim)
         self.gru = nn.GRU(self.input_dim, self.hidden_dim, num_layers=num_layers,
                           batch_first=True)
+        # A direct last-frame path is deliberately retained beside the GRU.
+        # In the previous ACT stack a saturated recurrent gate could reduce
+        # different spatial scenes to virtually the same hidden state.
+        self.input_residual = nn.Linear(self.input_dim, self.hidden_dim)
 
     def forward(
         self,
@@ -165,10 +169,12 @@ class SharedTemporalEncoder(nn.Module):
             raise ValueError("time_deltas shape 必须为 [B,L]")
 
         delta = self.delta_proj(time_deltas.to(features.dtype).unsqueeze(-1))
-        sequence, _ = self.gru(features + delta)
+        gru_input = features + delta
+        sequence, _ = self.gru(gru_input)
         # Select the last valid state, not necessarily the final padded slot.
         indices = valid_mask.long().sum(dim=1).clamp_min(1) - 1
-        pooled = sequence[torch.arange(batch, device=device), indices]
+        rows = torch.arange(batch, device=device)
+        pooled = sequence[rows, indices] + self.input_residual(gru_input[rows, indices])
         if return_sequence:
             return pooled, sequence
         return pooled

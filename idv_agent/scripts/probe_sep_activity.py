@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
-from idv_agent.scripts.train_vla import _load_act_backbone
+from idv_agent.scripts.train_vla import _load_act_base_backbone
 from PIL import Image
 from PIL import ImageDraw
 
@@ -72,21 +72,22 @@ def _occlude(image: Image.Image, side: str) -> Image.Image:
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", default="checkpoints/M3_ACT_spatial/act_spatial_b1_030.pt")
-    p.add_argument("--init-checkpoint", default="checkpoints/M2_VG_spatial")
+    p.add_argument("--model-path", default="", help="基础 Qwen 模型；默认从 ACT manifest 读取")
+    p.add_argument("--init-checkpoint", default="", help="已废弃：不会加载 M2")
     p.add_argument("--device", default="cuda")
     p.add_argument("--frames", nargs="*", default=["tmp/feature_activity/00000003.jpg",
                                                        "tmp/feature_activity/00002888.jpg",
                                                        "tmp/feature_activity/00003715.jpg"])
     args = p.parse_args(argv)
     ckpt = Path(args.checkpoint)
-    init_ckpt = args.init_checkpoint
-    base = (json.load(open(init_ckpt + "/manifest.json", encoding="utf-8"))["base_model"])
+    act_manifest = json.loads((ckpt.parent / "manifest.json").read_text(encoding="utf-8"))
+    base = args.model_path or act_manifest["base_model"]
     dev = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     amp = dev.type == "cuda"
     dtype = torch.float16 if amp else torch.float32
-    adapter, _, pm = _load_act_backbone(base, init_ckpt, dtype=torch.float16 if amp else torch.float32, device=dev)
+    adapter, _ = _load_act_base_backbone(base, dtype=torch.float16 if amp else torch.float32, device=dev)
     adapter.eval()
-    # spatial_agg reload happens inside _load_act_backbone (enable)
+    # Diagnostic spatial_agg is loaded explicitly from the ACT checkpoint.
     saved = torch.load(ckpt, map_location="cpu", weights_only=False)
     adapter.visual_projection.load_state_dict(saved["adapter"]["visual_projection"])
     adapter.condition_projection.load_state_dict(saved["adapter"]["condition_projection"])
@@ -95,7 +96,7 @@ def main(argv=None):
         adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
     manifest = json.load(open(Path(ckpt).parent / "manifest.json", encoding="utf-8"))
     td = int(manifest["training"]["temporal_dim"])
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=td,
+    core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=td,
                              history_action_dim=72).to(dev)
     core.load_state_dict(saved["core"])
     core.eval()

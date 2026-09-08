@@ -18,8 +18,13 @@ import torch
 
 from idv_agent.capture.screen_capture import CaptureConfig, ScreenCapture
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA, SlowCondition
-from idv_agent.scripts.train_vla import _load_act_backbone
-from idv_agent.vla.action_chunk import BUTTON_NAMES, MOVE_DIRECTIONS, CAMERA_BUCKETS
+from idv_agent.model.act_checkpoint import ACT_CAMERA_PRIOR_SCALE, load_visual_grounded_act_checkpoint
+from idv_agent.scripts.train_vla import _load_act_base_backbone
+from idv_agent.vla.action_chunk import BUTTON_NAMES, MOVE_DIRECTIONS, CAMERA_BUCKETS, MACRO_FRAMES
+
+
+ACT_HISTORY_FRAMES = 8
+ACT_HISTORY_STRIDE = 3
 
 
 def parse_output_size(value: str) -> tuple[int, int]:
@@ -101,7 +106,8 @@ def action_step_to_text(step: ActionChunkStep) -> str:
 class RealtimeWindow:
     """Small rolling feature window used by both ACT consumers."""
 
-    def __init__(self, max_length: int = 3):
+    def __init__(self, max_length: int = ACT_HISTORY_FRAMES * ACT_HISTORY_STRIDE -
+                 (ACT_HISTORY_STRIDE - 1)):
         if max_length < 1:
             raise ValueError("max_length 必须为正数")
         self.max_length = int(max_length)
@@ -115,6 +121,18 @@ class RealtimeWindow:
             self._items.append((int(frame_index), int(timestamp_ns), feature))
             self._items = self._items[-self.max_length:]
 
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def ready(self, *, history_frames: int = ACT_HISTORY_FRAMES,
+              history_stride: int = ACT_HISTORY_STRIDE) -> bool:
+        """Whether the full strided ACT v5 observation window is available."""
+        if history_frames < 1 or history_stride < 1:
+            raise ValueError("history_frames/history_stride 必须为正数")
+        span = (int(history_frames) - 1) * int(history_stride) + 1
+        return len(self) >= span
+
     def snapshot(self) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
         with self._lock:
             items = list(self._items)
@@ -123,6 +141,22 @@ class RealtimeWindow:
         values = torch.stack([item[2] for item in items], dim=0).unsqueeze(0)
         valid = torch.ones((1, values.shape[1]), dtype=torch.bool, device=values.device)
         return values, valid, [item[0] for item in items]
+
+    def snapshot_window(self, *, history_frames: int = ACT_HISTORY_FRAMES,
+                        history_stride: int = ACT_HISTORY_STRIDE) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        """Return the exact recent strided window consumed by ACT v5."""
+        if history_frames < 1 or history_stride < 1:
+            raise ValueError("history_frames/history_stride 必须为正数")
+        span = (int(history_frames) - 1) * int(history_stride) + 1
+        with self._lock:
+            items = list(self._items)
+        if len(items) < span:
+            raise RuntimeError(f"ACT v5 窗口未预热：需要 {span} 个采集帧，当前 {len(items)}")
+        start = len(items) - span
+        selected = [items[start + index * int(history_stride)] for index in range(int(history_frames))]
+        values = torch.stack([item[2] for item in selected], dim=0).unsqueeze(0)
+        valid = torch.ones((1, values.shape[1]), dtype=torch.bool, device=values.device)
+        return values, valid, [item[0] for item in selected]
 
     def latest_capture_time(self) -> float | None:
         with self._lock:
@@ -136,43 +170,55 @@ def _sync(device: torch.device) -> None:
 
 def _load_model(args: argparse.Namespace, device: torch.device):
     amp_dtype = torch.float16 if device.type == "cuda" else torch.float32
-    adapter, _, parent_manifest = _load_act_backbone(
-        args.model_path, args.init_checkpoint, dtype=amp_dtype, device=device)
+    adapter, _ = _load_act_base_backbone(args.model_path, dtype=amp_dtype, device=device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if "adapter" not in checkpoint or "core" not in checkpoint:
-        raise ValueError("ACT checkpoint 缺少 adapter/core")
-    adapter.visual_projection.load_state_dict(checkpoint["adapter"]["visual_projection"])
-    adapter.condition_projection.load_state_dict(checkpoint["adapter"]["condition_projection"])
-    if "spatial_agg" in checkpoint["adapter"]:
-        agg_state = checkpoint["adapter"]["spatial_agg"]
-        adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
     temporal_dim = int(checkpoint.get("manifest", {}).get("training", {}).get("temporal_dim", args.temporal_dim))
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=temporal_dim,
+    core = SharedFastSlowVLA(getattr(adapter, "act_feature_dim", adapter.hidden_size), temporal_dim=temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
-    core.load_state_dict(checkpoint["core"])
+    load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
+    configured_camera_prior = float(
+        checkpoint.get("manifest", {}).get("training", {}).get(
+            "camera_prior_scale", ACT_CAMERA_PRIOR_SCALE))
+    if configured_camera_prior != ACT_CAMERA_PRIOR_SCALE:
+        raise ValueError("m26 ACT manifest 的 camera_prior_scale 必须为 0")
+    core.camera_prior_scale = ACT_CAMERA_PRIOR_SCALE
+    core.interact_event_threshold = float(
+        checkpoint.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
+    )
+    core.execution_horizon = int(
+        checkpoint.get("manifest", {}).get("training", {}).get("execution_horizon", 1)
+    )
+    if core.execution_horizon != 1:
+        raise ValueError("ACT runtime 仅接受 m25 execution_horizon=1 checkpoint")
     adapter.eval()
     core.eval()
-    return adapter, core, parent_manifest
+    return adapter, core, {"stage": "base_without_m2"}
 
 
 def _predict(core: SharedFastSlowVLA, window: RealtimeWindow, condition: SlowCondition,
-             device: torch.device):
-    features, valid, _ = window.snapshot()
+             device: torch.device, visual_window: RealtimeWindow | None = None,
+             *, history_frames: int = ACT_HISTORY_FRAMES,
+             history_stride: int = ACT_HISTORY_STRIDE):
+    features, valid, _ = window.snapshot_window(
+        history_frames=history_frames, history_stride=history_stride)
+    visual_features = features if visual_window is None else visual_window.snapshot_window(
+        history_frames=history_frames, history_stride=history_stride)[0]
     history = torch.zeros((1, 72), device=device, dtype=torch.float32)
     with torch.inference_mode():
-        output = core(features, condition, valid_mask=valid, history_actions=history,
+        output = core(features, condition, valid_mask=valid, visual_frame_features=visual_features,
+                      history_actions=history,
                       run_slow=False)
     fast = output.fast
     move = fast.move_logits.argmax(-1)[0]
     dx = fast.camera_dx_logits.argmax(-1)[0]
     dy = fast.camera_dy_logits.argmax(-1)[0]
-    buttons = (fast.button_logits.sigmoid() >= 0.5)[0]
-    duration = fast.duration[0]
+    event_threshold = float(getattr(core, "interact_event_threshold", 0.0))
+    buttons = fast.button_predictions(event_threshold=event_threshold)[0]
     steps = []
-    for i in range(fast.move_logits.shape[1]):
+    for i in range(int(core.execution_horizon)):
         steps.append(ActionChunkStep(
             int(move[i]), CAMERA_BUCKETS[int(dx[i])], CAMERA_BUCKETS[int(dy[i])],
-            tuple(int(v) for v in buttons[i].tolist()), int(round(float(duration[i])))))
+            tuple(int(v) for v in buttons[i].tolist()), MACRO_FRAMES))
     return output, steps
 
 
@@ -180,21 +226,22 @@ def run(args: argparse.Namespace) -> dict:
     device = torch.device(args.device)
     adapter, core, parent_manifest = _load_model(args, device)
     task_cache = adapter.encode_task_once(args.instruction, args.mode, task_id="realtime-benchmark")
-    window = RealtimeWindow(args.history_frames)
+    window_span = (args.history_frames - 1) * args.history_stride + 1
+    window = RealtimeWindow(window_span)
+    visual_window = RealtimeWindow(window_span)
     condition = core.initial_condition(1, device=device, mode_id=0)
     condition.mode_id = torch.tensor([0], dtype=torch.long, device=device)
-    slow_period = 1.0 / args.slow_hz
     fast_period = 1.0 / args.fast_hz
     start_time = time.perf_counter()
-    next_fast = next_slow = start_time
-    captures = encoded = fast_ticks = slow_ticks = 0
-    timings = {"capture": [], "encode": [], "fast": [], "slow": [], "total": [], "feature_age": []}
+    next_fast = start_time
+    captures = encoded = fast_ticks = 0
+    timings = {"capture": [], "encode": [], "planner": [], "total": [], "feature_age": []}
     latest_frame = LatestFrameSlot()
     stop = Event()
     capture_done = Event()
     worker_error: list[BaseException] = []
     print(f"[act-realtime] dry_run=True device={device} capture_fps={args.capture_fps} "
-          f"fast_hz={args.fast_hz} slow_hz={args.slow_hz}")
+          f"planner_hz={args.fast_hz}")
     deadline = time.perf_counter() + args.seconds
     cfg = CaptureConfig(fps=args.capture_fps, region=args.region,
                         output_size=args.output_size, window_title=args.title)
@@ -234,11 +281,20 @@ def run(args: argparse.Namespace) -> dict:
                 rgb = cv2.cvtColor(item.payload, cv2.COLOR_BGR2RGB)
                 image = Image.fromarray(rgb)
                 t0 = time.perf_counter()
-                feature = adapter.encode_frame(image, task_cache).to(torch.float32)
+                pair = getattr(adapter, "encode_frames_with_visual", None)
+                if pair is not None:
+                    feature, visual_feature = pair([image], task_cache)
+                    feature = feature[0].to(torch.float32)
+                    visual_feature = visual_feature[0].to(torch.float32)
+                else:
+                    feature = adapter.encode_frame(image, task_cache).to(torch.float32)
+                    visual_feature = feature
                 _sync(device)
                 timings["encode"].append((time.perf_counter() - t0) * 1000)
                 window.append(feature, frame_index=item.frame_index,
                               timestamp_ns=int(item.captured_at * 1_000_000_000))
+                visual_window.append(visual_feature, frame_index=item.frame_index,
+                                     timestamp_ns=int(item.captured_at * 1_000_000_000))
                 encoded += 1
         except BaseException as exc:
             worker_error.append(exc)
@@ -250,34 +306,27 @@ def run(args: argparse.Namespace) -> dict:
     vision_thread = threading.Thread(target=vision_worker, name="act-vision", daemon=True)
     capture_thread.start()
     vision_thread.start()
-    next_fast = next_slow = time.perf_counter()
+    next_fast = time.perf_counter()
     while not stop.is_set() and time.perf_counter() < deadline:
         tick_start = time.perf_counter()
         now = time.perf_counter()
         latest_ts = window.latest_capture_time()
         if latest_ts is not None:
             timings["feature_age"].append(max(0.0, time.perf_counter() - latest_ts) * 1000)
-        if latest_ts is not None and now >= next_slow:
-            t0 = time.perf_counter()
-            features, valid, _ = window.snapshot()
-            history = torch.zeros((1, 72), device=device, dtype=torch.float32)
-            with torch.inference_mode():
-                slow_pass = core(features, condition, valid_mask=valid,
-                                 history_actions=history, run_slow=True)
-            _sync(device)
-            timings["slow"].append((time.perf_counter() - t0) * 1000)
-            condition = core.condition_from_slow_output(slow_pass.slow, condition.mode_id)
-            slow_ticks += 1
-            while next_slow <= now:
-                next_slow += slow_period
         if latest_ts is not None and now >= next_fast:
             t0 = time.perf_counter()
-            _, steps = _predict(core, window, condition, device)
+            if not window.ready(history_frames=args.history_frames,
+                               history_stride=args.history_stride):
+                continue
+            output, steps = _predict(core, window, condition, device, visual_window,
+                                     history_frames=args.history_frames,
+                                     history_stride=args.history_stride)
             _sync(device)
-            timings["fast"].append((time.perf_counter() - t0) * 1000)
+            timings["planner"].append((time.perf_counter() - t0) * 1000)
             fast_ticks += 1
+            intent = int(output.visual.slow.intent_id[0]) if output.visual is not None else -1
             print(f"[act:{fast_ticks}] frame={window.snapshot()[2][-1]} "
-                  f"condition_intent={int(condition.intent_id[0])} "
+                  f"state_intent={intent} "
                   f"step0={action_step_to_text(steps[0])}")
             while next_fast <= now:
                 next_fast += fast_period
@@ -287,7 +336,7 @@ def run(args: argparse.Namespace) -> dict:
         # capture thread and make the benchmark report zero captures.
         if latest_ts is None:
             time.sleep(0.001)
-        remaining = min(next_fast, next_slow, deadline) - time.perf_counter()
+        remaining = min(next_fast, deadline) - time.perf_counter()
         if remaining > 0:
             time.sleep(min(remaining, 0.005))
     stop.set()
@@ -303,10 +352,10 @@ def run(args: argparse.Namespace) -> dict:
         values = sorted(values)
         return {"n": len(values), "mean_ms": statistics.mean(values),
                 "p95_ms": values[max(0, int(len(values) * .95) - 1)], "max_ms": max(values)}
-    result = {"captures": captures, "encoded": encoded, "fast_ticks": fast_ticks,
-              "slow_ticks": slow_ticks, "device": str(device),
+    result = {"captures": captures, "encoded": encoded, "planner_ticks": fast_ticks,
+              "device": str(device),
               "checkpoint": str(Path(args.checkpoint).resolve()),
-              "parent_stage": parent_manifest["stage"],
+              "initialization": parent_manifest["stage"],
               "latency": {key: summarize(value) for key, value in timings.items()}}
     print(result)
     return result
@@ -315,7 +364,6 @@ def run(args: argparse.Namespace) -> dict:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model-path", required=True)
-    p.add_argument("--init-checkpoint", required=True)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--device", default="cuda")
     p.add_argument("--title", default="第五人格")
@@ -324,8 +372,8 @@ def main(argv=None) -> int:
                    help="可选下采样尺寸，例如 640,384")
     p.add_argument("--capture-fps", type=int, default=30)
     p.add_argument("--fast-hz", type=float, default=15)
-    p.add_argument("--slow-hz", type=float, default=1)
-    p.add_argument("--history-frames", type=int, default=3)
+    p.add_argument("--history-frames", type=int, default=ACT_HISTORY_FRAMES)
+    p.add_argument("--history-stride", type=int, default=ACT_HISTORY_STRIDE)
     p.add_argument("--seconds", type=float, default=10)
     p.add_argument("--mode", default="standard")
     p.add_argument("--instruction", default="找到密码机，靠近并进入破译")
@@ -336,8 +384,12 @@ def main(argv=None) -> int:
         if len(values) != 4:
             p.error("--region 需要 left,top,width,height")
         args.region = values
-    if args.seconds <= 0 or args.capture_fps <= 0 or args.fast_hz <= 0 or args.slow_hz <= 0:
+    if args.seconds <= 0 or args.capture_fps <= 0 or args.fast_hz <= 0:
         p.error("时间和频率参数必须为正数")
+    if args.history_frames != ACT_HISTORY_FRAMES:
+        p.error(f"ACT v5 必须使用 history_frames={ACT_HISTORY_FRAMES}")
+    if args.history_stride != ACT_HISTORY_STRIDE:
+        p.error(f"ACT v5 必须使用 history_stride={ACT_HISTORY_STRIDE}")
     run(args)
     return 0
 

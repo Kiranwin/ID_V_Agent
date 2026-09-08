@@ -23,7 +23,7 @@ import torch
 from PIL import Image
 
 from idv_agent.model.spatial_grid_feature import build_spatial_grid_encoder
-from idv_agent.scripts.train_vla import _load_act_backbone
+from idv_agent.scripts.train_vla import _load_act_base_backbone
 
 
 def _signal(v: torch.Tensor) -> dict:
@@ -58,11 +58,10 @@ def main(argv=None):
     ckpt = Path(args.checkpoint)
     manifest = json.loads((ckpt.parent / "manifest.json").read_text(encoding="utf-8"))
     base_model = manifest["base_model"]
-    init_ckpt = manifest["parent"]
     probe_images = [Image.open(path).convert("RGB") for path in args.frames]
     names = [Path(x).name for x in args.frames]
 
-    adapter, _, _ = _load_act_backbone(base_model, init_ckpt, dtype=dtype, device=dev)
+    adapter, _ = _load_act_base_backbone(base_model, dtype=dtype, device=dev)
     adapter.eval()
 
     raw_cells = adapter.encode_raw_frames(probe_images, micro_batch_size=len(args.frames))  # [N,k*k,1024]

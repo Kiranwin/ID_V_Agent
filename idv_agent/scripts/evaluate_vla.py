@@ -15,8 +15,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
-from idv_agent.scripts.train_vla import (_contiguous_subset, _dataset_paths, _load_act_backbone,
-                                          encode_batch, _model_inputs, _scheduled_condition)
+from idv_agent.model.act_checkpoint import ACT_CAMERA_PRIOR_SCALE, load_visual_grounded_act_checkpoint
+from idv_agent.scripts.train_vla import (_contiguous_subset, _dataset_paths, _load_act_base_backbone,
+                                          encode_batch, _model_inputs)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
 from idv_agent.training.vla_loss import compute_vla_loss
@@ -32,16 +33,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     loader = DataLoader(dataset, batch_size=max(1, min(args.batch_size, 2)), shuffle=False,
                         collate_fn=VLASequenceCollator(max_frames=8))
 
-    adapter, _, parent_manifest = _load_act_backbone(
-        args.model_path, args.init_checkpoint,
-        dtype=torch.float16 if amp_enabled else torch.float32, device=device)
+    adapter, _ = _load_act_base_backbone(
+        args.model_path, dtype=torch.float16 if amp_enabled else torch.float32, device=device)
     act_manifest = load_manifest(Path(args.checkpoint).parent / "manifest.json",
                                  require_artifacts=True)
     if act_manifest["stage"] != "M3_ACT":
         raise ValueError(f"评估 checkpoint 必须是 M3_ACT，收到 {act_manifest['stage']}")
-    for name in ("visual_projection", "condition_projection"):
-        getattr(adapter, name).to(device=device, dtype=torch.float32)
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
+    adapter.condition_projection.to(device=device, dtype=torch.float32)
+    core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(
         device=device, dtype=torch.float32)
 
@@ -49,11 +48,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     with torch.no_grad():
         encode_batch(adapter, first, device=device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if "adapter" not in checkpoint or "core" not in checkpoint:
-        raise ValueError(f"ACT checkpoint 缺少 adapter/core: {args.checkpoint}")
-    adapter.visual_projection.load_state_dict(checkpoint["adapter"]["visual_projection"])
-    adapter.condition_projection.load_state_dict(checkpoint["adapter"]["condition_projection"])
-    core.load_state_dict(checkpoint["core"])
+    load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
+    core.camera_prior_scale = float(
+        checkpoint.get("manifest", {}).get("training", {}).get(
+            "camera_prior_scale", ACT_CAMERA_PRIOR_SCALE))
+    event_threshold = float(
+        checkpoint.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
+    )
+    core.interact_event_threshold = event_threshold
     adapter.eval()
     core.eval()
     frame_cache: dict[tuple[str, int, str], torch.Tensor] = {}
@@ -70,34 +72,24 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     with torch.no_grad():
         for batch in loader:
             model_batch = _model_inputs(batch, device)
-            features = encode_batch(adapter, batch, device=device, frame_cache=frame_cache,
-                                    frame_stats=frame_stats)
+            features, visual_features = encode_batch(
+                adapter, batch, device=device, frame_cache=frame_cache,
+                frame_stats=frame_stats, return_visual=True)
             condition = core.initial_condition(features.shape[0], device=device, mode_id=0)
             condition.mode_id = model_batch["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                # Evaluation must mirror deployment: the fast head consumes
-                # the slow head's own discrete predictions and context, never
-                # ground-truth intent/subgoal (teacher forcing ratio=0).
-                slow_pass = core(features, condition,
-                                 valid_mask=model_batch["frame_valid_mask"],
-                                 history_actions=model_batch["history_actions"], run_slow=True)
-                if slow_pass.slow is None:
-                    raise RuntimeError("slow pass 未产生 SlowVLAOutput")
-                next_condition = _scheduled_condition(
-                    core, slow_pass.slow, model_batch, teacher_forcing_ratio=0.0,
-                )
-                fast_pass = core(features, next_condition,
-                                 valid_mask=model_batch["frame_valid_mask"],
-                                 history_actions=model_batch["history_actions"], run_slow=False,
-                                 detach_slow_condition=False)
-                output = type(slow_pass)(temporal_feature=fast_pass.temporal_feature,
-                                         fast=fast_pass.fast, slow=slow_pass.slow)
+                # m28 evaluation mirrors deployment: one StateDecision pass
+                # whose planner consumes only predicted soft beliefs.
+                output = core(features, condition,
+                              valid_mask=model_batch["frame_valid_mask"],
+                              visual_frame_features=visual_features,
+                              history_actions=model_batch["history_actions"], run_slow=False)
                 losses = compute_vla_loss(output.fast, output.slow, model_batch)
             sample_mask = model_batch["fast_loss_mask"] > 0
             move_pred = output.fast.move_logits.argmax(-1)
             dx_pred = output.fast.camera_dx_logits.argmax(-1)
             dy_pred = output.fast.camera_dy_logits.argmax(-1)
-            buttons_pred = (output.fast.button_logits.sigmoid() >= 0.5).to(torch.float32)
+            buttons_pred = output.fast.button_predictions(event_threshold=event_threshold).to(torch.float32)
             move_target = model_batch["move_target"]
             dx_target = model_batch["camera_dx_target"]
             dy_target = model_batch["camera_dy_target"]
@@ -145,7 +137,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "data": [str(args.data)], "samples": records,
         "checkpoint": str(Path(args.checkpoint).resolve()),
-        "parent_stage": parent_manifest["stage"],
+        "initialization": "base_without_m2",
         "unique_frames_encoded": len(frame_cache),
         "frame_cache": {
             "hits": frame_stats["hits"], "misses": frame_stats["encoded"],
@@ -178,7 +170,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True, help="一个或多个 vla_chunks_v5.jsonl（逗号/分号分隔）")
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--init-checkpoint", required=True, help="M2_VG 目录")
+    parser.add_argument("--init-checkpoint", default="", help="已废弃：仅为旧命令兼容，不会加载 M2")
     parser.add_argument("--checkpoint", required=True, help="M3_ACT act_*.pt")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=1)

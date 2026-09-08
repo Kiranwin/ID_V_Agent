@@ -49,6 +49,55 @@ class FastVLAOutput:
     confidence: torch.Tensor
     stop_or_replan: torch.Tensor
     intent_context_logits: torch.Tensor
+    # Independent one-shot interaction event (Q) logits.  The first column of
+    # ``button_logits`` mirrors this tensor for wire compatibility, but is not
+    # part of the ordinary held-button loss.
+    interact_event_logits: Optional[torch.Tensor] = None
+
+    def button_predictions(self, *, event_threshold: float = 0.0) -> torch.Tensor:
+        """Decode wire-format buttons with the calibrated one-shot Q threshold."""
+        threshold = torch.as_tensor(event_threshold)
+        if not bool(torch.isfinite(threshold)):
+            raise ValueError("event_threshold 必须是有限数")
+        predictions = self.button_logits.sigmoid() >= 0.5
+        event_logits = (self.interact_event_logits
+                        if self.interact_event_logits is not None
+                        else self.button_logits[..., 0])
+        predictions = predictions.clone()
+        predictions[..., 0] = event_logits >= float(event_threshold)
+        return predictions
+
+
+@dataclass
+class VisualExpertOutput:
+    """History-free visual predictions and their decision representation."""
+
+    fast: FastVLAOutput
+    slow: SlowVLAOutput
+    feature: torch.Tensor
+    grounding: Optional["GroundingOutput"] = None
+    camera_control: Optional["CameraControlOutput"] = None
+
+
+@dataclass
+class GroundingOutput:
+    """Training-only visual grounding predictions for the current input frame."""
+    present_logits: torch.Tensor
+    bbox: torch.Tensor
+    side_logits: torch.Tensor
+    prompt_logits: torch.Tensor
+    reachable_logits: torch.Tensor
+
+
+@dataclass
+class CameraControlOutput:
+    """Visual-only predictions of human camera/path control semantics."""
+    phase_logits: torch.Tensor
+    target_id_logits: torch.Tensor
+    steering_logits: torch.Tensor
+    path_logits: torch.Tensor
+    desired_turn_dx_logits: torch.Tensor
+    desired_turn_dy_logits: torch.Tensor
 
 
 class FiLMConditioner(nn.Module):
@@ -108,15 +157,16 @@ class SlowVLAHead(nn.Module):
     """Low-frequency tactical intent/subgoal/context head."""
 
     def __init__(self, feature_dim: int, context_dim: int = CONTEXT_EMBEDDING_DIM,
-                 refresh_classes: int = 3):
+                 refresh_classes: int = 3, *, bias: bool = True, direct: bool = False):
         super().__init__()
         if feature_dim < 1 or context_dim != CONTEXT_EMBEDDING_DIM:
             raise ValueError("feature_dim 必须为正数且 context_dim 必须为 256")
-        self.intent = nn.Linear(feature_dim, len(INTENTS))
-        self.subgoal = nn.Linear(feature_dim, len(SUBGOAL_NAMES))
-        self.context = nn.Sequential(nn.Linear(feature_dim, feature_dim), nn.GELU(),
-                                     nn.Linear(feature_dim, context_dim))
-        self.refresh = nn.Linear(feature_dim, refresh_classes)
+        self.intent = nn.Linear(feature_dim, len(INTENTS), bias=bias)
+        self.subgoal = nn.Linear(feature_dim, len(SUBGOAL_NAMES), bias=bias)
+        self.context = (nn.Linear(feature_dim, context_dim, bias=bias) if direct else
+                        nn.Sequential(nn.Linear(feature_dim, feature_dim, bias=bias), nn.GELU(),
+                                      nn.Linear(feature_dim, context_dim, bias=bias)))
+        self.refresh = nn.Linear(feature_dim, refresh_classes, bias=bias)
 
     def forward(self, temporal_feature: torch.Tensor) -> SlowVLAOutput:
         if temporal_feature.ndim == 1:
@@ -135,24 +185,32 @@ class FastVLAHead(nn.Module):
     """High-frequency action-chunk head with fixed v3/v4 action dimensions."""
 
     def __init__(self, feature_dim: int, history_action_dim: int = 0,
-                 horizon: int = ACTION_CHUNK_HORIZON):
+                 horizon: int = ACTION_CHUNK_HORIZON, *, bias: bool = True, direct: bool = False):
         super().__init__()
         if feature_dim < 1 or horizon < 1:
             raise ValueError("feature_dim/horizon 必须为正数")
         self.horizon = int(horizon)
         input_dim = feature_dim + max(0, int(history_action_dim))
-        self.trunk = nn.Sequential(nn.Linear(input_dim, feature_dim), nn.GELU(),
-                                   nn.Linear(feature_dim, feature_dim), nn.GELU())
-        self.move = nn.Linear(feature_dim, self.horizon * len(MOVE_DIRECTIONS))
-        self.camera_dx = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS))
-        self.camera_dy = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS))
-        self.buttons = nn.Linear(feature_dim, self.horizon * 6)
+        if direct:
+            if history_action_dim:
+                raise ValueError("direct FastVLAHead 不允许 history actions")
+            self.trunk = nn.Identity()
+        else:
+            self.trunk = nn.Sequential(nn.Linear(input_dim, feature_dim, bias=bias), nn.GELU(),
+                                       nn.Linear(feature_dim, feature_dim, bias=bias), nn.GELU())
+        self.move = nn.Linear(feature_dim, self.horizon * len(MOVE_DIRECTIONS), bias=bias)
+        self.camera_dx = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS), bias=bias)
+        self.camera_dy = nn.Linear(feature_dim, self.horizon * len(CAMERA_BUCKETS), bias=bias)
+        # Five ordinary button channels; the one-shot Q event has its own
+        # classifier below and is mirrored into button_logits[..., 0].
+        self.buttons = nn.Linear(feature_dim, self.horizon * 5, bias=bias)
+        self.interact_event = nn.Linear(feature_dim, self.horizon, bias=bias)
         # Duration is a bounded scalar in frames; sigmoid is mapped to 1..30.
-        self.duration = nn.Linear(feature_dim, self.horizon)
-        self.confidence = nn.Linear(feature_dim, 1)
-        self.stop = nn.Linear(feature_dim, 1)
+        self.duration = nn.Linear(feature_dim, self.horizon, bias=bias)
+        self.confidence = nn.Linear(feature_dim, 1, bias=bias)
+        self.stop = nn.Linear(feature_dim, 1, bias=bias)
         # Auxiliary intent prediction used only for fast/slow consistency.
-        self.intent_context = nn.Linear(feature_dim, len(INTENTS))
+        self.intent_context = nn.Linear(feature_dim, len(INTENTS), bias=bias)
         self.history_action_dim = max(0, int(history_action_dim))
 
     def forward(self, temporal_feature: torch.Tensor,
@@ -170,13 +228,501 @@ class FastVLAHead(nn.Module):
         hidden = self.trunk(temporal_feature)
         batch = hidden.shape[0]
         reshape = lambda value, width: value.view(batch, self.horizon, width)
+        ordinary_button_logits = reshape(self.buttons(hidden), 5)
+        interact_event_logits = self.interact_event(hidden).view(batch, self.horizon)
+        button_logits = torch.cat((interact_event_logits.unsqueeze(-1), ordinary_button_logits), dim=-1)
         return FastVLAOutput(
             move_logits=reshape(self.move(hidden), len(MOVE_DIRECTIONS)),
             camera_dx_logits=reshape(self.camera_dx(hidden), len(CAMERA_BUCKETS)),
             camera_dy_logits=reshape(self.camera_dy(hidden), len(CAMERA_BUCKETS)),
-            button_logits=reshape(self.buttons(hidden), 6),
+            button_logits=button_logits,
             duration=1.0 + 29.0 * torch.sigmoid(self.duration(hidden)),
             confidence=torch.sigmoid(self.confidence(hidden)).squeeze(-1),
             stop_or_replan=torch.sigmoid(self.stop(hidden)).squeeze(-1),
             intent_context_logits=self.intent_context(hidden),
+            interact_event_logits=interact_event_logits,
         )
+
+
+class VisualActionExpert(nn.Module):
+    """Predict action and tactical outputs from image evidence only.
+
+    The input explicitly contains the latest visual state and its change from
+    the first valid observation.  It intentionally has no history-action or
+    slow-condition input, making the visual path inspectable and deployable.
+    """
+
+    def __init__(self, frame_feature_dim: int, temporal_dim: int,
+                 horizon: int = ACTION_CHUNK_HORIZON, *, max_frames: int = 8):
+        super().__init__()
+        if frame_feature_dim < 1 or temporal_dim < 1 or horizon < 1:
+            raise ValueError("frame_feature_dim/temporal_dim/horizon 必须为正数")
+        self.frame_feature_dim = int(frame_feature_dim)
+        self.temporal_dim = int(temporal_dim)
+        self.max_frames = int(max_frames)
+        if self.max_frames < 1:
+            raise ValueError("max_frames 必须为正数")
+        # Preserve the whole visual window.  The previous expert only kept
+        # first/last frames, which discarded the camera trajectory in the
+        # middle of the observation window.
+        self.sequence_dim = self.frame_feature_dim * self.max_frames
+        self.pair_dim = self.sequence_dim + self.frame_feature_dim
+        self.visual_feature_scale = 0.25
+        self.register_buffer("input_center", torch.zeros(self.pair_dim), persistent=True)
+        self.input_norm = nn.LayerNorm(self.pair_dim, elementwise_affine=False)
+        self.fast = FastVLAHead(self.pair_dim, history_action_dim=0, horizon=horizon,
+                                bias=False, direct=True)
+        self.slow = SlowVLAHead(self.pair_dim, bias=False, direct=True)
+        # Sparse event channels need a calibrated negative baseline.  The
+        # parameter is initialized from the train-subset event rate and
+        # remains trainable so visual evidence can move it away from prior.
+        self.interact_event_bias = nn.Parameter(torch.zeros(horizon))
+        # Ordinary held buttons use an independent five-channel baseline;
+        # Q is intentionally excluded because it is an edge-triggered event.
+        self.ordinary_button_bias = nn.Parameter(torch.zeros(horizon, 5))
+        self.camera_summary_dim = self.frame_feature_dim * 5
+        self.camera_summary_scale = 0.25
+        # Keep the direct full-window visual signal in the camera path and
+        # fuse it with the trajectory summary instead of replacing it.
+        self.camera_visual_pair_dx = nn.Linear(self.pair_dim,
+                                               self.fast.horizon * len(CAMERA_BUCKETS),
+                                               bias=False)
+        self.camera_visual_pair_dy = nn.Linear(self.pair_dim,
+                                               self.fast.horizon * len(CAMERA_BUCKETS),
+                                               bias=False)
+        self.camera_visual_dx = nn.Linear(self.camera_summary_dim,
+                                          self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        self.camera_visual_dy = nn.Linear(self.camera_summary_dim,
+                                          self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        # These heads consume the direct full visual pair, never history,
+        # temporal prior, slow condition, YOLO detections, or runtime rules.
+        self.grounding_present = nn.Linear(self.pair_dim, 1, bias=False)
+        self.grounding_bbox = nn.Linear(self.pair_dim, 4, bias=False)
+        self.grounding_side = nn.Linear(self.pair_dim, 4, bias=False)
+        self.grounding_prompt = nn.Linear(self.pair_dim, 1, bias=False)
+        self.grounding_reachable = nn.Linear(self.pair_dim, 1, bias=False)
+        self.camera_control_phase = nn.Linear(self.pair_dim, 4, bias=False)
+        self.camera_control_target_id = nn.Linear(self.pair_dim, 3, bias=False)
+        self.camera_control_steering = nn.Linear(self.pair_dim, 4, bias=False)
+        self.camera_control_path = nn.Linear(self.pair_dim, 4, bias=False)
+        self.desired_turn_dx = nn.Linear(self.pair_dim, len(CAMERA_BUCKETS), bias=False)
+        self.desired_turn_dy = nn.Linear(self.pair_dim, len(CAMERA_BUCKETS), bias=False)
+        # Predicted grounding is a learned visual condition for camera only.
+        # The five logits are produced from pixels by the modules above; this
+        # path has no annotation/runtime input. Zero initialization keeps the
+        # previous direct-pair camera behavior until joint losses establish a
+        # useful side/prompt-to-turn mapping.
+        self.camera_grounding_dim = 7  # present + side(4) + prompt + reachable
+        self.camera_grounding_dx = nn.Linear(
+            self.camera_grounding_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        self.camera_grounding_dy = nn.Linear(
+            self.camera_grounding_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        self.camera_control_dim = 4 + 3 + 4 + 4 + 2 * len(CAMERA_BUCKETS)
+        self.camera_control_dx = nn.Linear(
+            self.camera_control_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        self.camera_control_dy = nn.Linear(
+            self.camera_control_dim, self.fast.horizon * len(CAMERA_BUCKETS), bias=False)
+        nn.init.zeros_(self.camera_grounding_dx.weight)
+        nn.init.zeros_(self.camera_grounding_dy.weight)
+        nn.init.zeros_(self.camera_control_dx.weight)
+        nn.init.zeros_(self.camera_control_dy.weight)
+
+    @staticmethod
+    def _valid_indices(frame_features: torch.Tensor,
+                       valid_mask: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, steps, _ = frame_features.shape
+        if valid_mask is None:
+            first = torch.zeros(batch, dtype=torch.long, device=frame_features.device)
+            last = torch.full((batch,), steps - 1, dtype=torch.long, device=frame_features.device)
+            return first, last
+        if valid_mask.ndim == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != (batch, steps):
+            raise ValueError("valid_mask shape 必须为 [B,L]")
+        valid_mask = valid_mask.bool()
+        if not bool(valid_mask.any(dim=1).all()):
+            raise ValueError("每个视觉窗口至少需要一帧有效画面")
+        first = valid_mask.long().argmax(dim=1)
+        last = valid_mask.long().sum(dim=1).clamp_min(1) - 1
+        return first, last
+
+    def forward(self, frame_features: torch.Tensor,
+                valid_mask: Optional[torch.Tensor] = None) -> VisualExpertOutput:
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        if frame_features.ndim != 3 or frame_features.shape[-1] != self.frame_feature_dim:
+            raise ValueError(f"frame_features 必须是 [B,L,{self.frame_feature_dim}]")
+        feature = (self.normalized_pair_features(frame_features, valid_mask=valid_mask) *
+                   self.visual_feature_scale).float()
+        # The direct 8192 -> logits path is intentionally kept in FP32.  On
+        # Turing GPUs, FP16 autocast can overflow its reduction/linear
+        # gradients even though LayerNorm's output is finite.
+        with torch.autocast(device_type=feature.device.type, enabled=False):
+            fast = self.fast(feature)
+            slow = self.slow(feature)
+            event_bias = self.interact_event_bias.to(fast.button_logits).view(1, self.fast.horizon)
+            ordinary_bias = self.ordinary_button_bias.to(
+                fast.button_logits).view(1, self.fast.horizon, 5)
+            event_logits = fast.interact_event_logits + event_bias
+            fast.interact_event_logits = event_logits
+            fast.button_logits = fast.button_logits.clone()
+            fast.button_logits[..., 0] = event_logits
+            fast.button_logits[..., 1:] = fast.button_logits[..., 1:] + ordinary_bias
+        grounding = GroundingOutput(
+            present_logits=self.grounding_present(feature).squeeze(-1),
+            bbox=torch.sigmoid(self.grounding_bbox(feature)),
+            side_logits=self.grounding_side(feature),
+            prompt_logits=self.grounding_prompt(feature).squeeze(-1),
+            reachable_logits=self.grounding_reachable(feature).squeeze(-1),
+        )
+        camera_control = CameraControlOutput(
+            phase_logits=self.camera_control_phase(feature),
+            target_id_logits=self.camera_control_target_id(feature),
+            steering_logits=self.camera_control_steering(feature),
+            path_logits=self.camera_control_path(feature),
+            desired_turn_dx_logits=self.desired_turn_dx(feature),
+            desired_turn_dy_logits=self.desired_turn_dy(feature),
+        )
+        camera = self.camera_summary(frame_features, valid_mask=valid_mask)
+        batch = camera.shape[0]
+        pair_dx = self.camera_visual_pair_dx(feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        pair_dy = self.camera_visual_pair_dy(feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        summary_dx = self.camera_visual_dx(camera).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        summary_dy = self.camera_visual_dy(camera).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        grounding_feature = torch.cat((grounding.present_logits.unsqueeze(-1), grounding.side_logits,
+                                       grounding.prompt_logits.unsqueeze(-1),
+                                       grounding.reachable_logits.unsqueeze(-1)), dim=-1)
+        grounding_dx = self.camera_grounding_dx(grounding_feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        grounding_dy = self.camera_grounding_dy(grounding_feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        control_feature = torch.cat((camera_control.phase_logits, camera_control.target_id_logits,
+                                     camera_control.steering_logits, camera_control.path_logits,
+                                     camera_control.desired_turn_dx_logits,
+                                     camera_control.desired_turn_dy_logits), dim=-1)
+        control_dx = self.camera_control_dx(control_feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        control_dy = self.camera_control_dy(control_feature).view(
+            batch, self.fast.horizon, len(CAMERA_BUCKETS))
+        fast.camera_dx_logits = pair_dx + summary_dx + grounding_dx + control_dx
+        fast.camera_dy_logits = pair_dy + summary_dy + grounding_dy + control_dy
+        return VisualExpertOutput(fast=fast, slow=slow, feature=feature, grounding=grounding,
+                                  camera_control=camera_control)
+
+    def set_interact_event_bias(self, bias: torch.Tensor) -> None:
+        """Initialize only the independent one-shot interaction baseline."""
+        bias = bias.detach().to(device=self.interact_event_bias.device,
+                                dtype=self.interact_event_bias.dtype).reshape(-1)
+        if bias.shape != self.interact_event_bias.shape or not bool(torch.isfinite(bias).all()):
+            raise ValueError(f"interact event bias 必须是有限 [{self.fast.horizon}] Tensor")
+        with torch.no_grad():
+            self.interact_event_bias.copy_(bias)
+
+    def set_ordinary_button_bias(self, bias: torch.Tensor) -> None:
+        """Initialize the five ordinary held-button baselines."""
+        bias = bias.detach().to(device=self.ordinary_button_bias.device,
+                                dtype=self.ordinary_button_bias.dtype)
+        if bias.shape != self.ordinary_button_bias.shape or not bool(torch.isfinite(bias).all()):
+            raise ValueError(f"ordinary button bias 必须是有限 [{self.fast.horizon},5] Tensor")
+        with torch.no_grad():
+            self.ordinary_button_bias.copy_(bias)
+
+    def camera_summary(self, frame_features: torch.Tensor,
+                       valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Summarize camera-relevant visual trajectory without raw flattening."""
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        first_index, last_index = self._valid_indices(frame_features, valid_mask)
+        rows = torch.arange(frame_features.shape[0], device=frame_features.device)
+        first = frame_features[rows, first_index]
+        last = frame_features[rows, last_index]
+        if valid_mask is None:
+            valid = torch.ones(frame_features.shape[:2], dtype=torch.bool,
+                               device=frame_features.device)
+        else:
+            valid = valid_mask.bool()
+            if valid.ndim == 1:
+                valid = valid.unsqueeze(0)
+            if valid.shape != frame_features.shape[:2]:
+                raise ValueError("valid_mask shape 必须为 [B,L]")
+        mean = (frame_features * valid.unsqueeze(-1)).sum(dim=1) / valid.sum(dim=1, keepdim=True).clamp_min(1)
+        if frame_features.shape[1] > 1:
+            delta = frame_features[:, 1:] - frame_features[:, :-1]
+            delta_valid = valid[:, 1:] & valid[:, :-1]
+            delta_mean = (delta * delta_valid.unsqueeze(-1)).sum(dim=1) / delta_valid.sum(dim=1, keepdim=True).clamp_min(1)
+        else:
+            delta_mean = torch.zeros_like(last)
+        summary = torch.cat((first, last, mean, last - first, delta_mean), dim=-1)
+        sequence_dim = self.frame_feature_dim * self.max_frames
+        center = self.input_center[:sequence_dim]
+        center_first = center[:self.frame_feature_dim]
+        center_last = center[(self.max_frames - 1) * self.frame_feature_dim:self.max_frames * self.frame_feature_dim]
+        center_mean = center[:self.frame_feature_dim * self.max_frames].reshape(
+            self.max_frames, self.frame_feature_dim).mean(dim=0)
+        center_delta = self.input_center[sequence_dim:]
+        summary_center = torch.cat((center_first, center_last, center_mean,
+                                    center_last - center_first, center_delta), dim=-1)
+        return (summary - summary_center.to(summary)) * self.camera_summary_scale
+
+    def pair_features(self, frame_features: torch.Tensor,
+                      valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return raw ``[all_frames, last-first]`` features for calibration."""
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        if frame_features.ndim != 3 or frame_features.shape[-1] != self.frame_feature_dim:
+            raise ValueError(f"frame_features 必须是 [B,L,{self.frame_feature_dim}]")
+        first_index, last_index = self._valid_indices(frame_features, valid_mask)
+        rows = torch.arange(frame_features.shape[0], device=frame_features.device)
+        first = frame_features[rows, first_index]
+        last = frame_features[rows, last_index]
+        if frame_features.shape[1] > self.max_frames:
+            raise ValueError(f"视觉窗口长度不能超过 {self.max_frames}")
+        sequence = torch.zeros((frame_features.shape[0], self.max_frames,
+                                self.frame_feature_dim), device=frame_features.device,
+                               dtype=frame_features.dtype)
+        sequence[:, :frame_features.shape[1]] = frame_features
+        return torch.cat((sequence.reshape(frame_features.shape[0], -1), last - first), dim=-1)
+
+    def set_input_center(self, center: torch.Tensor) -> None:
+        center = center.detach().reshape(-1).to(device=self.input_center.device,
+                                                 dtype=self.input_center.dtype)
+        if center.shape != self.input_center.shape or not bool(torch.isfinite(center).all()):
+            raise ValueError(f"visual input center 必须是有限 [{self.pair_dim}] Tensor")
+        self.input_center.copy_(center)
+
+    def normalized_pair_features(self, frame_features: torch.Tensor,
+                                 valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        pair = self.pair_features(frame_features, valid_mask=valid_mask)
+        return self.input_norm(pair - self.input_center.to(pair))
+
+
+class StateDecisionExpert(nn.Module):
+    """Shared visual state trunk followed by a joint h0 action planner.
+
+    m28's deployment path is deliberately not a collection of parallel image
+    classifiers.  The complete spatial frame sequence first produces one
+    trainable state ``z``.  Intent, grounding and route-control logits are
+    predicted from that same state.  The planner then consumes only ``z`` and
+    differentiable *predicted* state embeddings to produce move, camera and Q
+    logits together.  Annotation sidecars supervise those state predictions
+    during training but are never arguments to ``forward``.
+    """
+
+    def __init__(self, frame_feature_dim: int, temporal_dim: int,
+                 horizon: int = ACTION_CHUNK_HORIZON, *, max_frames: int = 8):
+        super().__init__()
+        if frame_feature_dim < 1 or temporal_dim < 1 or horizon < 1:
+            raise ValueError("frame_feature_dim/temporal_dim/horizon 必须为正数")
+        self.frame_feature_dim = int(frame_feature_dim)
+        self.temporal_dim = int(temporal_dim)
+        self.max_frames = int(max_frames)
+        if self.max_frames < 1:
+            raise ValueError("max_frames 必须为正数")
+        self.sequence_dim = self.frame_feature_dim * self.max_frames
+        self.pair_dim = self.sequence_dim + self.frame_feature_dim
+        self.visual_feature_scale = 0.25
+        self.register_buffer("input_center", torch.zeros(self.pair_dim), persistent=True)
+        self.input_norm = nn.LayerNorm(self.pair_dim, elementwise_affine=False)
+        # This is a learned projection of the full ordered spatial sequence,
+        # not a mean pool.  Every frame cell and the explicit last-first delta
+        # has a distinct input coordinate.
+        self.state_trunk = nn.Sequential(
+            nn.Linear(self.pair_dim, self.temporal_dim, bias=False),
+            nn.GELU(),
+            nn.LayerNorm(self.temporal_dim),
+        )
+        # ``task_features`` is the per-frame task/mode projection produced by
+        # the backbone adapter (conditioned feature minus pure visual feature).
+        # It keeps instruction/mode available to m28 without letting the old
+        # FiLM/GRU diagnostic branch become a hidden action controller.
+        self.task_state_projection = nn.Linear(self.frame_feature_dim, self.temporal_dim, bias=False)
+        self.task_state_norm = nn.LayerNorm(self.frame_feature_dim, elementwise_affine=False)
+        self.state_fusion_norm = nn.LayerNorm(self.temporal_dim, elementwise_affine=False)
+        self.task_state_scale = 0.25
+        self.slow = SlowVLAHead(self.temporal_dim, bias=False, direct=True)
+        self.grounding_present = nn.Linear(self.temporal_dim, 1, bias=False)
+        self.grounding_bbox = nn.Linear(self.temporal_dim, 4, bias=False)
+        self.grounding_side = nn.Linear(self.temporal_dim, 4, bias=False)
+        self.grounding_prompt = nn.Linear(self.temporal_dim, 1, bias=False)
+        self.grounding_reachable = nn.Linear(self.temporal_dim, 1, bias=False)
+        self.camera_control_phase = nn.Linear(self.temporal_dim, 4, bias=False)
+        self.camera_control_target_id = nn.Linear(self.temporal_dim, 3, bias=False)
+        self.camera_control_steering = nn.Linear(self.temporal_dim, 4, bias=False)
+        self.camera_control_path = nn.Linear(self.temporal_dim, 4, bias=False)
+
+        # Soft embeddings keep the decision path differentiable while making
+        # it impossible to inject a label id at deployment.
+        self.intent_state = nn.Embedding(len(INTENTS), 16)
+        self.subgoal_state = nn.Embedding(len(SUBGOAL_NAMES), 24)
+        self.present_state = nn.Embedding(2, 4)
+        self.side_state = nn.Embedding(4, 8)
+        self.prompt_state = nn.Embedding(2, 4)
+        self.reachable_state = nn.Embedding(2, 4)
+        self.phase_state = nn.Embedding(4, 8)
+        self.target_state = nn.Embedding(3, 8)
+        self.steering_state = nn.Embedding(4, 8)
+        self.path_state = nn.Embedding(4, 8)
+        # z + intent/subgoal + present/side/prompt/reachable + phase/target/
+        # steering/path + bbox = temporal_dim + 96.
+        planner_dim = self.temporal_dim + 16 + 24 + 4 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 4
+        self.planner = FastVLAHead(planner_dim, history_action_dim=0, horizon=horizon, bias=False)
+        # Sparse Q / held keys retain learned training-set baselines, but
+        # their visual evidence now comes from the shared planner state.
+        self.interact_event_bias = nn.Parameter(torch.zeros(horizon))
+        self.ordinary_button_bias = nn.Parameter(torch.zeros(horizon, 5))
+
+    @staticmethod
+    def _valid_indices(frame_features: torch.Tensor,
+                       valid_mask: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, steps, _ = frame_features.shape
+        if valid_mask is None:
+            return (torch.zeros(batch, dtype=torch.long, device=frame_features.device),
+                    torch.full((batch,), steps - 1, dtype=torch.long, device=frame_features.device))
+        if valid_mask.ndim == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != (batch, steps):
+            raise ValueError("valid_mask shape 必须为 [B,L]")
+        valid = valid_mask.bool()
+        if not bool(valid.any(dim=1).all()):
+            raise ValueError("每个视觉窗口至少需要一帧有效画面")
+        return valid.long().argmax(dim=1), valid.long().sum(dim=1).clamp_min(1) - 1
+
+    def pair_features(self, frame_features: torch.Tensor,
+                      valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        if frame_features.ndim != 3 or frame_features.shape[-1] != self.frame_feature_dim:
+            raise ValueError(f"frame_features 必须是 [B,L,{self.frame_feature_dim}]")
+        first_index, last_index = self._valid_indices(frame_features, valid_mask)
+        rows = torch.arange(frame_features.shape[0], device=frame_features.device)
+        first, last = frame_features[rows, first_index], frame_features[rows, last_index]
+        if frame_features.shape[1] > self.max_frames:
+            raise ValueError(f"视觉窗口长度不能超过 {self.max_frames}")
+        sequence = torch.zeros((frame_features.shape[0], self.max_frames, self.frame_feature_dim),
+                               device=frame_features.device, dtype=frame_features.dtype)
+        sequence[:, :frame_features.shape[1]] = frame_features
+        return torch.cat((sequence.reshape(frame_features.shape[0], -1), last - first), dim=-1)
+
+    def normalized_pair_features(self, frame_features: torch.Tensor,
+                                 valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.input_norm(self.pair_features(frame_features, valid_mask=valid_mask) -
+                               self.input_center.to(frame_features))
+
+    def set_input_center(self, center: torch.Tensor) -> None:
+        center = center.detach().reshape(-1).to(device=self.input_center.device,
+                                                 dtype=self.input_center.dtype)
+        if center.shape != self.input_center.shape or not bool(torch.isfinite(center).all()):
+            raise ValueError(f"visual input center 必须是有限 [{self.pair_dim}] Tensor")
+        self.input_center.copy_(center)
+
+    @staticmethod
+    def _soft_class(logits: torch.Tensor, table: nn.Embedding) -> torch.Tensor:
+        return torch.softmax(logits, dim=-1) @ table.weight
+
+    @staticmethod
+    def _soft_binary(logit: torch.Tensor, table: nn.Embedding) -> torch.Tensor:
+        probability = torch.sigmoid(logit).unsqueeze(-1)
+        return torch.cat((1.0 - probability, probability), dim=-1) @ table.weight
+
+    def planner_from_predicted_state(self, state: torch.Tensor, slow: SlowVLAOutput,
+                                     grounding: GroundingOutput,
+                                     control_logits: tuple[torch.Tensor, torch.Tensor,
+                                                           torch.Tensor, torch.Tensor]) -> FastVLAOutput:
+        """Plan from ``z`` and predicted belief logits only; no label inputs."""
+        phase, target, steering, path = control_logits
+        planner_input = torch.cat((
+            state,
+            self._soft_class(slow.intent_logits, self.intent_state),
+            self._soft_class(slow.subgoal_logits, self.subgoal_state),
+            self._soft_binary(grounding.present_logits, self.present_state),
+            self._soft_class(grounding.side_logits, self.side_state),
+            self._soft_binary(grounding.prompt_logits, self.prompt_state),
+            self._soft_binary(grounding.reachable_logits, self.reachable_state),
+            self._soft_class(phase, self.phase_state),
+            self._soft_class(target, self.target_state),
+            self._soft_class(steering, self.steering_state),
+            self._soft_class(path, self.path_state),
+            grounding.bbox,
+        ), dim=-1)
+        fast = self.planner(planner_input)
+        event_bias = self.interact_event_bias.to(fast.button_logits).view(1, self.planner.horizon)
+        ordinary_bias = self.ordinary_button_bias.to(fast.button_logits).view(1, self.planner.horizon, 5)
+        event_logits = fast.interact_event_logits + event_bias
+        fast.interact_event_logits = event_logits
+        fast.button_logits = fast.button_logits.clone()
+        fast.button_logits[..., 0] = event_logits
+        fast.button_logits[..., 1:] = fast.button_logits[..., 1:] + ordinary_bias
+        return fast
+
+    def forward(self, frame_features: torch.Tensor,
+                valid_mask: Optional[torch.Tensor] = None,
+                task_features: Optional[torch.Tensor] = None) -> VisualExpertOutput:
+        if frame_features.ndim == 2:
+            frame_features = frame_features.unsqueeze(0)
+        if task_features is not None:
+            if task_features.ndim == 2:
+                task_features = task_features.unsqueeze(0)
+            if task_features.shape != frame_features.shape:
+                raise ValueError("task_features shape 必须与 frame_features 一致")
+        pair = self.normalized_pair_features(frame_features, valid_mask=valid_mask)
+        # Keep state/core arithmetic FP32 on Turing, as with m27 direct heads.
+        with torch.autocast(device_type=pair.device.type, enabled=False):
+            state = self.state_trunk((pair * self.visual_feature_scale).float())
+            if task_features is not None:
+                _first, last = self._valid_indices(frame_features, valid_mask)
+                rows = torch.arange(frame_features.shape[0], device=frame_features.device)
+                # The adapter's conditioned-minus-pure vector has a model-
+                # dependent magnitude.  Normalize it before the shared-state
+                # injection and bound its contribution, otherwise the task
+                # path can dominate the first multi-task backward pass.
+                task = self.task_state_norm(task_features[rows, last].float())
+                state = state + self.task_state_scale * self.task_state_projection(task)
+            # Both visual and task residuals update during ACT.  Keep their
+            # merged state on the same bounded scale before every state head
+            # and the planner consume it; otherwise a few early task-path
+            # updates can make intent CE dominate the shared-state gradient.
+            state = self.state_fusion_norm(state)
+            slow = self.slow(state)
+            grounding = GroundingOutput(
+                present_logits=self.grounding_present(state).squeeze(-1),
+                bbox=torch.sigmoid(self.grounding_bbox(state)),
+                side_logits=self.grounding_side(state),
+                prompt_logits=self.grounding_prompt(state).squeeze(-1),
+                reachable_logits=self.grounding_reachable(state).squeeze(-1),
+            )
+            phase = self.camera_control_phase(state)
+            target = self.camera_control_target_id(state)
+            steering = self.camera_control_steering(state)
+            path = self.camera_control_path(state)
+            fast = self.planner_from_predicted_state(state, slow, grounding,
+                                                     (phase, target, steering, path))
+        # desired_turn is deliberately an alias of the planner h0 output:
+        # human intent labels therefore supervise the camera that deployment
+        # will execute, rather than an auxiliary, disconnected classifier.
+        control = CameraControlOutput(
+            phase_logits=phase, target_id_logits=target, steering_logits=steering,
+            path_logits=path, desired_turn_dx_logits=fast.camera_dx_logits[:, 0],
+            desired_turn_dy_logits=fast.camera_dy_logits[:, 0],
+        )
+        return VisualExpertOutput(fast=fast, slow=slow, feature=state,
+                                  grounding=grounding, camera_control=control)
+
+    def set_interact_event_bias(self, bias: torch.Tensor) -> None:
+        bias = bias.detach().to(device=self.interact_event_bias.device,
+                                dtype=self.interact_event_bias.dtype).reshape(-1)
+        if bias.shape != self.interact_event_bias.shape or not bool(torch.isfinite(bias).all()):
+            raise ValueError(f"interact event bias 必须是有限 [{self.planner.horizon}] Tensor")
+        with torch.no_grad():
+            self.interact_event_bias.copy_(bias)
+
+    def set_ordinary_button_bias(self, bias: torch.Tensor) -> None:
+        bias = bias.detach().to(device=self.ordinary_button_bias.device,
+                                dtype=self.ordinary_button_bias.dtype)
+        if bias.shape != self.ordinary_button_bias.shape or not bool(torch.isfinite(bias).all()):
+            raise ValueError(f"ordinary button bias 必须是有限 [{self.planner.horizon},5] Tensor")
+        with torch.no_grad():
+            self.ordinary_button_bias.copy_(bias)

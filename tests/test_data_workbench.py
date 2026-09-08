@@ -125,10 +125,10 @@ def test_init_intents_refuses_existing_file_without_overwrite(tmp_path: Path):
     assert (session / "intent_segments.csv").read_text(encoding="utf-8") == "sentinel"
 
 
-def start_test_server(root: Path):
+def start_test_server(root: Path, *, camera_control_dir: Path | None = None):
     from idv_agent.scripts.data_workbench import create_server
 
-    server = create_server(root, "127.0.0.1", 0)
+    server = create_server(root, "127.0.0.1", 0, camera_control_dir)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -151,6 +151,75 @@ def request(server, path: str, *, method: str = "GET", payload: object = None):
 def get_json(server, path: str) -> dict:
     response = request(server, path)
     return json.loads(response.read().decode("utf-8"))
+
+
+def write_camera_control_template(path: Path, *, split: str = "train") -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    row = {
+        "schema_version": "act.camera_control_annotation.v2",
+        "id": "s1_00000021",
+        "split": split,
+        "session": "s1",
+        "frame": 21,
+        "image_path": "unused-by-ui.jpg",
+        "existing_grounding": {
+            "cipher_bbox_xyxy_norm": [0.1, 0.2, 0.3, 0.4],
+            "target_side": "right", "interact_prompt": 0, "cipher_reachable": 1,
+        },
+        "replay_camera_dx": 2, "replay_camera_dy": 0,
+        "camera_control_phase": None, "camera_target_id": None,
+        "camera_steering_mode": None, "path_strategy": None,
+        "desired_turn_dx": None, "desired_turn_dy": None, "status": "pending",
+    }
+    (path / f"camera_control_{split}.v2.pending.jsonl").write_text(
+        json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+def test_camera_control_ui_serves_context_and_writes_annotated_copy(tmp_path: Path):
+    raw_root = tmp_path / "sessions"
+    make_valid_session(raw_root / "s1", frame_count=22)
+    annotation_dir = tmp_path / "annotations"
+    write_camera_control_template(annotation_dir, split="train")
+    write_camera_control_template(annotation_dir, split="val")
+    pending = annotation_dir / "camera_control_train.v2.pending.jsonl"
+    pending_before = pending.read_text(encoding="utf-8")
+    server = start_test_server(raw_root, camera_control_dir=annotation_dir)
+    try:
+        response = request(server, "/camera-control")
+        assert response.status == 200
+        page = response.read()
+        assert b"Camera Control Annotation" in page
+        assert b'id="replay-play"' in page
+        assert b'id="replay-slider"' in page
+        sets = get_json(server, "/api/camera-control/sets")
+        assert sets["splits"]["train"]["pending"] == 1
+        context = get_json(server, "/api/camera-control/train/rows/s1_00000021/context")
+        assert [item["frame"] for item in context["frames"]] == list(range(23, 29))
+        frame = request(server, "/api/camera-control/train/rows/s1_00000021/frames/21")
+        assert frame.status == 200
+        assert frame.read() == b"jpeg"
+
+        payload = {"annotation": {
+            "camera_control_phase": "target_acquire",
+            "camera_target_id": "target_cipher",
+            "camera_steering_mode": "target_center",
+            "path_strategy": "unknown",
+            "desired_turn_dx": 2, "desired_turn_dy": 0, "status": "complete",
+        }}
+        saved = request(server, "/api/camera-control/train/rows/s1_00000021", method="PUT", payload=payload)
+        assert saved.status == 200
+        assert json.loads(saved.read())["row"]["desired_turn_dx"] == 2
+        annotated = annotation_dir / "camera_control_train.v2.annotated.jsonl"
+        assert annotated.is_file()
+        assert pending.read_text(encoding="utf-8") == pending_before
+
+        invalid = request(server, "/api/camera-control/train/rows/s1_00000021", method="PUT", payload={"annotation": {"session": "escape"}})
+        assert invalid.status == 400
+        assert json.loads(annotated.read_text(encoding="utf-8"))["session"] == "s1"
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_http_api_lists_sessions_and_returns_summary(tmp_path: Path):

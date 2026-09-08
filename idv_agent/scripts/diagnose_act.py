@@ -16,9 +16,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from idv_agent.model.fast_slow_vla import SharedFastSlowVLA
+from idv_agent.model.act_checkpoint import load_visual_grounded_act_checkpoint
 from idv_agent.scripts.train_vla import (_contiguous_subset, _bounded_subset, _stratified_subset, _dataset_paths,
-                                          _load_act_backbone, _model_inputs,
-                                          encode_batch, _scheduled_condition)
+                                          _load_act_base_backbone, _model_inputs,
+                                          encode_batch, _interact_event_metrics)
 from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
 from idv_agent.training.vla_loss import compute_vla_loss
@@ -29,14 +30,12 @@ from idv_agent.configs.subgoal import SUBGOAL_NAMES
 def _load(args):
     device = torch.device(args.device)
     amp = device.type == "cuda"
-    adapter, _, parent = _load_act_backbone(
-        args.model_path, args.init_checkpoint,
-        dtype=torch.float16 if amp else torch.float32, device=device)
+    adapter, _ = _load_act_base_backbone(
+        args.model_path, dtype=torch.float16 if amp else torch.float32, device=device)
     manifest = load_manifest(Path(args.checkpoint).parent / "manifest.json", require_artifacts=True)
-    core = SharedFastSlowVLA(adapter.hidden_size, temporal_dim=args.temporal_dim,
+    core = SharedFastSlowVLA(adapter.act_feature_dim, temporal_dim=args.temporal_dim,
                              history_action_dim=72).to(device=device, dtype=torch.float32)
-    for name in ("visual_projection", "condition_projection"):
-        getattr(adapter, name).to(device=device, dtype=torch.float32)
+    adapter.condition_projection.to(device=device, dtype=torch.float32)
     # Materialize lazy projection exactly as evaluation does.
     probe = VLASequenceDataset(_dataset_paths(args.data), verify_images=True)
     probe = _bounded_subset(probe, min(1, len(probe)))
@@ -44,14 +43,12 @@ def _load(args):
     with torch.no_grad():
         encode_batch(adapter, next(iter(loader)), device=device)
     saved = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    adapter.visual_projection.load_state_dict(saved["adapter"]["visual_projection"])
-    adapter.condition_projection.load_state_dict(saved["adapter"]["condition_projection"])
-    if "spatial_agg" in saved["adapter"]:
-        agg_state = saved["adapter"]["spatial_agg"]
-        adapter._ensure_spatial_agg(int(agg_state["position"].shape[-1])).load_state_dict(agg_state)
-    core.load_state_dict(saved["core"])
+    load_visual_grounded_act_checkpoint(adapter, core, saved)
+    core.interact_event_threshold = float(
+        saved.get("manifest", {}).get("training", {}).get("interact_event_threshold", 0.0)
+    )
     adapter.eval(); core.eval()
-    return device, amp, adapter, core, parent, manifest
+    return device, amp, adapter, core, {"stage": "base_without_m2"}, manifest
 
 
 def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int, cache: dict[tuple[str, int, str], torch.Tensor], sampling: str = "uniform", seed: int = 0, force_slow_mask: bool = False):
@@ -67,6 +64,7 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
         "slow_intent_loss_sum": 0.0, "slow_subgoal_loss_sum": 0.0, "slow_count": 0,
         "move_total": 0, "move_nonstop_pred": 0, "move_nonstop_total": 0,
         "button_pred_positive_counts": [0] * 6, "button_target_positive_counts": [0] * 6,
+        "event_logits": [], "event_targets": [], "event_masks": [],
     }
     with torch.no_grad():
         for batch in loader:
@@ -77,15 +75,11 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
             condition = core.initial_condition(1, device=device, mode_id=0)
             condition.mode_id = mb["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                slow_pass = core(features, condition, valid_mask=mb["frame_valid_mask"],
-                                 history_actions=mb["history_actions"], run_slow=True)
-                next_condition = _scheduled_condition(core, slow_pass.slow, mb, teacher_forcing_ratio=0.0)
-                fast_pass = core(features, next_condition, valid_mask=mb["frame_valid_mask"],
-                                 history_actions=mb["history_actions"], run_slow=False,
-                                 detach_slow_condition=False)
-                losses = compute_vla_loss(fast_pass.fast, slow_pass.slow, mb)
+                fast_pass = core(features, condition, valid_mask=mb["frame_valid_mask"],
+                                 history_actions=mb["history_actions"], run_slow=False)
+                losses = compute_vla_loss(fast_pass.fast, fast_pass.slow, mb)
             intent_target = int(mb["intent_target"][0])
-            intent_pred = int(slow_pass.slow.intent_logits.argmax(-1)[0])
+            intent_pred = int(fast_pass.slow.intent_logits.argmax(-1)[0])
             # Only rows with slow_loss_mask=1 contribute to the slow loss.
             # Counting every valid intent here would dilute CE by the ~90%
             # of chunks deliberately skipped by the low-frequency slow tick.
@@ -107,11 +101,20 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
                 if t != 0:
                     out["move_nonstop_total"] += 1
                     out["move_nonstop_pred"] += int(p != 0)
-            button_pred = (fast_pass.fast.button_logits[0] > 0).to(torch.int64)
+            event_threshold = float(getattr(core, "interact_event_threshold", 0.0))
+            button_pred = fast_pass.fast.button_predictions(
+                event_threshold=event_threshold
+            )[0].to(torch.int64)
             button_target = mb["button_target"][0].to(torch.int64)
             for i in range(button_pred.shape[-1]):
                 out["button_pred_positive_counts"][i] += int(button_pred[:, i].sum())
                 out["button_target_positive_counts"][i] += int(button_target[:, i].sum())
+            event_logits = (fast_pass.fast.interact_event_logits
+                            if fast_pass.fast.interact_event_logits is not None
+                            else fast_pass.fast.button_logits[..., 0])
+            out["event_logits"].append(event_logits[0].detach().cpu())
+            out["event_targets"].append(mb["button_target"][0, :, 0].detach().cpu())
+            out["event_masks"].append(torch.ones_like(mb["button_target"][0, :, 0], dtype=torch.bool).cpu())
     if out["slow_count"]:
         out["slow_intent_loss_mean"] = out["slow_intent_loss_sum"] / out["slow_count"]
         out["slow_subgoal_loss_mean"] = out["slow_subgoal_loss_sum"] / out["slow_count"]
@@ -119,6 +122,15 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
         out["move_nonstop_pred"] / out["move_nonstop_total"] if out["move_nonstop_total"] else None)
     out["interact_pred_positive"] = out["button_pred_positive_counts"][0]
     out["interact_target_positive"] = out["button_target_positive_counts"][0]
+    if out["event_logits"]:
+        out["interact_event"] = _interact_event_metrics(
+            torch.stack(out.pop("event_logits")),
+            torch.stack(out.pop("event_targets")),
+            torch.stack(out.pop("event_masks")),
+            threshold=float(getattr(core, "interact_event_threshold", 0.0)),
+        )
+    else:
+        out["interact_event"] = None
     total = stats["hits"] + stats["encoded"]
     out["frame_cache"] = {
         "hits": stats["hits"], "misses": stats["encoded"],
@@ -134,7 +146,7 @@ def _run(name: str, paths: str, *, device, amp, adapter, core, max_samples: int,
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True); p.add_argument("--val-data", required=True)
-    p.add_argument("--model-path", required=True); p.add_argument("--init-checkpoint", required=True)
+    p.add_argument("--model-path", required=True); p.add_argument("--init-checkpoint", default="", help="已废弃：不会加载 M2")
     p.add_argument("--checkpoint", required=True); p.add_argument("--device", default="cuda")
     p.add_argument("--temporal-dim", type=int, default=256)
     p.add_argument("--max-samples", type=int, default=256,

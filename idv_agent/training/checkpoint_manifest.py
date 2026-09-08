@@ -49,7 +49,9 @@ def validate_manifest(manifest: Mapping[str, Any], *, checkpoint_dir: str | Path
         raise ValueError(f"不支持的 checkpoint stage: {stage}")
     base_model = _require_text(manifest.get("base_model"), "base_model")
     parent = manifest.get("parent")
-    if stage in PARENT_REQUIRED and not isinstance(parent, str) or (stage in PARENT_REQUIRED and not str(parent).strip()):
+    base_init = manifest.get("initialization") == "base_without_m2"
+    parent_required = stage in PARENT_REQUIRED and not (stage == "M3_ACT" and base_init)
+    if parent_required and (not isinstance(parent, str) or not parent.strip()):
         raise ValueError(f"{stage} 必须声明 parent checkpoint")
     if stage == "M1_WK" and parent not in (None, ""):
         raise ValueError("M1_WK 的 parent 必须为空")
