@@ -283,6 +283,36 @@ def test_camera_control_loss_updates_visual_control_heads_and_masks_rows():
     }
     losses = compute_camera_control_loss(control, batch, VLALossWeights())
     assert torch.isfinite(losses["camera_control_total"])
+    terms = [losses[name] for name in ("camera_control_phase", "camera_control_target_id",
+                                       "camera_control_steering", "camera_control_path",
+                                       "desired_turn_dx", "desired_turn_dy")]
+    assert torch.allclose(losses["camera_control_total"], sum(terms) / len(terms))
     losses["camera_control_total"].backward()
     assert core.visual_expert.camera_control_steering.weight.grad is not None
     assert torch.isfinite(core.visual_expert.camera_control_steering.weight.grad).all()
+
+
+def test_dataset_paths_expands_only_top_level_jsonl_in_sorted_order(tmp_path):
+    from idv_agent.scripts.train_vla import _dataset_paths
+
+    root = tmp_path / "train"; root.mkdir(); (root / "z.jsonl").write_text("", encoding="utf-8")
+    (root / "a.jsonl").write_text("", encoding="utf-8"); (root / "nested").mkdir()
+    (root / "nested" / "ignored.jsonl").write_text("", encoding="utf-8")
+    assert _dataset_paths(str(root)) == [str(root / "a.jsonl"), str(root / "z.jsonl")]
+
+
+def test_camera_control_metrics_masks_unannotated_rows():
+    from idv_agent.scripts.train_vla import _camera_control_metrics
+
+    one = torch.tensor([[0., 5.], [5., 0.]])
+    metrics = _camera_control_metrics(
+        phase_logits=one, target_id_logits=one, steering_logits=one, path_logits=one,
+        desired_turn_dx_logits=one, desired_turn_dy_logits=one,
+        mask=torch.tensor([1., 0.]), phase_target=torch.tensor([1, 0]),
+        target_id_target=torch.tensor([1, 0]), steering_target=torch.tensor([1, 0]),
+        path_target=torch.tensor([1, 0]), desired_turn_dx_target=torch.tensor([1, 0]),
+        desired_turn_dy_target=torch.tensor([1, 0]),
+    )
+    assert metrics["annotated"] == 1
+    assert all(metrics[name]["accuracy"] == 1.0 for name in
+               ("phase", "target_id", "steering", "path", "desired_turn_dx", "desired_turn_dy"))

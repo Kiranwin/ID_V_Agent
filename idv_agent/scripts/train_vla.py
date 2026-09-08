@@ -99,12 +99,21 @@ def _load_images(paths: list[Path | None], *, augmentation_params=None,
 
 
 def _dataset_paths(value: str | list[str] | None) -> list[str]:
-    """Parse one or more JSONL paths (comma/semicolon separated)."""
+    """Parse JSONL files or deterministic one-level dataset directories."""
     if value is None:
         return []
-    if isinstance(value, list):
-        return value
-    return [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+    raw = value if isinstance(value, list) else [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+    paths: list[str] = []
+    for item in raw:
+        path = Path(item)
+        if path.is_dir():
+            files = sorted(path.glob("*.jsonl"))
+            if not files:
+                raise ValueError(f"数据目录不包含 JSONL: {path}")
+            paths.extend(str(file) for file in files)
+        else:
+            paths.append(str(path))
+    return paths
 
 
 def _bounded_subset(dataset, limit: int):
@@ -1587,6 +1596,7 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
     event_target_rows: list[torch.Tensor] = []
     event_mask_rows: list[torch.Tensor] = []
     grounding_rows: dict[str, list[torch.Tensor]] = defaultdict(list)
+    control_rows: dict[str, list[torch.Tensor]] = defaultdict(list)
     non_stop_pred = 0
     non_stop_total = 0
     # Eval runs adapter.eval() + torch.no_grad(): safe to deduplicate vision
@@ -1621,6 +1631,24 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
                     ("reachable_target", batch["grounding_reachable_target"].to(output_device)),
                 ):
                     grounding_rows[key].append(value.detach().cpu())
+            control = getattr(visual_output, "camera_control", None)
+            if control is not None:
+                for key, value in (
+                    ("phase_logits", control.phase_logits),
+                    ("target_id_logits", control.target_id_logits),
+                    ("steering_logits", control.steering_logits),
+                    ("path_logits", control.path_logits),
+                    ("desired_turn_dx_logits", control.desired_turn_dx_logits),
+                    ("desired_turn_dy_logits", control.desired_turn_dy_logits),
+                    ("mask", batch["camera_control_mask"].to(output_device)),
+                    ("phase_target", batch["camera_control_phase_target"].to(output_device)),
+                    ("target_id_target", batch["camera_control_target_id_target"].to(output_device)),
+                    ("steering_target", batch["camera_control_steering_target"].to(output_device)),
+                    ("path_target", batch["camera_control_path_target"].to(output_device)),
+                    ("desired_turn_dx_target", batch["desired_turn_dx_target"].to(output_device)),
+                    ("desired_turn_dy_target", batch["desired_turn_dy_target"].to(output_device)),
+                ):
+                    control_rows[key].append(value.detach().cpu())
             execution_horizon = int(getattr(core, "execution_horizon", output.fast.move_logits.shape[1]))
             if not 1 <= execution_horizon <= output.fast.move_logits.shape[1]:
                 raise ValueError("execution_horizon 超出 fast action chunk")
@@ -1721,6 +1749,9 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
     grounding_metrics = (_grounding_metrics(
         **{key: torch.cat(values) for key, values in grounding_rows.items()})
         if grounding_rows else None)
+    camera_control_metrics = (_camera_control_metrics(
+        **{key: torch.cat(values) for key, values in control_rows.items()})
+        if control_rows else None)
     return {"loss": (sum(losses) / len(losses) if losses else None),
             "slow_accuracy": slow_acc,
             "frame_cache": {
@@ -1741,6 +1772,7 @@ def _evaluate(adapter, core, loader, device, amp_enabled, *, raw_feature_cache: 
             "interact_pred_positive": button_pred[0], "interact_target_positive": button_target[0],
             "interact_event": event_metrics,
             "grounding": grounding_metrics,
+            "camera_control": camera_control_metrics,
             "move_nonstop_prediction_rate": (non_stop_pred / non_stop_total if non_stop_total else None)}
 
 
@@ -1776,6 +1808,39 @@ def _grounding_metrics(*, present_logits: torch.Tensor, bbox: torch.Tensor, side
             "prompt": _binary_metrics(prompt_logits, prompt_target, valid),
             "reachable": _binary_metrics(reachable_logits, reachable_target, valid),
             "side_accuracy": side_accuracy, "bbox_l1": bbox_l1}
+
+
+def _camera_control_metrics(*, phase_logits: torch.Tensor, target_id_logits: torch.Tensor,
+                            steering_logits: torch.Tensor, path_logits: torch.Tensor,
+                            desired_turn_dx_logits: torch.Tensor, desired_turn_dy_logits: torch.Tensor,
+                            mask: torch.Tensor, phase_target: torch.Tensor, target_id_target: torch.Tensor,
+                            steering_target: torch.Tensor, path_target: torch.Tensor,
+                            desired_turn_dx_target: torch.Tensor,
+                            desired_turn_dy_target: torch.Tensor) -> dict[str, Any]:
+    """Score all human control heads only on completed annotation rows."""
+    valid = mask.bool()
+    heads = {
+        "phase": (phase_logits, phase_target),
+        "target_id": (target_id_logits, target_id_target),
+        "steering": (steering_logits, steering_target),
+        "path": (path_logits, path_target),
+        "desired_turn_dx": (desired_turn_dx_logits, desired_turn_dx_target),
+        "desired_turn_dy": (desired_turn_dy_logits, desired_turn_dy_target),
+    }
+    metrics: dict[str, Any] = {"annotated": int(valid.sum())}
+    for name, (logits, target) in heads.items():
+        if not bool(valid.any()):
+            metrics[name] = {"accuracy": None, "recall": [None] * logits.shape[-1]}
+            continue
+        prediction = logits[valid].argmax(-1)
+        truth = target[valid]
+        recall = []
+        for class_id in range(logits.shape[-1]):
+            class_mask = truth == class_id
+            recall.append(float((prediction[class_mask] == class_id).float().mean())
+                          if bool(class_mask.any()) else None)
+        metrics[name] = {"accuracy": float((prediction == truth).float().mean()), "recall": recall}
+    return metrics
 
 
 def _teacher_forcing_ratio(args: argparse.Namespace, step: int) -> float:

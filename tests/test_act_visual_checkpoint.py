@@ -47,7 +47,7 @@ def test_act_checkpoint_schema_rejects_layernorm_cell_projector_contract():
     checkpoint = {"checkpoint_schema_version": "m4_act.visual_grounded.v1",
                   "adapter": {}, "core": {}}
 
-    with pytest.raises(ValueError, match="m26"):
+    with pytest.raises(ValueError, match="m27"):
         load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
 
 
@@ -60,7 +60,7 @@ def test_act_checkpoint_rejects_previous_m6_visual_residual_schema():
     checkpoint = {"checkpoint_schema_version": "m6_act.visual_decision_residual.v1",
                   "adapter": {}, "core": {}}
 
-    with pytest.raises(ValueError, match="m26"):
+    with pytest.raises(ValueError, match="m27"):
         load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
 
 
@@ -73,7 +73,7 @@ def test_act_checkpoint_rejects_previous_m17_eventless_schema():
     checkpoint = {"checkpoint_schema_version": "m17_act.camera_visual_summary.v1",
                   "adapter": {}, "core": {}}
 
-    with pytest.raises(ValueError, match="m26"):
+    with pytest.raises(ValueError, match="m27"):
         load_visual_grounded_act_checkpoint(adapter, core, checkpoint)
 
 
@@ -122,7 +122,7 @@ def test_m26_checkpoint_rejects_nonzero_camera_prior_manifest():
     adapter = _adapter()
     core = SharedFastSlowVLA(frame_feature_dim=5, temporal_dim=4, history_action_dim=72)
     checkpoint = {
-        "checkpoint_schema_version": "m26_act.visual_camera_no_prior.v1",
+        "checkpoint_schema_version": "m27_act.visual_camera_control.v1",
         "adapter": {"condition_projection": adapter.condition_projection.state_dict()},
         "core": core.state_dict(),
         "manifest": {"training": {"camera_prior_scale": 0.5}},

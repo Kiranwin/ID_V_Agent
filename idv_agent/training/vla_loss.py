@@ -224,7 +224,11 @@ def compute_camera_control_loss(control: CameraControlOutput, batch: dict,
             class_weight = balanced_class_weights(counts).to(device=logits.device, dtype=logits.dtype)
         values = F.cross_entropy(logits, target, weight=class_weight, reduction="none")
         losses[name] = _masked_mean(values, mask)
-    return {"camera_control_total": sum(losses.values()), **losses}
+    # These are six equally important semantic descriptions of one visual
+    # decision.  Average them so adding a head does not silently multiply the
+    # total auxiliary gradient; ``weights.camera_control`` remains the single
+    # explicit lambda relative to action and grounding losses.
+    return {"camera_control_total": sum(losses.values()) / len(losses), **losses}
 
 
 def compute_vla_loss(fast: FastVLAOutput, slow: Optional[SlowVLAOutput],

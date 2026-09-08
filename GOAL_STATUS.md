@@ -147,6 +147,39 @@ computed over all four action horizons while the causal loss trained only step
 0. The corrected implementation has passed a fresh smoke; the next full run
 must be trained from the base Qwen with the corrected step-0 tables.
 
+## m27 Camera-Control Semantic Smoke (2026-09-08)
+
+The completed human labels are now consumed only during ACT training by
+visual-only control heads (`phase`, `target_id`, `steering`, `path`, and
+`desired_turn_dx/dy`).  Their *predicted* logits are fused into camera logits;
+runtime never reads label JSONL or applies a path rule.  The checkpoint schema
+is therefore `m27_act.visual_camera_control.v1`; older m26 checkpoints fail
+closed against the expanded head state.
+
+The first 60-step m27 smoke exposed an auxiliary-scale defect: summing six
+control cross-entropies yielded a peak control loss `9.0361` and gradient norm
+`120.30` (step 5), so the training-behavior gate correctly rejected it.  The
+repair averages the six head losses, retaining independent class weights and
+the single `camera_control_loss_weight` lambda.
+
+The repaired local run completed at
+`C:\Codespace\ID_V_Agent\checkpoints\m27_control_rebucket675_normalized_smoke60_local_idv312`:
+
+- base Qwen only; M2/VG disabled; m27 schema; v3 rebucket675 data;
+  train=128 / val=64 sampled chunks; 48/46 completed train/val semantic labels
+  available in their full datasets;
+- loss `8.1845 -> 3.5596` (minimum `2.1173`); max gradient `70.1498`; all
+  gradients/components finite; checkpoint reload delta `0`; behavior gate **passes**;
+- this is only a numerical/integration smoke, not a deployment candidate:
+  validation h0 camera zero false-turn remains dx=`0.6750`, dy=`0.6538`, both
+  far above `0.15`; visual dependency and full held-out control metrics must
+  be rerun after full training.
+
+The training evaluator now records held-out metrics for every semantic control
+head and masks all unannotated rows.  Next: train all 732 chunks / validate all
+182 chunks with the new schema and then run control, visual-dependency, class,
+and sandbox gates before any dry-run deployment.
+
 ## Latest Evidence: m25 Loss-Scale Smoke
 
 | Item | Evidence |
