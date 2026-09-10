@@ -1,8 +1,8 @@
 # User Guide · 从录制到运行
 
 本文是上手这份代码的唯一操作入口：按顺序做完六步，就能从零得到一次可复现的
-SGan（原 M29）运行。运行字段、trace 结构与故障排查见 [agent.md](agent.md)；
-工具细节见 [tools/](tools/)；历史设计与实验记录见 [AGENTS/](AGENTS/)。
+SGan（原 M29）运行。运行字段、trace 结构与故障排查见 [run-agent.md](run-agent.md)；
+工具细节见 [data-workbench-v6.md](data-workbench-v6.md)；历史设计与实验记录见 [AGENTS/](AGENTS/)。
 
 ## 0. 准备
 
@@ -59,7 +59,7 @@ python -m idv_agent.scripts.data_workbench --root data/raw_sessions --port 8765
 ```
 
 回放要确认三件事：画面与时间戳对齐、鼠标位移与视角转动一致、端点切在你真正想监督
-的那一帧。详见 [tools/replay-tool.md](tools/replay-tool.md)。
+的那一帧。详见 [replay-tool.md](replay-tool.md)。
 
 ## 3. 数据标注
 
@@ -81,7 +81,7 @@ python -m idv_agent.scripts.import_mvp_anylabeling review <workspace> `
   --csv <session>/navigation_review_with_state.csv --output <out_dir> --reviewer <name>
 ```
 
-标注口径、默认值与简化流程见 [tools/data-workbench-v6.md](tools/data-workbench-v6.md)。
+标注口径、默认值与简化流程见 [data-workbench-v6.md](data-workbench-v6.md)。
 
 ## 4. 数据准备
 
@@ -171,6 +171,6 @@ bbox 平移会改变导航，且 Q 没有假触发；`false` 时进程以退出�
 | 文档 | 内容 |
 |---|---|
 | [user-guide.md](user-guide.md) | 本文：六步操作 |
-| [agent.md](agent.md) | 运行入口字段、依赖脚本、trace 结构、故障排查 |
-| [tools/](tools/) | 采集、回放、标注工作台的使用说明 |
+| [run-agent.md](run-agent.md) | 运行入口字段、依赖脚本、trace 结构、故障排查 |
+| [data-workbench-v6.md](data-workbench-v6.md) | 采集、回放、标注工作台的使用说明 |
 | [AGENTS/](AGENTS/) | 历史设计与实验记录（00 状态、03 数据格式、18 架构历史、19 ACT 协议等） |

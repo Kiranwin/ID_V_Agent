@@ -9,8 +9,8 @@
 | 你想做什么 | 看这里 |
 |---|---|
 | **第一次上手：六步操作** | [docs/user-guide.md](docs/user-guide.md) |
-| 运行入口字段、依赖脚本、trace 结构 | [docs/agent.md](docs/agent.md) |
-| 标注工作台 / 录制 / 回放工具 | [docs/tools/](docs/tools/) |
+| 运行入口字段、依赖脚本、trace 结构 | [docs/run-agent.md](docs/run-agent.md) |
+| 标注工作台 / 录制 / 回放工具 | [docs/](docs/)（data-workbench-v6 / data-collection-tool / replay-tool） |
 | 架构设计与实验历史 | [docs/AGENTS/18-架构变更历史.md](docs/AGENTS/18-架构变更历史.md) |
 | 数据格式与动作空间（历史权威版） | [docs/AGENTS/03-数据格式.md](docs/AGENTS/03-数据格式.md) |
 | 环境、硬件与反作弊须知 | [docs/AGENTS/04-环境与硬件.md](docs/AGENTS/04-环境与硬件.md) |
@@ -57,7 +57,7 @@ runtime 门禁与 trace 指标，不进入网络；顶层状态由模型自己�
 | 推理与命令合并 / 时序时钟 | `idv_agent/agent/m29_policy.py`, `idv_agent/agent/observation_clock.py` |
 | 离线评估与视觉依赖门禁 | `idv_agent/scripts/evaluate_model_ability.py` |
 
-逐字段说明与 trace 结构见 [docs/agent.md](docs/agent.md)，设计演进见
+逐字段说明与 trace 结构见 [docs/run-agent.md](docs/run-agent.md)，设计演进见
 [docs/AGENTS/18-架构变更历史.md](docs/AGENTS/18-架构变更历史.md)。
 
 ## 已确认决策
@@ -127,7 +127,7 @@ python -m idv_agent.scripts.import_mvp_anylabeling review <workspace> `
   --csv <session>/navigation_review_with_state.csv --output <out_dir> --reviewer <name>
 ```
 
-详细字段与简化流程见 [docs/tools/data-workbench-v6.md](docs/tools/data-workbench-v6.md)。
+详细字段与简化流程见 [docs/data-workbench-v6.md](docs/data-workbench-v6.md)。
 
 ### 4. 数据准备
 
@@ -242,8 +242,8 @@ python -m idv_agent.scripts.validate_vla_raw data/raw_sessions/<session_id>
 | 文档 | 定位 |
 |---|---|
 | [docs/user-guide.md](docs/user-guide.md) | 当前操作入口：六步全管线 |
-| [docs/agent.md](docs/agent.md) | 当前运行入口：字段、依赖脚本、trace 结构、故障排查 |
-| [docs/tools/](docs/tools/) | 当前工具说明：采集、回放、V6 标注工作台 |
+| [docs/run-agent.md](docs/run-agent.md) | 当前运行入口：字段、依赖脚本、trace 结构、故障排查 |
+| [docs/data-workbench-v6.md](docs/data-workbench-v6.md) 等 | 当前工具说明：采集、回放、V6 标注工作台 |
 | [docs/AGENTS/](docs/AGENTS/) | 历史记录：00 状态、03 数据格式、04 环境、05 操作手册、10 训练策略、12–17 WK/VG/快慢 VLA、18 架构变更历史、19 ACT 协议 |
 
 ## 合规边界

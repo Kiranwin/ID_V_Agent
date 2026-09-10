@@ -3,7 +3,7 @@
 本文介绍当前 VLA 原始数据采集工具的使用方式、脚本依赖和输出字段。采集工具只记录屏幕、键鼠事件和 Raw Input 鼠标相对位移，不向游戏注入输入。
 
 > **当前 v6 流程更正（2026-09-08）**：以下旧提取/构建章节描述 v3/v4/v5 工具，
-> 不是新 20 FPS MVP 样本的前置步骤。新流程权威入口是 [03 §0](../AGENTS/03-数据格式.md)。
+> 不是新 20 FPS MVP 样本的前置步骤。新流程权威入口是 [03 §0](AGENTS/03-数据格式.md)。
 > 原始校验仍保留；`prepare_mvp_v6 prepare` 已在内部调用它，并直接从原始时间戳、
 > events.csv、mouse_deltas.csv 生成 200 ms 动作建议，无需 per_frame_actions.csv。
 > X-AnyLabeling 完成后导入，再填写 navigation_review_with_state.csv，审核通过后导出

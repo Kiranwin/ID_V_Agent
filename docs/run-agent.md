@@ -8,7 +8,7 @@ Action Network）。它是原 M29 的对外名称，checkpoint 内部 schema、�
 旧的 `--mode rule`（规则安全兜底）与 `--mode act`（旧 ACT 同步 runtime）已从本
 入口移除，传这两个值会被 argparse 直接拒绝。
 
-相关文档：[user-guide.md](user-guide.md)（六步操作）、[tools/](tools/)（采集/回放/
+相关文档：[user-guide.md](user-guide.md)（六步操作）、[data-workbench-v6.md](data-workbench-v6.md)（采集/回放/
 标注工具）、[AGENTS/](AGENTS/)（历史设计与实验记录）。
 
 ## 1. 它做什么

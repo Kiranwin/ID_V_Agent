@@ -1,7 +1,7 @@
 # ACT 实时推理接入协议
 
 > **2026-09-10 状态：** `run_agent` 的 `--mode act` 与 `--mode rule` 已移除，实时入口
-> 只剩 SGan（`--mode sgan`，原 M29），见 [agent.md](../agent.md)。`ACTPolicy`、
+> 只剩 SGan（`--mode sgan`，原 M29），见 [agent.md](../run-agent.md)。`ACTPolicy`、
 > `ACTActionChunkExecutor` 与闭环 trace 工具已随旧 runtime 一并删除。本文件以下
 > ACT 协议仅作历史记录，不再对应可运行的 CLI 或模块。
 
