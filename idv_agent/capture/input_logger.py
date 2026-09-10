@@ -3,7 +3,7 @@
 关键点（NeAC，见 docs/04）：
 - 录制必须**管理员权限**运行，否则 pynput 用户态 hook 被 NeAC/系统隔离，
   进游戏内的 W/A/S/D 事件收不到。
-- 所有事件与帧统一 `time.perf_counter_ns()` 时间戳，供 labels/state_machine 对齐。
+- 所有事件与帧统一 `time.perf_counter_ns()` 时间戳，供逐帧动作与标注对齐。
 
 事件 kind：
     key_down / key_up     key 列给 "key:w" 形式

@@ -88,6 +88,18 @@ def load_qwen3vl_backbone(
     return Qwen3VLBackboneAdapter(base_model, processor=processor), processor
 
 
+def load_frozen_qwen3vl_backbone(model_path: str | Path, *, dtype: torch.dtype,
+                                 device: torch.device | str):
+    """加载 SGan/M29 运行时使用的冻结主干（不挂 LoRA、不加载 M2 投影）。
+
+    这是唯一的运行时主干加载入口：训练与推理都必须从这里取冻结的
+    Qwen3-VL，避免部署路径依赖旧的 VLA 训练脚本。
+    """
+    adapter, processor = load_qwen3vl_backbone(
+        model_path, dtype=dtype, device_map=None, apply_lora=False)
+    return adapter.to(device), processor
+
+
 def _spatial_grid_forward(images, adapter, k: int, merge_size: int):
     """在 adapter 上用 SpatialGridEncoder 取 k×k 保胞 token（不进 nn 图）。
 

@@ -35,7 +35,7 @@ class M29FeatureEncoder:
 
 
 def load_m29_encoder(model_path, device):
-    from idv_agent.scripts.train_vla import _load_act_base_backbone
+    from idv_agent.model.qwen_backbone_adapter import load_frozen_qwen3vl_backbone
     dtype = torch.float16 if torch.device(device).type == "cuda" else torch.float32
-    adapter, _ = _load_act_base_backbone(model_path, dtype=dtype, device=device)
+    adapter, _ = load_frozen_qwen3vl_backbone(model_path, dtype=dtype, device=device)
     return M29FeatureEncoder(adapter)

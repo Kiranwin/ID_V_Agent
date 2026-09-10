@@ -1,8 +1,9 @@
 # ACT 实时推理接入协议
 
 > **2026-09-10 状态：** `run_agent` 的 `--mode act` 与 `--mode rule` 已移除，实时入口
-> 只剩 SGan（`--mode sgan`，原 M29），见 [agent.md](agent.md)。本文件以下 ACT 协议
-> 仅作历史记录，不再对应可运行的 CLI。
+> 只剩 SGan（`--mode sgan`，原 M29），见 [agent.md](../agent.md)。`ACTPolicy`、
+> `ACTActionChunkExecutor` 与闭环 trace 工具已随旧 runtime 一并删除。本文件以下
+> ACT 协议仅作历史记录，不再对应可运行的 CLI 或模块。
 
 > 2026-09-08：以下命令仍对应旧 v5/m28 同步 runtime。用户新定的 20 FPS 采集与
 > 约 6 FPS Qwen 视觉需要 [03 §0](03-数据格式.md) 的异步协议；当前仅落地 CPU
@@ -11,7 +12,8 @@
 > 触发。不以等待 decoding、过去按过 Q 或精确匹配人类 down 边沿作为输出条件。
 > 执行器按模型 token 翻译键位；不能读取人工标签绕过视觉学习。
 
-M29 的实时入口为 `idv_agent.scripts.run_m29`：20 FPS 采集、单槽覆盖积压、单一
+M29 的实时入口为 `idv_agent.scripts.run_agent`（`--mode sgan`，引擎同文件内的
+`run()`）：20 FPS 采集、单槽覆盖积压、单一
 Qwen 视觉 worker（约 5 FPS 上限）、独立 50 Hz 命令时钟。它要求 M29 checkpoint，
 不接受旧 m28/v5 checkpoint；默认 dry-run，且 checkpoint 的 `deployable` 必须显式
 通过全部门禁才允许 `--send-input`。运行前先用 `train_m29 --task q` 做 Q 专项；full

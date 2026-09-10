@@ -29,6 +29,90 @@ checkpoint as deployable merely because its training loss decreases.
 
 ## Root-Cause Review Addendum (2026-09-08)
 
+**2026-09-10 删除破译状态机（最后一块无生产引用的旧标注栈）：** 核对引用后确认
+`idv_agent/labels/state_machine.py` 已无生产引用——原消费者 `scripts/extract.py`、
+`labels/extract.py` 在管线裁剪时删除，V6 的 `decoding` 标签现由工作台人工评审
+（`import_mvp_anylabeling` 读 `decoding=true/false/unknown`）产生。已删除
+`state_machine.py` 与随之变空的 `labels/` 包（含过期 `__pycache__`），并同步移除
+`scripts/smoke_test.py` 的“[3] 破译状态机（P2 校准）”一节、`tests/test_smoke.py`
+中 5 个状态机用例（退出/重入/单次 Q/raw delta 回放），以及 `configs/schema.py`
+中零引用的 `ExtractParams`（P2 校准与 tap/hold 阈值参数，仅该状态机使用）。
+`capture/input_logger.py` 的 docstring 提法、AGENTS.md 与 README 的目录说明同步
+更新。验证：`pytest tests -q` 131 passed（较上次 137 少 6 个被删用例，含 pytest 从
+`test_smoke.py` 收集的 3 个导入用例）、`smoke_test` 全通过（现为 3 节）、
+全仓已无 `idv_agent.labels` 引用。注：`tests/test_workbench_review_editor.py` 的
+HTTP 用例偶发 `ConnectionAbortedError`/断言失败（单跑必过、连续两次全量跑均通过），
+与本轮改动无关，属本地回环连接的既有不稳定。
+
+**2026-09-10 评估入口改名 + 文档分区：** （1）`idv_agent/scripts/evaluate_m29.py`
+改名为 `evaluate_model_ability.py`（配套测试 `tests/test_model_ability.py`），CLI 与
+报告结构不变；命名对应 SGan 的“模型能力评估”，而不再绑定 m29 编号。
+（2）`docs/` 下 13 个编号文档（00/03/04/05/10/12–19）整体移入 `docs/AGENTS/` 作为
+历史分区，目录内指向 `agent.md` / `tools/` 的相对链接已改写，README、AGENTS.md、
+docs/tools 与本文档的引用路径同步更新。（3）新增 `docs/user-guide.md` 作为当前唯一
+操作入口（六步全管线），`docs/agent.md` 保留为运行入口字段与 trace 说明。
+（4）`README.md` 与 `AGENTS.md` 补齐架构链路图、代码地图与文档地图，明确“当前文档
+（docs/、docs/tools/）vs 历史文档（docs/AGENTS/）”。验证：`pytest tests -q`
+137 passed；16 个入口模块导入正常；`evaluate_model_ability --mode gate`
+4 样本 `gate_pass=true`（`reports/model_ability_rename_smoke_20260910.json`）；
+全仓 markdown 相对链接检查 54 条 0 broken。
+
+**2026-09-10 入口去重：run_m29 并入 run_agent，evaluate_visual_dependency 并入
+evaluate_m29：** 运行侧原先 `run_agent.py`（CLI）只做参数校验再转发
+`run_m29.run()`，两层文件没有分工价值，现已把引擎（采集/推理/命令三个线程 +
+trace 落盘 + `run()`）整体移入 `idv_agent/scripts/run_agent.py`，删除
+`run_m29.py`；CLI 字段与行为不变（`--mode sgan`、默认 dry-run、`deployable` 门禁、
+`--enable-navigation`、`--allow-undeployed-send-input`）。评估侧原先
+`evaluate_m29.py`（标签指标）与 `evaluate_visual_dependency.py`（视觉依赖门禁）
+各自加载同一 checkpoint/encoder/dataset，现合并为单一入口
+`evaluate_m29.py --mode {metrics,gate,all}`（默认 `all`），共享一次模型与数据集
+加载，输出统一报告 `m29.evaluation.v2`（`metrics` + `gate` 两段，
+`gate_pass` 决定退出码；`metrics` 模式 `gate_pass=null`），删除
+`evaluate_visual_dependency.py`。验证：`pytest tests -q` 137 passed、16 个入口模块
+导入正常；SGan dry-run `reports/sgan_merged_run_20260910.jsonl`
+（captures=3 encoded=2 errors=[]）；`evaluate_m29 --mode gate --max-samples 6`
+`reports/m29_merged_gate_20260910.json` `gate_pass=true`；`--mode metrics`
+`reports/m29_merged_metrics_20260910.json` 正常产出（val 只有单一 scenario group，
+跨组打乱按设计返回 `unavailable`）。`README.md`、`docs/AGENTS/05-操作手册.md`、
+`docs/agent.md`、`AGENTS.md` 的命令与表格已同步。删除文件均为 git 跟踪文件，可
+`git checkout -- <path>` 恢复。
+
+**2026-09-10 全管线裁剪：只保留录制→回放→标注→数据准备→训练→推理运行：** 先做
+依赖图分析（从 18 个管线入口求可达闭包），再删除 55 个非入口代码文件与 24 个对应
+测试：旧 m28/ACT 栈（`fast_slow_vla`、`vla_heads`、`act_checkpoint`、`vla_dataset`、
+`vla_loss`、`train_vla`、`evaluate_vla`、`build_vla_chunks`、`extract`、
+`precompute_vla_features`、ACT/相机诊断脚本）、WK/VG/YOLO 三阶段栈
+（`train_wk_lora`、`train_vg_grounding`、`checkpoint_manifest`、YOLO 转换与训练脚本）、
+旧 camera-control 标注轨（`camera_control_store` 及静态资源）、`siglip_vision_adapter`
+等零引用残留。运行时解耦：`load_frozen_qwen3vl_backbone` 从 `train_vla` 移到
+`model/qwen_backbone_adapter.py`，`m29_features.load_m29_encoder` 直接依赖它；
+`evaluate_visual_dependency.py` 重写为仅接受 `m29.state_guided_action.v3` 的 SGan 门禁
+（旧 ACT 分支与 grounding/camera 分层诊断一并移除）。裁剪后非 `__init__` 模块
+100% 可从管线入口到达。验证：`pytest tests -q` 137 passed（原 372，减少的都是被删
+模块的测试）、`smoke_test` 全部通过、18 个入口模块导入正常、SGan dry-run
+`reports/sgan_after_prune_smoke_20260910.jsonl`（captures=5 encoded=5 errors=[]）、
+重写后的视觉依赖门禁 `reports/vdg_after_prune_smoke_20260910.json`
+`visual_dependency_gate_pass=true`（6 样本）。`README.md`、`docs/AGENTS/05-操作手册.md`、
+`AGENTS.md` 已按六阶段管线重写；`docs/12`～`docs/19` 保留为历史记录。所有删除都是
+git 跟踪文件，`git checkout -- <path>` 可恢复。
+
+**2026-09-10 删除 run_agent 不再依赖的旧 rule/ACT 文件：** 逐个核对引用后删除
+`idv_agent/agent/realtime_agent.py`、`rule_agent.py`、`act_policy.py`、
+`act_scheduler.py`、`act_action_executor.py`、`memory.py`、`perception.py`、
+`mvp_closed_loop.py`、`idv_agent/model/policy.py`、
+`idv_agent/scripts/evaluate_mvp_closed_loop.py`，以及只覆盖这些模块的
+`tests/test_act_policy.py`、`tests/test_act_action_executor.py`、
+`tests/test_mvp_closed_loop.py`。依据：这些模块在 `idv_agent/` 内只被彼此引用，
+包外零引用；同时从 `tests/test_configs.py`、`tests/test_m2_bypass_loading.py`、
+`tests/test_vla_camera_v5.py` 移除仅测这些模块的用例。保留
+`agent/action_decoder.py`（`m29_policy` 依赖 `Command`）、
+`agent/action_executor.py`（`scripts/replay_mouse.py` 依赖）与
+`model/fast_slow_vla.py` / `act_checkpoint.py` / `scripts/train_vla.py`
+（VLA 训练与 `m29_features.load_m29_encoder` 依赖）。验证：
+`pytest tests -q` 339 passed（原 372，减少的都是被删模块的用例）、
+`smoke_test` 全部通过、10 个存活 CLI 入口导入正常。`AGENTS.md` 与 `README.md`
+的关键位置表已改指向 SGan 栈。
+
 **2026-09-10 run_agent 入口收敛为 SGan：** 按用户要求，`run_agent` 删除
 `--mode rule`（规则安全兜底）与 `--mode act`（旧 ACT 同步 runtime）两条分支及其
 参数，只保留原 M29 运行链路并对外重命名为 **SGan**（State-Guided Action
@@ -40,8 +124,8 @@ Network；checkpoint schema 与模块名仍为 m29，`m29.pt` 可直接加载）
 单独用 `--send-input` 仍被 `run_m29.py` 拒绝。旧 rule/act 分支上的“--send-input
 必须管理员终端”预检随分支一并移除；SGan 路径沿用 run_m29 的 deployable 门禁。
 完整字段与 trace 说明写入
-`docs/agent.md`；受影响文档 `README.md`、`docs/05-操作手册.md`、
-`docs/19-ACT实时推理接入.md` 已同步，行为回归测试
+`docs/agent.md`；受影响文档 `README.md`、`docs/AGENTS/05-操作手册.md`、
+`docs/AGENTS/19-ACT实时推理接入.md` 已同步，行为回归测试
 `tests/test_configs.py -k run_agent` 2 passed。当前标准模式沙盒命令为：
 
 `conda run -n idv312 python -m idv_agent.scripts.run_agent --mode sgan --checkpoint checkpoints/m29_q_interact_fix300_20260910/m29.pt --model-path <Qwen目录> --device cuda --duration 10 --enable-navigation --send-input --allow-undeployed-send-input --trace reports/sgan_sandbox_<date>.jsonl`
@@ -603,7 +687,7 @@ prompt-Q correction above supersedes its Q gating and outcome prerequisites.
 
 User requested a complete raw-to-training annotation redesign, one top-level
 decipher task, 20 FPS capture, and supplied a ~6 FPS Qwen vision baseline.
-The complete current design is docs/03-数据格式.md §0. This supersedes prior
+The complete current design is docs/AGENTS/03-数据格式.md §0. This supersedes prior
 v5 new-data instructions; all old raw/checkpoints remain historical evidence.
 
 Implemented: recorder defaults to 20 FPS/data/raw_sessions, preserves idle
@@ -652,7 +736,7 @@ gate or model-performance result. git diff --check passed.
 Read-only diagnosis requested by the user was completed in the primary
 `vla-train` checkout at `ecae81f` (including m28 commit `7bd3106`). No model,
 dataset, training run, or deployment permission changed. Detailed evidence
-and the proposed repair order are recorded in `docs/18-架构变更历史.md`, section
+and the proposed repair order are recorded in `docs/AGENTS/18-架构变更历史.md`, section
 “MVP 根因复核：监督冲突、评估口径与执行时间”.
 
 New confirmed issues to resolve before interpreting another full run:
@@ -702,7 +786,7 @@ ACT runtime integration is now wired: `ACTPolicy` accepts
 `closed_loop_observer`; the executor callback records the submitted h0 and the
 trace writer flushes it only after at least 6 newly observed frames. `run_agent`
 exposes `--closed-loop-trace` and `--closed-loop-episode-id`, and the usage and
-evaluation commands are documented in `docs/19-ACT实时推理接入.md`. The current
+evaluation commands are documented in `docs/AGENTS/19-ACT实时推理接入.md`. The current
 CLI observer supplies detector fields when a template/YOLO model is given;
 `decode_entry` still requires an external frame-state observer to provide
 `frame_state=decoding`. No live sandbox run has been performed.
@@ -923,8 +1007,8 @@ candidate, or deployed.  m28 supersedes its parallel-head architecture.
 ## Data-to-Training Contract Consolidation (2026-09-08)
 
 The data pipeline and labels were consolidated after the camera-supervision
-diagnosis.  The current single source of truth is `docs/03-数据格式.md` §7;
-`docs/00-当前状态.md` is the concise execution entrypoint and `docs/10`/`14`
+diagnosis.  The current single source of truth is `docs/AGENTS/03-数据格式.md` §7;
+`docs/AGENTS/00-当前状态.md` is the concise execution entrypoint and `docs/10`/`14`
 now describe ACT consumption and human annotation without carrying old v2 or
 48-pixel bucket guidance.
 

@@ -102,18 +102,20 @@ def test_known_absence_is_negative_even_when_human_replay_contains_q(tmp_path):
         validate_labels(row)
 
 
-def test_prompt_q_loss_can_supervise_the_deployed_m28_q_logit():
-    from idv_agent.model.vla_heads import StateDecisionExpert
+def test_prompt_q_loss_can_supervise_the_deployed_sgan_q_logit():
+    from idv_agent.model.state_guided_action import StateGuidedActionNetwork
     torch.manual_seed(23)
-    expert = StateDecisionExpert(4, 8)
-    output = expert(torch.randn(3, 8, 4))
-    # Existing output wire exposes exactly this Q event logit; no auxiliary
-    # head or label input is required to train it with the new supervision.
-    logits = output.fast.interact_event_logits[:, 0]
-    assert torch.equal(logits, output.fast.button_logits[:, 0, 0])
-    prompt_q_loss(logits, torch.tensor([1., 1., 0.]), torch.ones(3, dtype=torch.bool)).backward()
-    assert expert.planner.interact_event.weight.grad.abs().sum() > 0
-    assert expert.state_trunk[0].weight.grad.abs().sum() > 0
+    core = StateGuidedActionNetwork(feature_dim=8, hidden_dim=8)
+    out = core(features=torch.randn(1, 3, 8),
+               valid_mask=torch.ones(1, 3, dtype=torch.bool),
+               relative_times_s=torch.tensor([[-0.4, -0.2, 0.0]]),
+               execution_feedback=torch.zeros(1, 2))
+    # 部署时唯一的 Q 判据就是这个 logit；Q 监督不需要额外的辅助分类头。
+    logits = out.q_logits
+    assert torch.equal(logits, out.facts.prompt_logits)
+    prompt_q_loss(logits, torch.tensor([1.]), torch.ones(1, dtype=torch.bool)).backward()
+    assert core.prompt_q.weight.grad.abs().sum() > 0
+    assert core.prompt_trunk[0].weight.grad.abs().sum() > 0
 
 
 def test_migration_preserves_facts_and_old_review_without_touching_raw(tmp_path):

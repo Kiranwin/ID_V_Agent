@@ -1,9 +1,8 @@
-"""无 GPU / 无游戏冒烟测试：验证 VLA 核心与规则安全兜底。
+"""无 GPU / 无游戏冒烟测试：验证动作空间与录制/动作契约。
 
 覆盖：
 - intent 正交性
 - ActionDecoder 差分逻辑（press/release/mouse）
-- 破译状态机校准标记（P2）
 - VLA action-chunk schema
 
 用法：
@@ -47,30 +46,6 @@ def test_action_decoder() -> None:
     # 鼠标移动
     cmds3 = dec.decode(int(ActionCategory.LOOK), [0, 0, 0.5, 0])
     _expect(any(c.kind == "mouse_move" for c in cmds3), "LOOK 产生鼠标移动")
-
-
-def test_decode_state_machine_calibration() -> None:
-    import pandas as pd
-    from idv_agent.labels.state_machine import DecodeStateTracker, StateReplay
-    # 合成事件：按 Q 进入破译（0.0s），0.5s 按 Space（校准，未抬起）
-    # 录制末端设置足够大，保证 Space 在校准帧仍处于 held 态。
-    end_ns = 5_000_000_000   # 5s
-    events = pd.DataFrame([
-        {"timestamp_ns": 0, "kind": "key_down", "code": "key:q", "value": 1},
-        {"timestamp_ns": 500_000_000, "kind": "key_down", "code": "key:space", "value": 1},
-    ])
-    positions = pd.DataFrame(columns=["timestamp_ns", "x", "y"])
-    replay = StateReplay(events, positions, end_ts_ns=end_ns)
-    tracker = DecodeStateTracker()
-    # 帧 0：Q 按下 → 进入破译
-    st0 = tracker.on_frame(0, replay.frame_state(0, 0))
-    _expect(st0.active, "Q press 进入破译态")
-    # 帧 0.6s：Space 仍在 held → 校准
-    st1 = tracker.on_frame(600_000_000, replay.frame_state(600_000_000, 500_000_000))
-    _expect(st1.active and st1.calibration, "破译中按 Space 标记校准（P2）")
-    # 帧 0.7s：Space 已抬起（无释放事件则 held 仍持续——用单独事件验证非校准场景略过）
-    st2 = tracker.on_frame(700_000_000, replay.frame_state(700_000_000, 600_000_000))
-    _expect(st2.active, "Space 校准后仍保持破译态")
 
 
 def test_vla_contract() -> None:
@@ -119,8 +94,7 @@ def main() -> int:
     print("=== ID_V_Agent smoke_test ===")
     print("\n[1] intent 正交性"); test_intent_orthogonality()
     print("\n[2] ActionDecoder"); test_action_decoder()
-    print("\n[3] 破译状态机（P2 校准）"); test_decode_state_machine_calibration()
-    print("\n[4] VLA action-chunk contract"); test_vla_contract()
+    print("\n[3] VLA action-chunk contract"); test_vla_contract()
     print("\n=== 全部通过 ===")
     return 0
 

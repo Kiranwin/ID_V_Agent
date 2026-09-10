@@ -2,10 +2,14 @@
 
 更新：2026-09-10。`run_agent` 现在只有一种运行架构：**SGan**（State-Guided
 Action Network）。它是原 M29 的对外名称，checkpoint 内部 schema、文件命名和
-模块名仍是 `m29`（例如 `m29.pt`、`idv_agent/scripts/run_m29.py`）。
+模块名仍是 `m29`（例如 `m29.pt`、`m29_policy.py`、`train_m29.py`、
+`evaluate_model_ability.py`）。
 
 旧的 `--mode rule`（规则安全兜底）与 `--mode act`（旧 ACT 同步 runtime）已从本
 入口移除，传这两个值会被 argparse 直接拒绝。
+
+相关文档：[user-guide.md](user-guide.md)（六步操作）、[tools/](tools/)（采集/回放/
+标注工具）、[AGENTS/](AGENTS/)（历史设计与实验记录）。
 
 ## 1. 它做什么
 
@@ -33,7 +37,7 @@ executor loop  50 Hz    消费最新 decision，合并按键/鼠标动作，维�
 | 文件 | 角色 |
 |---|---|
 | `idv_agent/scripts/run_agent.py` | 本入口：唯一 `--mode sgan`，负责参数校验与转发 |
-| `idv_agent/scripts/run_m29.py` | 运行时引擎：20 FPS 采集线程、推理线程、50 Hz 命令线程、trace 落盘 |
+| `idv_agent/scripts/run_agent.py`（`run()`） | 运行时引擎：20 FPS 采集线程、推理线程、50 Hz 命令线程、trace 落盘 |
 | `idv_agent/agent/m29_policy.py` | `M29Policy`（模型推理 + 8 帧 history）与 `M29CommandMerger`（动作合并、Q 发送、按键释放） |
 | `idv_agent/agent/observation_clock.py` | `CapturedObservation`、`LatestObservationSlot`（单槽覆盖）、`ObservationActionClock`（200 ms 动作 / 400 ms 陈旧门禁） |
 | `idv_agent/model/m29_checkpoint.py` | `load_m29_checkpoint`：严格校验 checkpoint schema 与控制契约，不兼容 m28/v5 |
@@ -42,7 +46,7 @@ executor loop  50 Hz    消费最新 decision，合并按键/鼠标动作，维�
 | `idv_agent/capture/screen_capture.py` | `ScreenCapture` / `CaptureConfig`：按窗口标题抓屏，宽度上限 1334 |
 | `idv_agent/agent/action_decoder.py` | `Command`：`press` / `release` / `mouse_move` 指令载体 |
 | `idv_agent/scripts/train_m29.py` | 训练入口，产出 `m29.pt` + `manifest.json` + `metrics.json` |
-| `idv_agent/scripts/evaluate_m29.py` | 离线评估同一 checkpoint |
+| `idv_agent/scripts/evaluate_model_ability.py` | 离线模型能力评估：标签指标（`--mode metrics`）、视觉依赖门禁（`--mode gate`）或两者（默认 `all`） |
 | `tests/test_m29_hierarchy.py`、`tests/test_m29_pipeline.py`、`tests/test_configs.py` | 层级契约、checkpoint 往返、CLI 参数回归 |
 
 ## 3. 运行前准备
@@ -241,7 +245,7 @@ python -m idv_agent.scripts.run_agent --mode sgan `
 
 1. **默认 fail-closed**：不加 `--send-input` 就永远不发送键鼠，只写 trace。
 2. **checkpoint 门禁**：`manifest.deployable=false` 时，`--send-input` 单独使用会被
-   `run_m29.py` 拒绝；只有显式加 `--allow-undeployed-send-input` 才放行，用于已经
+   `run_agent.py` 拒绝；只有显式加 `--allow-undeployed-send-input` 才放行，用于已经
    授权的标准模式沙盒验证。
 3. **模式门禁**：仅在官方自定义剧本/训练模式运行；不要对正常对局使用。
 4. **退出释放**：`shutdown` 无条件释放 `w/a/s/d/q`，避免残留按住状态。
@@ -264,7 +268,7 @@ python -m idv_agent.scripts.run_agent --mode sgan `
 ```text
 train_m29.py  →  checkpoints/<run>/m29.pt + manifest.json + metrics.json
                         │
-                        ├── evaluate_m29.py       离线指标
+                        ├── evaluate_model_ability.py   离线指标 + 视觉依赖门禁
                         └── run_agent --mode sgan  实时运行（本文件）
 ```
 

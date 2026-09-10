@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import IntEnum
 
 
@@ -49,31 +48,3 @@ CONT_MOVE_Y = 1      # S = -1, W = +1
 CONT_CAM_DX = 2      # 鼠标 X 增量 / cam_pixel_scale，截断到 [-1, 1]
 CONT_CAM_DY = 3      # 鼠标 Y 增量 / cam_pixel_scale，截断到 [-1, 1]
 
-
-@dataclass
-class ExtractParams:
-    """从原始 events 推导动作类别 / 连续值时的可调参数。"""
-
-    # 短按 vs 长按时间阈值（ms）。按下后到 frame 时刻的持续时间 < tap_threshold 视为 TAP。
-    tap_threshold_ms: float = 150.0
-
-    # 抬起事件的「余热窗口」：抬起后多少 ms 内仍标记为 RELEASE 而非 NOOP。
-    release_window_ms: float = 50.0
-
-    # 鼠标移动的「显著」阈值（像素/帧）。低于此视为静止，避免微抖被算作 LOOK。
-    cam_motion_dead_zone_px: float = 2.0
-
-    # 鼠标增量归一化物理尺度：cam_pixel_scale 像素 → 1.0。
-    # P7 灵敏度域：录数据与部署必须用同一尺度，且记录游戏内灵敏度保持一致。
-    cam_pixel_scale: float = 200.0
-
-    # WASD 离散方向归一化是否保持单位向量；False 时对角线移动幅度 = √2 会被 clip。
-    normalize_diagonal: bool = True
-
-    # ---- 第五人格特有的隐式状态：破译 ----
-    # 求生者按一次 Q 即进入「自动破译」，此后无按键事件但语义是 INTERACT_HOLD。
-    enable_decoding_state: bool = True
-
-    # 破译状态最长持续时间（秒）。超过则强制退出，防止 Q 误触导致后续被错标。
-    # IDV 单次破译最长约 80s；90s 是「真破译」与「Q 误触 + 长静止」的平衡点。
-    max_decode_duration_s: float = 90.0

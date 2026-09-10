@@ -1,5 +1,1 @@
-"""VLA 训练包。"""
-from .vla_dataset import VLASequenceCollator, VLASequenceDataset
-from .vla_loss import VLALossWeights, compute_vla_loss
-
-__all__ = ["VLASequenceCollator", "VLASequenceDataset", "VLALossWeights", "compute_vla_loss"]
+"""SGan（原 M29）训练包：数据集 / 冻结特征 / 损失。"""
