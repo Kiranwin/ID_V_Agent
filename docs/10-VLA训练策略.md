@@ -1,5 +1,15 @@
 # 10 · VLA 多模式与 ActVLP 训练策略
 
+> 2026-09-08：新 MVP 标签/时间设计以 [03 §0](03-数据格式.md) 为准。以下为旧 v5
+> 训练实现。v6 导出不能喂给当前 train_vla；固定 decipher 不训练单类别 intent CE，
+> 用户最新要求 Q=当前 interact_prompt，允许短时连续 Q。Q 独立 mask/BCE，不读
+> replay Q、过去 Q 或 decoding 结果来抑制；损失组件已实现，旧训练器尚未迁移。
+
+> M29 SGAN 已实现：预测 facts/phase/steering/path 经过 soft beliefs 才能进入
+> navigation；原始视觉到导航的旁路被禁止。请以 [03 §0.13](03-数据格式.md) 的
+> checkpoint、介入和独立 Q/状态验收为准。M29 训练入口是 `train_m29`，不是旧 v5
+> `train_vla`；没有完整 decoding 和导航审核覆盖时只允许运行 `--task q`。
+
 ## 1. 多模式 LoRA 路线
 
 标准模式数据训练共享底座 `M0`。M0 固定：

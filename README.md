@@ -147,21 +147,24 @@ RTX 2080 Ti 无 BF16，训练全程 FP16 + GradScaler。当前所有 500-step �
 
 ### 5. 实时推理部署
 
-`run_agent --mode act` 接入 ACT checkpoint，三个独立循环解耦运行（协议见 [docs/19-ACT实时推理接入.md](docs/19-ACT实时推理接入.md)）：
+`run_agent` 现在只保留 **SGan**（原 M29）一种运行架构，旧的 `--mode rule` 与
+`--mode act` 已移除；字段、依赖脚本与 trace 说明见 [docs/agent.md](docs/agent.md)。
 
 ```text
-Capture loop（30 FPS）：grab → M0.encode_frame（每帧最多一次） → append FrameFeatureCache
-Fast loop（15 Hz）  ：固定 deadline 读取最新窗口 → fast_temporal → Fast Head → 执行动作块
-Slow loop（1 Hz/事件触发）：读取同一窗口 → slow_temporal → Slow Head → 更新 condition_t
+Capture loop（20 FPS）：抓屏 → 单槽覆盖 → 推理线程取走最新帧
+Inference loop（≤5 Hz）：冻结 Qwen 视觉编码 → SGan 前向 → 发布最新 decision
+Executor loop（50 Hz）：合并导航按键/鼠标动作与 Q，维护 200 ms 宏动作和 400 ms 陈旧门禁
 ```
 
 ```bash
-python -m idv_agent.scripts.run_agent --mode act --title "第五人格" \
-  --act-checkpoint checkpoints/M3_ACT/<candidate>.pt \
-  --act-init-checkpoint checkpoints/M2_VG --model-path <Qwen3-VL-4B 权重目录> --dry-run
+python -m idv_agent.scripts.run_agent --mode sgan --title "第五人格" \
+  --checkpoint checkpoints/<run>/m29.pt \
+  --model-path <Qwen3-VL-4B 权重目录> \
+  --device cuda --duration 10 --trace reports/sgan_dryrun.jsonl
 ```
 
-默认 `dry-run`，只打印动作不发送；`--send-input` 仅限官方自定义剧本/训练营，且要求管理员权限。F12 随时紧急退出并释放所有按键。
+默认 `dry-run`，只记录命令不发送；真实发送仅限官方自定义剧本/训练模式，且未过
+门禁的 checkpoint 需要同时传 `--send-input --allow-undeployed-send-input`。
 
 ### 6. 评估
 

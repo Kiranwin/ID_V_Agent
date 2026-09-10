@@ -305,23 +305,39 @@ def test_prepare_yolo_dataset_splits_by_session(tmp_path):
     assert all(p.stat().st_size == 0 for p in (out / "labels" / "train").glob("*.txt"))
 
 
-def test_run_agent_send_input_requires_admin(monkeypatch):
-    """安全回归：非管理员进程不得进入真发送路径。"""
-    import ctypes
+def test_run_agent_only_accepts_sgan_mode():
+    """回归：旧 rule/act 模式已从 run_agent 移除，只保留 sgan。"""
+    import pytest
+
     from idv_agent.scripts import run_agent
 
-    class _Shell:
-        @staticmethod
-        def IsUserAnAdmin():
-            return 0
+    for removed in ("rule", "act", "m29"):
+        with pytest.raises(SystemExit):
+            run_agent.main(["--mode", removed])
 
-    monkeypatch.setattr(ctypes, "windll", type("W", (), {"shell32": _Shell})(), raising=False)
-    try:
-        run_agent.main(["--mode", "rule", "--send-input", "--duration", "0"])
-    except RuntimeError as exc:
-        assert "管理员权限" in str(exc)
-    else:
-        raise AssertionError("非管理员 --send-input 应被拒绝")
+
+def test_run_agent_sgan_requires_existing_checkpoint_and_fresh_trace(tmp_path):
+    """回归：SGan 必须给出存在的 checkpoint 与全新的 trace 路径。"""
+    import pytest
+
+    from idv_agent.scripts import run_agent
+
+    with pytest.raises(SystemExit):
+        run_agent.main(["--mode", "sgan"])
+    checkpoint = tmp_path / "m29.pt"
+    checkpoint.write_bytes(b"stub")
+    with pytest.raises(SystemExit):
+        run_agent.main(["--mode", "sgan", "--checkpoint", str(checkpoint),
+                        "--trace", str(tmp_path / "trace.jsonl"),
+                        "--allow-undeployed-send-input"])
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        run_agent.main(["--mode", "sgan", "--checkpoint", str(checkpoint),
+                        "--trace", str(trace)])
+    with pytest.raises(SystemExit):
+        run_agent.main(["--mode", "sgan", "--checkpoint", str(tmp_path / "missing.pt"),
+                        "--trace", str(tmp_path / "fresh.jsonl")])
 
 
 def test_cipher_detector_safe_empty_and_spatial_shape():
@@ -401,21 +417,6 @@ def test_cipher_detector_through_wall_highlight():
     assert result.visible == "yes"
     assert result.position == "center"
     assert result.confidence >= 0.78
-
-
-def test_run_agent_offline_image_mode(tmp_path, capsys):
-    import cv2
-    import numpy as np
-    from idv_agent.scripts import run_agent
-
-    image = tmp_path / "frame.jpg"
-    frame = np.zeros((180, 240, 3), dtype=np.uint8)
-    frame[55:125, 112:120] = (0, 255, 255)
-    cv2.imwrite(str(image), frame)
-    assert run_agent.main(["--mode", "rule", "--test-image", str(image)]) == 0
-    output = capsys.readouterr().out
-    assert "[test] offline" in output
-    assert "action=MOVE_LOOK" in output or "action=MOVE" in output
 
 
 def test_realtime_agent_rejects_invalid_camera_scale():

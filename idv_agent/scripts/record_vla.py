@@ -12,7 +12,10 @@ an administrator terminal on Windows; this recorder never injects input.
 from __future__ import annotations
 
 import argparse
+import bisect
+import csv
 import json
+import shutil
 from threading import Lock
 import time
 from datetime import datetime
@@ -92,8 +95,122 @@ def _new_session(args):
     return session_id, session_dir, frames_dir
 
 
+def _trim_idle_boundaries(*, session_dir: Path,
+                          frame_timestamps: list[tuple[int, int]],
+                          raw_mouse: RawInputMouse | None,
+                          context_frames: int = 0) -> tuple[list[tuple[int, int]], bool]:
+    """Remove the leading/trailing frames with no recorded user input.
+
+    Idle spans in the middle of a demonstration are meaningful and are kept.
+    ``context_frames`` can retain visual context around the boundaries; the
+    recorder uses zero by default so the F9-to-first-input idle span is removed
+    exactly. The event and Raw Input files are clipped to the input interval.
+    """
+    if not frame_timestamps:
+        return [], False
+    context_frames = max(0, int(context_frames))
+    activity_ts: list[int] = []
+    held_codes: set[str] = set()
+    events_path = session_dir / "events.csv"
+    if events_path.is_file():
+        with events_path.open(encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                code = str(row.get("code") or "")
+                if code in {"key:f9", "key:f10"}:
+                    continue
+                try:
+                    timestamp = int(float(row["timestamp_ns"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                activity_ts.append(timestamp)
+                kind = str(row.get("kind") or "")
+                if kind in {"key_down", "mouse_down"}:
+                    held_codes.add(code)
+                elif kind in {"key_up", "mouse_up"}:
+                    held_codes.discard(code)
+    if raw_mouse is not None:
+        activity_ts.extend(item.timestamp_ns for item in raw_mouse.deltas
+                           if item.dx or item.dy)
+
+    frame_times = [ts for _, ts in frame_timestamps]
+    clip_start = clip_end = None
+    if not activity_ts:
+        # Keep the session structurally valid but discard every idle frame.
+        selected_start, selected_end = 0, -1
+    else:
+        first_input = min(activity_ts)
+        last_input = max(activity_ts)
+        # A key/button that is still held when F9 stops remains active until
+        # the final captured frame; otherwise trimming would erase the actual
+        # action after its initial key_down edge.
+        if held_codes:
+            last_input = frame_times[-1]
+        clip_start, clip_end = first_input, last_input
+        selected_start = max(0, bisect.bisect_left(frame_times, first_input) - context_frames)
+        selected_end = min(len(frame_timestamps) - 1,
+                           bisect.bisect_left(frame_times, last_input) + context_frames)
+
+    selected = frame_timestamps[selected_start:selected_end + 1]
+    selected_ids = {frame_id for frame_id, _ in selected}
+    frames_dir = session_dir / "frames"
+    # Rename retained files through temporary names before deleting/renumbering
+    # to avoid collisions when the kept range starts at a nonzero frame id.
+    temp_files: list[tuple[Path, Path]] = []
+    for old_id, _ in selected:
+        source = frames_dir / f"{old_id:08d}.jpg"
+        if source.is_file():
+            temp = frames_dir / f".trim_{old_id:08d}.jpg"
+            source.rename(temp)
+            temp_files.append((temp, source))
+    for source in frames_dir.glob("*.jpg"):
+        try:
+            if int(source.stem) not in selected_ids:
+                source.unlink()
+        except ValueError:
+            continue
+    renumbered: list[tuple[int, int]] = []
+    for new_id, (temp, _old_path) in enumerate(temp_files):
+        target = frames_dir / f"{new_id:08d}.jpg"
+        temp.rename(target)
+        old_id = int(_old_path.stem)
+        timestamp = next(ts for frame_id, ts in selected if frame_id == old_id)
+        renumbered.append((new_id, timestamp))
+
+    if renumbered:
+        start_ts, end_ts = renumbered[0][1], renumbered[-1][1]
+    else:
+        start_ts = end_ts = frame_times[0]
+    (session_dir / "frame_timestamps.csv").write_text(
+        "frame_id,timestamp_ns\n" + "".join(f"{i},{ts}\n" for i, ts in renumbered),
+        encoding="utf-8",
+    )
+
+    def _clip_csv(path: Path, fields: tuple[str, ...]) -> None:
+        if not path.is_file():
+            return
+        with path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        kept = []
+        for row in rows:
+            try:
+                ts = int(float(row["timestamp_ns"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if clip_start is not None and clip_start <= ts <= clip_end:
+                kept.append(row)
+        kept.sort(key=lambda row: int(float(row["timestamp_ns"])))
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows({field: row.get(field, "") for field in fields} for row in kept)
+
+    _clip_csv(events_path, ("timestamp_ns", "kind", "code", "value"))
+    _clip_csv(session_dir / "mouse_deltas.csv", ("timestamp_ns", "dx", "dy"))
+    return renumbered, bool(activity_ts)
+
+
 def _finalize_session(*, args, session_id, session_dir, frame_timestamps,
-                      n_frames, start_ts, end_ts) -> Path:
+                      n_frames, start_ts, end_ts) -> Path | None:
     frame_ts_csv = session_dir / "frame_timestamps.csv"
     frame_ts_csv.write_text(
         "frame_id,timestamp_ns\n" + "".join(f"{i},{ts}\n" for i, ts in frame_timestamps),
@@ -103,6 +220,42 @@ def _finalize_session(*, args, session_id, session_dir, frame_timestamps,
     raw_mouse = getattr(args, "_raw_mouse", None)
     if raw_mouse is not None:
         write_deltas_csv(mouse_deltas_path, raw_mouse.deltas)
+    trim_idle = bool(getattr(args, "trim_idle_boundaries", False))
+    if trim_idle:
+        frame_timestamps, had_input = _trim_idle_boundaries(
+            session_dir=session_dir, frame_timestamps=frame_timestamps,
+            raw_mouse=raw_mouse,
+        )
+    else:
+        # Waiting before a decision and automatic decoding after Q are real
+        # observations. Lack of keyboard input must not erase these frames.
+        with (session_dir / "events.csv").open(encoding="utf-8", newline="") as handle:
+            had_input = any(row.get("code") not in {"key:f9", "key:f10"}
+                            for row in csv.DictReader(handle))
+        had_input = had_input or bool(raw_mouse and any(
+            item.dx or item.dy for item in raw_mouse.deltas))
+    n_frames = len(frame_timestamps)
+    if not frame_timestamps:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        print(f"[record-vla] 丢弃空 session（未检测到输入）：{session_id}")
+        return None
+    # The first key edge may precede the first retained frame.  Keep that
+    # event in the session clock so state replay can reconstruct a held key,
+    # and make meta bounds cover both frames and retained input rows.
+    frame_start, frame_end = frame_timestamps[0][1], frame_timestamps[-1][1]
+    input_times: list[int] = []
+    for path in (session_dir / "events.csv", session_dir / "mouse_deltas.csv"):
+        if not path.is_file():
+            continue
+        try:
+            with path.open(encoding="utf-8", newline="") as handle:
+                input_times.extend(int(float(row["timestamp_ns"]))
+                                   for row in csv.DictReader(handle)
+                                   if row.get("timestamp_ns") not in (None, ""))
+        except (OSError, TypeError, ValueError):
+            pass
+    start_ts = min([frame_start, *input_times])
+    end_ts = max([frame_end, *input_times])
     duration_s = max((end_ts - start_ts) / 1e9, 1e-9)
     meta = {
         "recording_type": "vla_raw",
@@ -114,7 +267,11 @@ def _finalize_session(*, args, session_id, session_dir, frame_timestamps,
         "task_instruction": args.task_instruction,
         "target_fps": args.fps,
         "num_frames": n_frames,
-        "effective_fps": n_frames / duration_s,
+        # A one-frame segment has no measurable interval; report the target
+        # rate instead of an artificial 1e9 FPS that raw-session validation
+        # would reject.
+        "effective_fps": ((n_frames - 1) * 1e9 / (frame_end - frame_start)
+                          if n_frames > 1 and frame_end > frame_start else float(args.fps)),
         "start_ts_ns": start_ts,
         "end_ts_ns": end_ts,
         "window_title": args.window_title,
@@ -126,6 +283,11 @@ def _finalize_session(*, args, session_id, session_dir, frame_timestamps,
         "note": args.note,
         "mouse_input_source": "raw_input",
         "camera_motion_valid": True,
+        "raw_schema_version": "idv.raw_session.v2",
+        "top_intent": "decipher",
+        "idle_boundary_trimmed": trim_idle,
+        "post_stop_seconds": float(getattr(args, "post_stop_seconds", 2.0)),
+        "had_input": had_input,
     }
     (session_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -139,6 +301,7 @@ def record(args) -> Path | None:
 
     print("[record-vla] 仅限官方自定义剧本/训练营；本命令不注入输入")
     print("[record-vla] F9 开始/结束当前录制段，F10 退出 CLI")
+    print("[record-vla] 开始后先静止约 2 秒；F9 停止时保留结果画面，F10 立即退出")
     controls = RecordingControls()
     hotkey_listener = _start_control_listener(controls)
     last_session = None
@@ -164,12 +327,13 @@ def record(args) -> Path | None:
                 frame_interval = 1.0 / max(args.fps, 1)
                 next_deadline = time.perf_counter()
                 n_frames = 0
+                stop_at = None
                 print(f"[record-vla] 录制开始：{session_dir}")
-                recorder.start()
                 raw_mouse = RawInputMouse()
-                raw_mouse.start()
-                args._raw_mouse = raw_mouse
                 try:
+                    recorder.start()
+                    raw_mouse.start()
+                    args._raw_mouse = raw_mouse
                     while not controls.exit_requested:
                         now = time.perf_counter()
                         if now < next_deadline:
@@ -177,32 +341,47 @@ def record(args) -> Path | None:
                         elif now - next_deadline > frame_interval:
                             next_deadline = now
                         if controls.consume_toggle():
+                            if stop_at is None:
+                                stop_at = time.perf_counter() + float(getattr(args, "post_stop_seconds", 2.0))
+                        if stop_at is not None and time.perf_counter() >= stop_at:
                             break
                         if args.max_seconds > 0 and time.perf_counter() - start_wall >= args.max_seconds:
                             break
                         if args.max_frames > 0 and n_frames >= args.max_frames:
                             break
+                        # Anchor the frame to the capture request.  Measuring
+                        # after grab/resize/JPEG write shifts the visual
+                        # timestamp by the processing latency and can move an
+                        # input event into the wrong frame at 20 FPS.
+                        capture_ts = time.perf_counter_ns()
                         frame = cap.grab()
+                        next_deadline += frame_interval
                         if frame is None:
                             continue
-                        capture_ts = time.perf_counter_ns()
                         h, w = frame.shape[:2]
                         if w > args.max_width:
                             scale = args.max_width / w
                             frame = cv2.resize(frame, (int(w * scale), int(h * scale)),
                                                interpolation=cv2.INTER_AREA)
                         path = frames_dir / f"{n_frames:08d}.jpg"
-                        cv2.imwrite(str(path), frame,
-                                    [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
+                        if not cv2.imwrite(str(path), frame,
+                                           [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality]):
+                            raise RuntimeError(f"写入帧失败: {path}")
                         frame_timestamps.append((n_frames, capture_ts))
                         n_frames += 1
-                        next_deadline += frame_interval
                 finally:
                     raw_mouse.stop()
                     recorder.stop()
-                    _finalize_session(args=args, session_id=session_id, session_dir=session_dir,
-                                      frame_timestamps=frame_timestamps, n_frames=n_frames,
-                                      start_ts=start_ts, end_ts=time.perf_counter_ns())
+                    # Finalize only after both listeners have been stopped and
+                    # their files are closed. Startup failures still cleanly
+                    # release the recorder/raw-input resources.
+                    if raw_mouse._thread is None:
+                        finalized = _finalize_session(
+                            args=args, session_id=session_id, session_dir=session_dir,
+                            frame_timestamps=frame_timestamps, n_frames=n_frames,
+                            start_ts=start_ts, end_ts=time.perf_counter_ns())
+                        if finalized is None:
+                            last_session = None
                 if controls.exit_requested:
                     break
                 print("[record-vla] 已停止；F9 开始下一段，F10 退出")
@@ -219,8 +398,13 @@ def record(args) -> Path | None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="VLA 原始示范录制（不注入输入）")
     parser.add_argument("--window-title", default="第五人格")
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--output", type=Path, default=Path("data/new_vla_raw_sessions"))
+    parser.add_argument("--fps", type=int, default=20,
+                        help="采集 FPS；MVP v6 默认 20。Qwen 视觉解析不按此频率运行")
+    parser.add_argument("--output", type=Path, default=Path("data/raw_sessions"))
+    parser.add_argument("--post-stop-seconds", type=float, default=2.0,
+                        help="F9 停止后继续采集结果画面的秒数；F10/时长上限仍立即结束")
+    parser.add_argument("--trim-idle-boundaries", action="store_true",
+                        help="仅历史兼容：删除边界空闲帧；新 MVP 录制应保留等待和破译结果")
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--max-width", type=int, default=1334)
@@ -233,6 +417,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.fps <= 0 or args.max_width <= 0 or not 1 <= args.jpeg_quality <= 100:
         parser.error("fps/max-width 必须为正数，jpeg-quality 必须为 1..100")
+    if not 0 <= args.post_stop_seconds <= 30:
+        parser.error("post-stop-seconds 必须为 0..30")
     record(args)
     return 0
 

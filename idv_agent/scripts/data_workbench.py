@@ -8,10 +8,10 @@ import mimetypes
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, parse_qs
 
 from idv_agent.data_tools.session_store import SessionStore
-from idv_agent.data_tools.camera_control_store import CameraControlStore
+from idv_agent.data_tools.review_store import ReviewConflict
 from idv_agent.data_tools.workbench import DataWorkbench
 
 
@@ -22,7 +22,6 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     """HTTP routes for one configured ``DataWorkbench`` instance."""
 
     workbench: DataWorkbench
-    camera_control: CameraControlStore | None
     static_dir: Path
     protocol_version = "HTTP/1.0"
 
@@ -51,6 +50,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             value = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("request body must be valid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError("请求必须为 JSON 对象")
         return value
 
     def _path_parts(self) -> list[str]:
@@ -61,89 +62,65 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             parts = self._path_parts()
             if not parts:
                 return self._send_file(self.static_dir / "index.html")
-            if parts == ["camera-control"]:
-                if self.camera_control is None:
-                    return self._send_error(HTTPStatus.NOT_FOUND, "camera-control UI is not configured")
-                return self._send_file(self.static_dir / "camera_control.html")
-            if parts[0:2] == ["api", "camera-control"]:
-                return self._camera_control_get(parts)
-            if parts[0] == "api" and parts[1:] == ["sessions"]:
-                return self._send_json({"sessions": self.workbench.sessions()})
+            if parts == ["api", "sessions"]:
+                return self._send_json({"schema": "idv.workbench.v6", "sessions": self.workbench.sessions()})
+            if parts == ["api", "mvp-v6", "readiness"]:
+                return self._send_json(self.workbench.annotation_readiness())
             if len(parts) == 4 and parts[:2] == ["api", "sessions"] and parts[3] == "summary":
                 return self._send_json(self.workbench.session_summary(parts[2]))
+            if len(parts) == 4 and parts[:2] == ["api", "sessions"] and parts[3] == "mvp-v6":
+                return self._send_json(self.workbench.mvp_v6_summary(parts[2]))
+            if len(parts) == 5 and parts[:2] == ["api", "sessions"] and parts[3:] == ["mvp-v6", "rows"]:
+                workspace = parse_qs(urlsplit(self.path).query).get("workspace", [None])[0]
+                return self._send_json(self.workbench.review_rows(parts[2], workspace=workspace))
             if len(parts) == 5 and parts[:2] == ["api", "sessions"] and parts[3] == "frames":
-                return self._send_frame(parts[2], parts[4])
-            if parts[0] == "static" and len(parts) == 2:
-                return self._send_static_asset(parts[1])
+                session = self.workbench.store.resolve_session(parts[2])
+                if not parts[4].isdigit(): raise ValueError("frame must be an integer")
+                path = (session / "frames" / f"{int(parts[4]):08d}.jpg").resolve()
+                if path.parent != (session / "frames").resolve() or not path.is_file():
+                    raise FileNotFoundError("frame not found")
+                return self._send_file(path)
+            if parts[0] == "static" and len(parts) == 2 and parts[1] in {"app.js", "styles.css"}:
+                path = (self.static_dir / parts[1]).resolve()
+                if path.parent != self.static_dir.resolve() or not path.is_file(): raise FileNotFoundError("asset not found")
+                return self._send_file(path)
             self._send_error(HTTPStatus.NOT_FOUND, "route not found")
-        except FileNotFoundError as exc:
-            self._send_error(HTTPStatus.NOT_FOUND, str(exc))
-        except ValueError as exc:
-            self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
-        except Exception as exc:
-            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+        except FileNotFoundError as exc: self._send_error(HTTPStatus.NOT_FOUND, str(exc))
+        except ValueError as exc: self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
+        except Exception as exc: self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
     def do_POST(self) -> None:
         try:
             parts = self._path_parts()
-            if len(parts) == 4 and parts[:3] == ["api", "sessions", parts[2]] and parts[3] == "actions":
-                count = self.workbench.extract_actions(parts[2])
-                return self._send_json({"action_count": count})
-            if len(parts) == 5 and parts[:3] == ["api", "sessions", parts[2]] and parts[3:] == ["intents", "init"]:
-                payload = self._read_json()
-                overwrite = bool(payload.get("overwrite", False)) if isinstance(payload, dict) else False
-                count = self.workbench.init_intents(parts[2], overwrite=overwrite)
-                return self._send_json({"segment_count": count})
-            if len(parts) == 5 and parts[:3] == ["api", "sessions", parts[2]] and parts[3:] == ["chunks", "build"]:
-                result = self.workbench.build_vla_chunks_v5(parts[2])
-                return self._send_json(result)
-            self._send_error(HTTPStatus.NOT_FOUND, "route not found")
-        except FileExistsError as exc:
-            self._send_error(HTTPStatus.CONFLICT, str(exc))
-        except FileNotFoundError as exc:
-            self._send_error(HTTPStatus.NOT_FOUND, str(exc))
-        except ValueError as exc:
-            self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
-        except Exception as exc:
-            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            if len(parts) != 5 or parts[:3] != ["api", "sessions", parts[2]] or parts[3] != "mvp-v6":
+                return self._send_error(HTTPStatus.NOT_FOUND, "V6 route not found")
+            name, operation, payload = parts[2], parts[4], self._read_json()
+            if operation == "save-row":
+                result = self.workbench.update_review_row(name, workspace=payload.get("workspace"),
+                    row_id=payload["row_id"], patch=payload["patch"], revision=payload["revision"], reviewer=payload["reviewer"])
+            elif operation == "check-review":
+                result = self.workbench.check_review(name, workspace=payload.get("workspace"), reviewer=payload["reviewer"])
+            elif operation == "finish-review":
+                result = self.workbench.finish_review(name, workspace=payload.get("workspace"), reviewer=payload["reviewer"])
+            elif operation == "export-q-all":
+                result = self.workbench.export_q_all(name, workspace=payload.get("workspace"))
+            elif operation == "prepare": result = self.workbench.prepare_mvp_v6(name, output=payload.get("output"))
+            elif operation == "import": result = self.workbench.import_mvp_v6(name, workspace=payload.get("workspace"), output=payload.get("output"), annotator=str(payload.get("annotator", "")), completion_note=str(payload.get("completion_note", "")), split=str(payload.get("split", "")), scenario_group=str(payload.get("scenario_group", "")))
+            elif operation == "validate": result = self.workbench.validate_mvp_v6(name, workspace=payload.get("workspace"), prompt_only=bool(payload.get("prompt_only", False)), require_reviewed=bool(payload.get("require_reviewed", False)))
+            elif operation == "review": result = self.workbench.review_mvp_v6(name, workspace=payload.get("workspace"), csv_path=str(payload["csv_path"]), output=payload.get("output"), reviewer=str(payload.get("reviewer", "")))
+            elif operation == "export-q": result = self.workbench.export_q_mvp_v6(name, workspace=payload.get("workspace"), output=str(payload["output"]))
+            elif operation == "export": result = self.workbench.export_mvp_v6(name, workspace=payload.get("workspace"), output=str(payload["output"]))
+            else: return self._send_error(HTTPStatus.NOT_FOUND, "unknown V6 operation")
+            self._send_json(result)
+        except ReviewConflict as exc: self._send_error(HTTPStatus.CONFLICT, str(exc))
+        except FileExistsError as exc: self._send_error(HTTPStatus.CONFLICT, str(exc))
+        except FileNotFoundError as exc: self._send_error(HTTPStatus.NOT_FOUND, str(exc))
+        except (KeyError, ValueError) as exc: self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
+        except Exception as exc: self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
     def do_PUT(self) -> None:
-        try:
-            parts = self._path_parts()
-            if len(parts) == 5 and parts[:3] == ["api", "camera-control", parts[2]] and parts[3] == "rows":
-                if self.camera_control is None:
-                    return self._send_error(HTTPStatus.NOT_FOUND, "camera-control UI is not configured")
-                payload = self._read_json()
-                if not isinstance(payload, dict) or not isinstance(payload.get("annotation"), dict):
-                    raise ValueError("annotation payload 必须包含 annotation 对象")
-                row = self.camera_control.update(parts[2], parts[4], payload["annotation"])
-                return self._send_json({"row": row})
-            if len(parts) == 4 and parts[:2] == ["api", "sessions"] and parts[3] == "intents":
-                payload = self._read_json()
-                if not isinstance(payload, list):
-                    raise ValueError("intent payload must be an array")
-                count = self.workbench.store.atomic_write_intents(parts[2], payload)
-                return self._send_json({"segment_count": count})
-            self._send_error(HTTPStatus.NOT_FOUND, "route not found")
-        except FileNotFoundError as exc:
-            self._send_error(HTTPStatus.NOT_FOUND, str(exc))
-        except ValueError as exc:
-            self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
-        except Exception as exc:
-            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
-
-    def _camera_control_get(self, parts: list[str]) -> None:
-        if self.camera_control is None:
-            return self._send_error(HTTPStatus.NOT_FOUND, "camera-control UI is not configured")
-        if parts == ["api", "camera-control", "sets"]:
-            return self._send_json(self.camera_control.summary())
-        if len(parts) == 6 and parts[:3] == ["api", "camera-control", parts[2]] and parts[3] == "rows" and parts[5] == "context":
-            return self._send_json({"frames": self.camera_control.context_frames(parts[2], parts[4])})
-        if len(parts) == 7 and parts[:3] == ["api", "camera-control", parts[2]] and parts[3] == "rows" and parts[5] == "frames":
-            if not parts[6].isdigit():
-                raise ValueError("frame must be an integer")
-            return self._send_file(self.camera_control.frame_path(parts[2], parts[4], int(parts[6])))
-        self._send_error(HTTPStatus.NOT_FOUND, "route not found")
+        self._send_error(HTTPStatus.METHOD_NOT_ALLOWED,
+                         "V6 workbench is versioned; use POST /mvp-v6/<operation>")
 
     def _send_file(self, path: Path) -> None:
         if not path.is_file():
@@ -155,49 +132,22 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _send_static_asset(self, name: str) -> None:
-        path = (self.static_dir / name).resolve()
-        if path.parent != self.static_dir.resolve() or not path.is_file():
-            return self._send_error(HTTPStatus.NOT_FOUND, "asset not found")
-        self._send_file(path)
-
-    def _send_frame(self, session_name: str, frame_name: str) -> None:
-        session = self.workbench.store.resolve_session(session_name)
-        if not frame_name.isdigit():
-            raise ValueError("frame must be an integer")
-        path = (session / "frames" / f"{int(frame_name):08d}.jpg").resolve()
-        if path.parent != (session / "frames").resolve() or not path.is_file():
-            raise FileNotFoundError("frame not found")
-        self._send_file(path)
-
-
-def create_server(root: Path, host: str = "127.0.0.1", port: int = 8765,
-                  camera_control_dir: Path | None = None) -> ThreadingHTTPServer:
+def create_server(root: Path, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
     store = SessionStore(root)
     workbench = DataWorkbench(store)
     static_dir = Path(__file__).resolve().parents[1] / "data_tools" / "static"
-    handler = type(
-        "ConfiguredWorkbenchHandler",
-        (WorkbenchHandler,),
-        {"workbench": workbench, "static_dir": static_dir,
-         "camera_control": (CameraControlStore(camera_control_dir, root)
-                            if camera_control_dir is not None else None)},
-    )
+    handler = type("ConfiguredWorkbenchHandler", (WorkbenchHandler,),
+                   {"workbench": workbench, "static_dir": static_dir})
     return ThreadingHTTPServer((host, port), handler)
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="启动本地 VLA 数据处理工作台")
-    parser.add_argument("--root", type=Path, default=Path("data/new_vla_raw_sessions"))
+    parser.add_argument("--root", type=Path, default=Path("data/raw_sessions"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--camera-control-dir", type=Path,
-                        help="camera_control_{train,val}.v2.pending.jsonl 所在目录")
     args = parser.parse_args(argv)
-    server = create_server(args.root, args.host, args.port, args.camera_control_dir)
-    print(f"[workbench] http://{args.host}:{server.server_port}/")
-    if args.camera_control_dir is not None:
-        print(f"[camera-control] http://{args.host}:{server.server_port}/camera-control")
+    server = create_server(args.root, args.host, args.port)
+    print(f"[workbench-v6] http://{args.host}:{server.server_port}/")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

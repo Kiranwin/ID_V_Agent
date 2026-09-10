@@ -1,58 +1,36 @@
 <!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VLA Data Workbench</title>
-  <link rel="stylesheet" href="/static/styles.css">
-</head>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Data Workbench V6</title><link rel="stylesheet" href="/static/styles.css"></head>
 <body>
-  <header class="topbar">
-    <div class="brand"><span class="brand-mark">VLA</span><div><strong>Data Workbench</strong><small>offline session preparation</small></div></div>
-    <div class="top-status"><span class="dot"></span><span id="server-status">Local server</span><a class="workbench-link" href="/camera-control">Camera labels</a><span class="session-pill" id="selected-session">No session</span></div>
-  </header>
-  <main class="shell">
-    <aside class="sidebar panel">
-      <div class="section-heading"><span>Sessions</span><button class="icon-button" id="refresh-sessions" title="Refresh sessions">↻</button></div>
-      <div id="session-list" class="session-list"><div class="empty">Loading...</div></div>
-      <div class="sidebar-foot"><span class="legend green"></span> raw valid <span class="legend amber"></span> needs work</div>
-    </aside>
-    <section class="workspace">
-      <div id="empty-state" class="empty-panel panel"><div class="empty-icon">◫</div><h1>Select a raw session</h1><p>Choose a session to inspect and prepare its training labels.</p></div>
-      <div id="session-view" hidden>
-        <section class="hero-row">
-          <div><p class="eyebrow">RAW SESSION / REVIEW</p><h1 id="session-title">Session</h1><p class="subtle" id="session-meta">Select a session to begin.</p></div>
-          <div class="actions"><button class="button secondary" id="extract-actions" data-output="per-frame-actions">↗ Extract actions</button><button class="button secondary" id="init-intents">＋ Init intent segments</button><button class="button primary" id="build-chunks">▣ Generate vla_chunks_v5</button></div>
-        </section>
-        <section class="metrics-grid">
-          <div class="metric panel"><span>Frames</span><strong id="metric-frames">—</strong><small id="metric-range">—</small></div>
-          <div class="metric panel"><span>Duration</span><strong id="metric-duration">—</strong><small id="metric-fps">— FPS</small></div>
-          <div class="metric panel"><span>Raw check</span><strong id="metric-raw">—</strong><small>integrity gate</small></div>
-          <div class="metric panel"><span>Label outputs</span><strong id="metric-outputs">—</strong><small id="metric-output-detail">actions / intents / v5 chunks / audit</small></div>
-        </section>
-        <section class="diagnostics-grid">
-          <div class="panel section-panel"><div class="section-heading"><span>Action distribution</span><span class="read-only">READ ONLY</span></div><div id="action-chart" class="bar-chart"><div class="empty">No action file yet.</div></div></div>
-          <div class="panel section-panel"><div class="section-heading"><span>Motion coverage</span><span class="read-only">PER FRAME</span></div><div class="coverage"><div class="coverage-row"><span>Move frames</span><strong id="move-frames">—</strong></div><div class="coverage-row"><span>Camera frames</span><strong id="camera-frames">—</strong></div><div id="mean-values" class="mean-values"></div></div></div>
-        </section>
-        <section class="panel section-panel event-panel"><div class="section-heading"><div><span>Input events</span><small class="section-note">Mapped to the nearest captured frame. Repeated consecutive keydowns are grouped for review.</small></div><span class="read-only"><strong id="event-total">0</strong> TOTAL · <strong id="key-total">0</strong> KEY EVENTS</span></div><div id="key-stats" class="key-stats"><div class="empty">No events.csv yet.</div></div><div class="event-table-wrap"><table id="event-table"><thead><tr><th>Frame</th><th>Time</th><th>Key</th><th>Event</th><th>Value</th></tr></thead><tbody><tr><td colspan="5" class="empty">No input events yet.</td></tr></tbody></table></div></section>
-        <section id="frame-viewer" class="panel section-panel preview-panel">
-          <div class="section-heading"><div><span>Frame review</span><small class="section-note">Browse every captured frame to confirm the intended action.</small></div><span class="read-only">FULL FRAME ACCESS</span></div>
-          <div class="frame-toolbar">
-            <button class="icon-button" id="frame-previous" title="Previous frame" aria-label="Previous frame">←</button>
-            <button class="button secondary frame-play-button" id="frame-play" title="Play frames" aria-label="Play frames">▶ Play</button>
-            <button class="icon-button" id="frame-next" title="Next frame" aria-label="Next frame">→</button>
-            <label class="frame-jump">Frame <input id="frame-input" type="number" min="0" step="1" inputmode="numeric"><span>/ <strong id="frame-total">—</strong></span></label>
-          </div>
-          <input id="frame-slider" class="frame-slider" type="range" min="0" max="0" value="0" step="1" aria-label="Frame position">
-          <div class="frame-canvas"><img id="frame-image" alt="current captured frame"><div id="frame-empty" class="empty">No frames.</div></div>
-          <div class="frame-caption"><strong id="frame-current">Frame —</strong><span id="frame-time">—</span><span id="frame-events">No input events on this frame</span></div>
-        </section>
-        <section class="panel section-panel intent-panel"><div class="section-heading"><div><span>Intent segments</span><small class="section-note">Edit ranges and intent, then save to CSV.</small></div><div class="intent-actions"><span id="intent-validation" class="validation"></span><button class="button primary small" id="save-intents">Save intents</button></div></div><div class="table-wrap"><table id="intent-table"><thead><tr><th>ID</th><th>Start</th><th>End</th><th>Intent</th><th>Candidate reason</th><th>Notes</th></tr></thead><tbody><tr><td colspan="6" class="empty">No intent segments yet.</td></tr></tbody></table></div></section>
-        <section id="error-panel" class="error-panel" hidden><strong>Validation / operation error</strong><div id="error-list"></div></section>
-        <div id="operation-status" class="operation-status" role="status"></div>
-      </div>
-    </section>
-  </main>
-  <script src="/static/app.js"></script>
-</body>
-</html>
+<header><div><b>V6</b> Data Workbench <small>M29 状态引导动作标注</small></div><span id="connection">本地工作台</span></header>
+<main>
+<aside><div class="heading"><h2>录制工程</h2><button id="refresh">刷新</button></div><div id="sessions"></div><p class="hint">20 FPS 原始画面<br>标注 → 校验 → 训练数据</p></aside>
+<article>
+<section class="setup"><h1 id="title">请选择 session</h1><div id="summary" class="hint"></div><div id="readiness" class="hint"></div>
+<div class="project-controls"><label>标注人<input id="reviewer" value="user"></label><label class="grow">标注工程<select id="workspace"></select></label><button id="load-project">打开工程</button><button id="reload-saved">放弃未保存修改并重载</button></div>
+<details id="create-panel"><summary>准备新工程 / 导入 X-AnyLabeling</summary><div class="project-controls"><label>数据分组<input id="group" placeholder="同场景使用相同分组"></label><label>用途<select id="split"><option>train</option><option>val</option><option>test</option></select></label><label><input id="xany-complete" type="checkbox">已完成全部画面的 X-AnyLabeling 标注</label><button id="prepare">准备端点</button><button id="import">导入标注</button></div></details>
+</section>
+<div id="message" role="status" aria-live="polite">选择工程后开始标注，保存自动写入 CSV。</div>
+<section id="editor" hidden>
+<div class="editor-toolbar"><button id="previous">← 上一个</button><label class="grow">决策端点<select id="endpoints"></select></label><button id="next">下一个 →</button><button id="next-pending">下一个未完成</button><span id="progress"></span></div>
+<div class="review-grid">
+<div class="visual-panel"><div class="heading"><strong id="frame-caption">当前画面</strong><label><input id="show-boxes" type="checkbox" checked>显示标注框</label></div>
+<div class="picture"><img id="frame-image" alt="当前标注画面"><svg id="boxes" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg></div>
+<div class="frame-controls"><button id="frame-back">前一帧</button><button id="play">播放历史</button><button id="frame-forward">后一帧</button><input id="frame-range" type="range" min="0" value="0"><label>帧<input id="frame-number" type="number" min="0"></label><button id="endpoint-frame">回到端点</button></div>
+<div id="history" class="history"></div><p class="hint">当前状态只参考端点及之前的画面。点击框可选择密码机目标。</p>
+<div class="badges"><span id="q-label"></span><span id="saved-status"></span></div><div id="issues" class="hint"></div>
+<details><summary>查看演示动作建议</summary><pre id="replay"></pre></details></div>
+<form id="annotation-form" novalidate>
+<h2>顶层决策与当前状态</h2><div class="fields">
+<label>范围<select id="scope" data-field="scope"></select></label><label>主要阶段<select id="phase" data-field="phase"></select></label>
+<label>实际正在破译<select id="decoding" data-field="decoding"></select></label><label>证据帧<input id="decoding_evidence_frames" data-field="decoding_evidence_frames" placeholder="例如 [75, 79]"></label>
+</div><button id="use-evidence" type="button" class="small">将当前查看帧加入破译证据</button>
+<h2>目标与局部路线</h2><div class="fields"><label>密码机候选<select id="target_candidate" data-field="target_candidate"></select></label><label>目标跟踪编号<input id="target_track_id" data-field="target_track_id" placeholder="cipher_1"></label><label>镜头方式<select id="steering" data-field="steering"></select></label><label>局部路径<select id="path" data-field="path"></select></label></div>
+<h2>移动 / 镜头动作</h2><label>动作标签来源<select id="action_source" data-field="action_source"></select></label><p id="action-help" class="hint"></p>
+<div id="correction" class="fields"><label>移动<select id="move" data-field="move"></select></label><label>水平镜头<select id="camera_dx" data-field="camera_dx"></select></label><label>垂直镜头<select id="camera_dy" data-field="camera_dy"></select></label></div>
+<label>备注 / 纠正原因<textarea id="reason" data-field="reason" rows="2"></textarea></label>
+<p class="hint">Q 已由交互提示标注生成，不受导航阶段或已按过 Q 的影响。</p>
+<div class="save-bar"><button id="save-draft" type="button">保存草稿</button><button id="complete" type="button" class="primary">标注完成并下一条</button></div>
+</form></div>
+<section class="export-panel"><div><h2>工程校验与导出</h2><p class="hint">完整导出前检查全部端点；导出会新建版本，不覆盖原始标注。</p></div><button id="check">检查工程</button><button id="export-q">导出 Q 全帧样本</button><button id="finish" class="primary">完成工程并导出 V6</button><pre id="report"></pre></section>
+</section>
+</article></main><script src="/static/app.js"></script></body></html>

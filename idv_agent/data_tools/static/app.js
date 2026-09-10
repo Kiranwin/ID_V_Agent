@@ -1,266 +1,51 @@
-const INTENTS = ["decipher", "kite", "rescue", "rotate", "travel", "search", "gate", "idle"];
-const state = { selected: null, summary: null, sessions: [], frameIndex: 0, playTimer: null };
-
-const $ = (id) => document.getElementById(id);
-
-async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
-  const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-  return data;
-}
-
-function setStatus(message, kind = "") {
-  const node = $("operation-status");
-  node.textContent = message || "";
-  node.className = `operation-status ${kind}`;
-}
-
-function showError(error) {
-  const panel = $("error-panel");
-  const list = $("error-list");
-  const messages = String(error.message || error).split("; ");
-  list.replaceChildren(...messages.map((message) => { const item = document.createElement("div"); item.textContent = message; return item; }));
-  panel.hidden = false;
-  setStatus("Operation failed", "error");
-}
-
-function clearError() { $("error-panel").hidden = true; $("error-list").replaceChildren(); }
-
-function renderSessions(sessions) {
-  const list = $("session-list");
-  list.replaceChildren();
-  if (!sessions.length) { list.innerHTML = '<div class="empty">No sessions found.</div>'; return; }
-  sessions.forEach((session) => {
-    const button = document.createElement("button");
-    button.className = `session-item ${state.selected === session.name ? "active" : ""}`;
-    button.dataset.session = session.name;
-    const status = session.raw_valid ? "valid" : "warning";
-    button.innerHTML = `<span class="session-icon">${session.raw_valid ? "●" : "!"}</span><span class="session-copy"><strong></strong><small>${session.frame_count} frames · ${session.duration_s.toFixed(1)}s</small></span><span class="file-status"><i class="${session.has_actions ? "on" : ""}">A</i><i class="${session.has_intents ? "on" : ""}">I</i><i class="${session.has_v5_chunks ? "on" : ""}">V5</i></span>`;
-    button.querySelector("strong").textContent = session.name;
-    button.querySelector(".session-icon").classList.add(status);
-    button.addEventListener("click", () => selectSession(session.name));
-    list.append(button);
-  });
-}
-
-async function loadSessions() {
-  try {
-    const data = await api("/api/sessions");
-    state.sessions = data.sessions || [];
-    renderSessions(data.sessions || []);
-    if (!state.selected && data.sessions && data.sessions.length) selectSession(data.sessions[0].name);
-  } catch (error) { showError(error); }
-}
-
-function renderActionChart(counts) {
-  const chart = $("action-chart");
-  chart.replaceChildren();
-  const entries = Object.entries(counts || {});
-  if (!entries.length) { chart.innerHTML = '<div class="empty">No action file yet.</div>'; return; }
-  const max = Math.max(...entries.map(([, value]) => value), 1);
-  entries.sort((a, b) => b[1] - a[1]).slice(0, 9).forEach(([name, count]) => {
-    const row = document.createElement("div"); row.className = "bar-row";
-    row.innerHTML = `<div class="bar-label"><span></span><strong>${count}</strong></div><div class="bar-track"><i style="width:${Math.max(3, count / max * 100)}%"></i></div>`;
-    row.querySelector("span").textContent = name;
-    chart.append(row);
-  });
-}
-
-function focusFrame(frameId) {
-  if (frameId == null || frameId === "") return;
-  const frameIds = state.summary?.frame_ids || [];
-  const numericId = Number(frameId);
-  if (!Number.isFinite(numericId) || !frameIds.length) return;
-  let index = frameIds.indexOf(numericId);
-  if (index < 0) {
-    index = frameIds.reduce((best, value, candidate) => Math.abs(value - numericId) < Math.abs(frameIds[best] - numericId) ? candidate : best, 0);
-  }
-  state.frameIndex = index;
-  const currentId = frameIds[index];
-  $("frame-input").value = currentId;
-  $("frame-slider").value = index;
-  $("frame-current").textContent = `Frame ${currentId}`;
-  $("frame-total").textContent = frameIds.length ? `${frameIds[frameIds.length - 1]}` : "—";
-  $("frame-time").textContent = state.summary.frame_times?.[String(currentId)] != null ? `${Number(state.summary.frame_times[String(currentId)]).toFixed(3)}s` : "—";
-  const frameEvents = (state.summary.events || []).filter((event) => event.frame_id === currentId);
-  $("frame-events").textContent = frameEvents.length ? `${frameEvents.length} input event${frameEvents.length === 1 ? "" : "s"} on this frame` : "No input events on this frame";
-  $("frame-image").hidden = false;
-  $("frame-empty").hidden = true;
-  $("frame-image").src = `/api/sessions/${encodeURIComponent(state.selected)}/frames/${currentId}`;
-  document.querySelectorAll("#event-table tr.selected").forEach((node) => node.classList.remove("selected"));
-  document.querySelectorAll(`#event-table tr[data-frame-id="${currentId}"]`).forEach((node) => node.classList.add("selected"));
-}
-
-function renderFrameViewer(summary) {
-  stopFramePlayback();
-  const frameIds = summary.frame_ids || [];
-  const slider = $("frame-slider");
-  slider.min = "0";
-  slider.max = String(Math.max(frameIds.length - 1, 0));
-  slider.disabled = !frameIds.length;
-  $("frame-input").disabled = !frameIds.length;
-  $("frame-previous").disabled = !frameIds.length;
-  $("frame-next").disabled = !frameIds.length;
-  $("frame-play").disabled = !frameIds.length;
-  if (!frameIds.length) {
-    $("frame-image").hidden = true;
-    $("frame-empty").hidden = false;
-    $("frame-current").textContent = "Frame —";
-    $("frame-total").textContent = "—";
-    return;
-  }
-  focusFrame(frameIds[0]);
-}
-
-function stepFrame(delta) {
-  const frameIds = state.summary?.frame_ids || [];
-  if (!frameIds.length) return;
-  const nextIndex = Math.max(0, Math.min(frameIds.length - 1, state.frameIndex + delta));
-  focusFrame(frameIds[nextIndex]);
-  if (nextIndex === frameIds.length - 1 && delta > 0) stopFramePlayback();
-}
-
-function stopFramePlayback() {
-  if (state.playTimer) window.clearInterval(state.playTimer);
-  state.playTimer = null;
-  $("frame-play").textContent = "▶ Play";
-  $("frame-play").setAttribute("aria-label", "Play frames");
-}
-
-function toggleFramePlayback() {
-  if (state.playTimer) { stopFramePlayback(); return; }
-  const frameIds = state.summary?.frame_ids || [];
-  if (!frameIds.length) return;
-  if (state.frameIndex >= frameIds.length - 1) focusFrame(frameIds[0]);
-  state.playTimer = window.setInterval(() => stepFrame(1), 1000 / Math.max(Number(state.summary.fps) || 10, 1));
-  $("frame-play").textContent = "⏸ Pause";
-  $("frame-play").setAttribute("aria-label", "Pause frames");
-}
-
-function renderKeyStats(counts) {
-  const stats = $("key-stats"); stats.replaceChildren();
-  const entries = Object.entries(counts || {}).sort((a, b) => b[1] - a[1]);
-  if (!entries.length) { stats.innerHTML = '<div class="empty">No key events.</div>'; return; }
-  entries.slice(0, 16).forEach(([key, count]) => {
-    const chip = document.createElement("div"); chip.className = "key-chip";
-    const label = document.createElement("span"); label.textContent = key;
-    const value = document.createElement("strong"); value.textContent = count;
-    chip.append(label, value); stats.append(chip);
-  });
-}
-
-function renderEvents(events) {
-  const body = $("event-table").querySelector("tbody"); body.replaceChildren();
-  if (!events || !events.length) { body.innerHTML = '<tr><td colspan="5" class="empty">No input events yet.</td></tr>'; return; }
-  events.forEach((event) => {
-    const row = document.createElement("tr"); row.dataset.frameId = event.frame_id ?? "";
-    const frameLabel = event.end_frame_id != null && event.end_frame_id !== event.frame_id ? `${event.frame_id}–${event.end_frame_id}` : (event.frame_id ?? "—");
-    const eventName = String(event.kind || "").replace("key_", "").toUpperCase() || "—";
-    const eventLabel = event.repeat_count > 1 ? `${eventName} ×${event.repeat_count}` : eventName;
-    const values = [frameLabel, event.time_s == null ? "—" : `${Number(event.time_s).toFixed(3)}s`, event.key || "—", eventLabel, event.value ?? "—"];
-    values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); });
-    row.addEventListener("click", () => {
-      focusFrame(event.frame_id);
-      row.classList.add("selected");
-      row.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    });
-    body.append(row);
-  });
-}
-
-function intentSelect(value) {
-  const select = document.createElement("select");
-  INTENTS.forEach((intent) => { const option = new Option(intent, intent, intent === value, intent === value); select.add(option); });
-  return select;
-}
-
-function renderIntents(rows) {
-  const body = $("intent-table").querySelector("tbody"); body.replaceChildren();
-  if (!rows || !rows.length) { body.innerHTML = '<tr><td colspan="6" class="empty">No intent segments yet.</td></tr>'; return; }
-  rows.forEach((row) => {
-    const tr = document.createElement("tr");
-    const id = document.createElement("td"); id.textContent = row.segment_id || "";
-    const start = document.createElement("input"); start.type = "number"; start.value = row.start_frame ?? ""; start.min = "0"; start.dataset.field = "start_frame";
-    const end = document.createElement("input"); end.type = "number"; end.value = row.end_frame ?? ""; end.min = "0"; end.dataset.field = "end_frame";
-    const startCell = document.createElement("td"); startCell.append(start);
-    const endCell = document.createElement("td"); endCell.append(end);
-    const intentCell = document.createElement("td"); const select = intentSelect(row.intent); select.dataset.field = "intent"; intentCell.append(select);
-    const reason = document.createElement("td"); reason.className = "reason"; reason.textContent = row.candidate_reason || "";
-    const notesCell = document.createElement("td"); const notes = document.createElement("input"); notes.type = "text"; notes.value = row.notes || ""; notes.dataset.field = "notes"; notesCell.append(notes);
-    tr.dataset.segmentId = row.segment_id || "";
-    tr.append(id, startCell, endCell, intentCell, reason, notesCell); body.append(tr);
-  });
-}
-
-function collectIntents() {
-  return [...$("intent-table").querySelectorAll("tbody tr")].map((row) => {
-    const value = (field) => row.querySelector(`[data-field="${field}"]`)?.value ?? "";
-    return { segment_id: row.dataset.segmentId, start_frame: value("start_frame"), end_frame: value("end_frame"), intent: value("intent"), candidate_reason: row.cells[4].textContent, notes: value("notes") };
-  });
-}
-
-function renderSummary(summary) {
-  state.summary = summary;
-  $("session-title").textContent = state.selected;
-  $("selected-session").textContent = state.selected;
-  $("session-meta").textContent = `${summary.metadata.task_instruction || summary.metadata.task_name || "raw VLA recording"} · ${summary.metadata.mode || "unknown mode"}`;
-  $("metric-frames").textContent = summary.frame_count;
-  $("metric-range").textContent = `frames ${summary.frame_start ?? "—"}–${summary.frame_end ?? "—"}`;
-  $("metric-duration").textContent = `${Number(summary.duration_s || 0).toFixed(1)}s`;
-  $("metric-fps").textContent = `${Number(summary.fps || 0).toFixed(1)} FPS`;
-  $("metric-raw").textContent = summary.raw_errors.length ? "Needs review" : "Valid";
-  $("metric-raw").className = summary.raw_errors.length ? "bad" : "good";
-  $("metric-outputs").textContent = `${summary.has_actions ? "A" : "–"} / ${summary.has_intents ? "I" : "–"} / ${summary.v5_chunks?.exists ? "V5" : "–"} / ${summary.v5_chunks?.audit_exists ? "✓" : "–"}`;
-  const auditText = !summary.v5_chunks?.audit_exists ? "audit missing" : summary.v5_chunks.audit_gate_pass ? "audit gate passed" : `audit gate blocked (${summary.v5_chunks.audit_conflicts || 0} conflicts)`;
-  $("metric-output-detail").textContent = summary.v5_chunks?.exists ? `${summary.v5_chunks.count} vla_chunks_v5 records · ${auditText}` : "actions / intents / v5 chunks / audit";
-  $("move-frames").textContent = `${summary.movement_frames} / ${summary.frame_count}`;
-  $("camera-frames").textContent = `${summary.camera_frames} / ${summary.frame_count}`;
-  $("event-total").textContent = summary.event_count || 0;
-  $("key-total").textContent = summary.key_event_count || 0;
-  $("mean-values").innerHTML = Object.entries(summary.mean_abs || {}).map(([key, value]) => `<span>${key}<strong>${Number(value).toFixed(3)}</strong></span>`).join("");
-  renderActionChart(summary.action_categories); renderKeyStats(summary.key_counts); renderEvents(summary.events); renderFrameViewer(summary); renderIntents(summary.intent_rows);
-  if (summary.raw_errors.length) showError({ message: summary.raw_errors.join("; ") }); else clearError();
-}
-
-async function selectSession(name) {
-  stopFramePlayback(); state.selected = name; renderSessions(state.sessions);
-  try { $("empty-state").hidden = true; $("session-view").hidden = false; setStatus("Loading session..."); renderSummary(await api(`/api/sessions/${encodeURIComponent(name)}/summary`)); setStatus("Ready", "success"); }
-  catch (error) { showError(error); }
-  loadSessions();
-}
-
-async function runOperation(button, path, method = "POST", payload = {}) {
-  if (!state.selected) return;
-  button.disabled = true; clearError(); setStatus("Working...");
-  try { await api(`/api/sessions/${encodeURIComponent(state.selected)}${path}`, { method, body: JSON.stringify(payload) }); await selectSession(state.selected); setStatus("Saved", "success"); }
-  catch (error) { showError(error); }
-  finally { button.disabled = false; }
-}
-
-$("refresh-sessions").addEventListener("click", loadSessions);
-$("frame-previous").addEventListener("click", () => stepFrame(-1));
-$("frame-next").addEventListener("click", () => stepFrame(1));
-$("frame-play").addEventListener("click", toggleFramePlayback);
-$("frame-slider").addEventListener("input", (event) => {
-  const frameIds = state.summary?.frame_ids || [];
-  if (frameIds.length) focusFrame(frameIds[Number(event.currentTarget.value)]);
-});
-$("frame-input").addEventListener("change", (event) => focusFrame(event.currentTarget.value));
-$("frame-input").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") { event.preventDefault(); focusFrame(event.currentTarget.value); event.currentTarget.blur(); }
-});
-$("extract-actions").addEventListener("click", (event) => runOperation(event.currentTarget, "/actions"));
-$("init-intents").addEventListener("click", (event) => runOperation(event.currentTarget, "/intents/init"));
-$("build-chunks").addEventListener("click", async (event) => {
-  const button = event.currentTarget;
-  button.disabled = true; clearError(); setStatus("Building vla_chunks_v5 and audit...");
-  try {
-    const result = await api(`/api/sessions/${encodeURIComponent(state.selected)}/chunks/build`, { method: "POST", body: JSON.stringify({}) });
-    await selectSession(state.selected);
-    setStatus(`Generated ${result.chunk_count} chunks → ${result.output} · ${result.audit_output}`, result.gate_pass ? "success" : "error");
-  } catch (error) { showError(error); }
-  finally { button.disabled = false; }
-});
-$("save-intents").addEventListener("click", (event) => runOperation(event.currentTarget, "/intents", "PUT", collectIntents()));
-loadSessions();
+"use strict";
+const $ = id => document.getElementById(id);
+const state = {session:null,summary:null,project:null,index:0,frame:0,dirty:false,busy:false,loading:0,timer:null};
+const labels = {
+ scope:{"":"未选择",in_scope:"MVP 范围内",out_of_scope:"范围外",uncertain:"无法判断"},
+ phase:{"":"未确定",search:"搜索密码机",approach:"导航靠近",align:"调整对齐",interact:"交互（含按 Q 后等待确认）",maintain_decode:"维持破译"},
+ decoding:{"":"未知",unknown:"未知",true:"正在破译",false:"未在破译"},
+ steering:{"":"未选择",target_center:"对准目标",path_follow:"跟随通行路径",search_sweep:"搜索扫视",hold:"保持镜头"},
+ path:{"":"未选择",direct:"直接接近",detour_left:"左侧绕行",detour_right:"右侧绕行",blocked:"前方受阻",unknown:"未知 / 不适用"},
+ action_source:{"":"未选择",accept_replay:"接受演示动作",correction:"纠正动作",exclude:"排除导航（保留 Q）"},
+ move:{"":"未选择",0:"0 停止",1:"1 前进 W",2:"2 右前 W+D",3:"3 向右 D",4:"4 右后 S+D",5:"5 后退 S",6:"6 左后 S+A",7:"7 向左 A",8:"8 左前 W+A"}
+};
+const sourceHelp={accept_replay:"使用右侧演示建议，无需手填方向与鼠标。",correction:"选择纠正后的方向与镜头 counts，并填写原因。",exclude:"此端点不训练移动/镜头；phase、decoding 和 Q 仍会保留。","":"请先判断这段演示动作是否适合学习。"};
+function message(text,type=""){ $("message").textContent=text;$("message").className=type; }
+async function api(path,options={}){const response=await fetch(path,{...options,headers:{"Content-Type":"application/json"}});const data=await response.json();if(!response.ok)throw new Error(data.error||`HTTP ${response.status}`);return data;}
+function base(){return `/api/sessions/${encodeURIComponent(state.session)}/mvp-v6`;}
+async function post(operation,payload={}){return api(`${base()}/${operation}`,{method:"POST",body:JSON.stringify(payload)});}
+function current(){return state.project?.rows[state.index];}
+function stopPlayback(){if(state.timer)clearTimeout(state.timer);state.timer=null;$("play").textContent="播放历史";}
+function canLeave(){if(state.busy)return false;if(state.dirty){message("当前标注尚未保存。请先保存草稿或标注完成。","error");return false;}return true;}
+async function operation(action){if(state.busy)return;state.busy=true;for(const b of document.querySelectorAll("button,input,select,textarea"))b.disabled=true;try{await action();}catch(error){message(error.message,"error");}finally{state.busy=false;for(const b of document.querySelectorAll("button,input,select,textarea"))b.disabled=false;if(state.project)updateAction();}}
+function setOptions(node,values,field){node.replaceChildren(...values.map(value=>new Option(labels[field]?.[value]??(value===""?"未选择":value),value)));}
+async function listSessions(){const [data,ready]=await Promise.all([api('/api/sessions'),api('/api/mvp-v6/readiness')]);$("sessions").replaceChildren();for(const s of data.sessions){const b=document.createElement('button');b.className='session'+(s.name===state.session?' active':'');const title=document.createElement('strong');title.textContent=s.name;const sub=document.createElement('small');sub.textContent=`${s.frame_count} 帧 · ${s.duration_s}s · ${s.raw_valid?'校验通过':'待检查'}`;b.append(title,sub);b.onclick=()=>selectSession(s.name);$("sessions").append(b);}$("readiness").textContent=`全工程 ${ready.reviewed}/${ready.total} · ${ready.pass?'标注准入通过':ready.blockers.join('；')}`;$("readiness").className=ready.pass?'success':'hint';return data.sessions;}
+async function selectSession(name){if(!canLeave())return;stopPlayback();const serial=++state.loading;state.session=name;state.project=null;$("editor").hidden=true;message("加载工程…");try{const summary=await api(`${base()}`);if(serial!==state.loading)return;state.summary=summary;$("title").textContent=name;const r=summary.xany_import_report;$("summary").textContent=`${summary.frame_count} 帧 · ${summary.fps.toFixed(1)} FPS · ${r?`Q ${r.q_positive} / NO_Q ${r.q_negative}`:'尚未导入视觉标注'}`;$("workspace").replaceChildren(...summary.projects.map(p=>new Option(p.name,p.path)));if(summary.projects.length){const preferred=summary.projects.find(p=>p.name.endsWith('xany_import_v2'))||summary.projects.find(p=>p.name.endsWith('xany_import_v1'))||summary.projects[0];$("workspace").value=preferred.path;await loadProject();}else{message("先准备端点，完成 X-AnyLabeling 后在此导入。请展开下方准备区。");$("create-panel").open=true;}await listSessions();}catch(error){message(error.message,"error");}}
+async function loadProject(){if(!canLeave()||!$("workspace").value)return;stopPlayback();const expectedSession=state.session,expectedProject=$("workspace").value;const data=await api(`${base()}/rows?workspace=${encodeURIComponent(expectedProject)}`);if(expectedSession!==state.session||expectedProject!==$("workspace").value)return;state.project=data;state.index=Math.max(0,data.rows.findIndex(r=>r.reviewed!=="reviewed"));$("editor").hidden=false;renderList();renderRow();message(`工程已打开。保存到：${data.path}`);}
+function renderList(){const rows=state.project.rows;$("endpoints").replaceChildren(...rows.map((r,i)=>new Option(`${r.reviewed==='reviewed'?'✓':'○'} 帧 ${r.frame} · ${labels.phase[r.phase]||'待标阶段'} · ${r.q_target==='1'?'Q':'NO_Q'}`,String(i))));$("endpoints").value=String(state.index);$("progress").textContent=`已完成 ${state.project.progress.reviewed} / ${state.project.progress.total}`;}
+function renderRow(){stopPlayback();const r=current();if(!r)return;for(const [key,choices] of Object.entries(state.project.choices)){const node=$(key);if(node?.tagName==='SELECT')setOptions(node,choices,key);}const options=[new Option('请选择当前目标',''),new Option('无密码机目标','none'),new Option('目标不确定','unknown'),new Option('目标被遮挡','occluded')];for(const candidate of r.candidates.filter(c=>c.label!=='interact_prompt'))options.push(new Option(`${candidate.candidate} · ${candidate.label}`,candidate.candidate));$("target_candidate").replaceChildren(...options);for(const field of document.querySelectorAll('[data-field]'))field.value=r[field.dataset.field]||'';if(!$("scope").value)$("scope").value='in_scope';if(!$("path").value)$("path").value='direct';if(!$("action_source").value)$("action_source").value='accept_replay';if(!$("target_candidate").value&&r.candidates.filter(c=>c.label!=='interact_prompt').length===1)$("target_candidate").value=r.candidates.find(c=>c.label!=='interact_prompt').candidate;if(!$("steering").value)$("steering").value=$("phase").value==='search'?'search_sweep':'hold';if(r.q_target==='1'&&r.suggested_target_candidate)$("target_candidate").value=r.suggested_target_candidate;$("decoding").value=$("phase").value==='maintain_decode'?'true':($("decoding").value||'false');$("decoding_evidence_frames").value=r.decoding_evidence_frames||'[]';const navBlocked=r.issues.some(v=>['insufficient_history','incomplete_action_window','visual_history_gap'].includes(v));if(navBlocked&&$("action_source").value!=="exclude")$("action_source").value="exclude";const candidateNote={prompt_no_navigation:'交互提示可见：已足够接近，无需目标跟踪/导航',manual_multi_candidate:'有多个密码机候选，请人工选择目标',not_prompt_frame:'当前不是 prompt 帧'}[r.candidate_mode]||'';$("q-label").textContent=(r.q_target==='1'?'交互提示可见 → Q':'无交互提示 → NO_Q')+(candidateNote?` · ${candidateNote}`:'');$("saved-status").textContent=r.reviewed==='reviewed'?'已标注完成':'待标注';$("issues").textContent=r.issues.map(v=>({insufficient_history:'历史不足：仅标注状态/意图，导航自动排除',incomplete_action_window:'未来动作窗口不完整：仅标注状态/意图，导航自动排除',insufficient_one_second_outcome_tail:'结果尾部较短：不影响 Q/phase，outcome 保持未知',visual_history_gap:'导航自动排除'})[v]||v).join('；');$("replay").textContent=r.replay?JSON.stringify({move_proposal:r.replay.move_proposal,camera_counts:r.replay.quantized_command_proposal,key_occupancy:r.replay.key_occupancy},null,2):'无完整动作窗口';$("history").replaceChildren(...r.history_frames.map(frame=>{const button=document.createElement('button');button.textContent=`帧 ${frame}`;button.onclick=()=>showFrame(frame);return button;}));$("frame-range").max=r.frame;$("frame-number").max=r.frame;state.dirty=false;updateAction();showFrame(Number(r.frame));$("endpoints").value=String(state.index);}
+function updateAction(){const row=current();const prompt=row?.q_target==='1';const blocked=prompt||row?.issues.some(v=>['insufficient_history','incomplete_action_window','visual_history_gap'].includes(v));const source=$("action_source").value;$("action_source").disabled=Boolean(blocked)||state.busy;$("correction").hidden=source!=="correction"||blocked;$("action-help").textContent=prompt?'交互提示出现，已足够接近；无需目标跟踪/导航，Q 与 interact 状态仍保留。':blocked?'导航监督已自动排除，Q 仍保留。若当前/过去画面足以判断就填写 phase；无法判断可保留“未确定”并完成。':sourceHelp[source]||'';}
+function showFrame(frame){const row=current();if(!row)return;const value=Math.max(0,Math.min(Number(row.frame),Number(frame)||0));state.frame=value;$("frame-number").value=value;$("frame-range").value=value;$("frame-caption").textContent=`查看帧 ${value} · 标注端点 ${row.frame}`;$("frame-image").src=`/api/sessions/${encodeURIComponent(state.session)}/frames/${value}`;drawBoxes();}
+function drawBoxes(){const svg=$("boxes");svg.replaceChildren();if(!$("show-boxes").checked||state.frame!==Number(current()?.frame))return;for(const shape of current().candidates){const [x1,y1,x2,y2]=shape.bbox;const rect=document.createElementNS(svg.namespaceURI,'rect');for(const [key,value] of Object.entries({x:x1*1000,y:y1*1000,width:(x2-x1)*1000,height:(y2-y1)*1000}))rect.setAttribute(key,String(value));rect.style.stroke=shape.label==='interact_prompt'?'#ffbf72':shape.candidate===$("target_candidate").value?'#80ffad':'#71c2ff';rect.onclick=()=>{if(state.busy||shape.label==='interact_prompt')return;$("target_candidate").value=shape.candidate;state.dirty=true;$("saved-status").textContent='未保存';drawBoxes();};const text=document.createElementNS(svg.namespaceURI,'text');text.setAttribute('x',String(x1*1000+4));text.setAttribute('y',String(Math.max(y1*1000,24)));text.textContent=`${shape.candidate} ${shape.label}`;svg.append(rect,text);}}
+async function save(completed){const row=current();if(!row)return;const patch={};for(const field of document.querySelectorAll('[data-field]'))patch[field.dataset.field]=field.value;try{patch.decoding_evidence_frames=JSON.parse(patch.decoding_evidence_frames||'[]');}catch{throw new Error('证据帧请使用数组，例如 [12, 14]');}patch.reviewed=completed?'reviewed':'pending';const data=await post('save-row',{workspace:state.project.workspace,row_id:row.id,patch,revision:state.project.revision,reviewer:$("reviewer").value});state.project=data;state.dirty=false;if(completed&&state.index<data.rows.length-1)state.index++;renderList();renderRow();message(completed?'标注已完成并保存。':'草稿已保存。','success');}
+function stepEndpoint(delta){if(!canLeave())return;state.index=Math.max(0,Math.min(state.project.rows.length-1,state.index+delta));renderRow();}
+function playback(){if(state.timer){stopPlayback();return;}const row=current();if(!row)return;showFrame(row.history_frames[0]);$("play").textContent='暂停';function tick(){if(state.frame>=Number(row.frame)){stopPlayback();return;}const times=state.summary.frame_times;const ms=Math.max(10,1000*((times[String(state.frame+1)]??0)-(times[String(state.frame)]??0))||50);state.timer=setTimeout(()=>{showFrame(state.frame+1);tick();},ms);}tick();}
+$("annotation-form").onsubmit=e=>e.preventDefault();for(const field of document.querySelectorAll('[data-field]'))field.addEventListener('input',()=>{state.dirty=true;$("saved-status").textContent='未保存';updateAction();if(field.id==='target_candidate')drawBoxes();});
+$("refresh").onclick=()=>{if(!canLeave())return;operation(listSessions);};
+$("load-project").onclick=()=>{if(!state.busy)loadProject().catch(e=>message(e.message,'error'));};
+$("reload-saved").onclick=()=>{if(state.busy)return;state.dirty=false;loadProject().catch(e=>message(e.message,"error"));};
+$("workspace").onchange=()=>{if(!canLeave()&&state.project)$("workspace").value=state.project.workspace;};
+$("previous").onclick=()=>stepEndpoint(-1);$("next").onclick=()=>stepEndpoint(1);
+$("endpoints").onchange=()=>{if(!canLeave()){$("endpoints").value=String(state.index);return;}state.index=Number($("endpoints").value);renderRow();};
+$("next-pending").onclick=()=>{if(!canLeave())return;const rows=state.project.rows;for(let n=1;n<=rows.length;n++){const i=(state.index+n)%rows.length;if(rows[i].reviewed!=='reviewed'){state.index=i;renderRow();return;}}message('全部端点已完成，可检查并导出。','success');};
+$("frame-back").onclick=()=>showFrame(state.frame-1);$("frame-forward").onclick=()=>showFrame(state.frame+1);$("endpoint-frame").onclick=()=>showFrame(current().frame);$("frame-range").oninput=e=>{stopPlayback();showFrame(e.target.value);};$("frame-number").onchange=e=>showFrame(e.target.value);$("play").onclick=playback;$("show-boxes").onchange=drawBoxes;
+$("use-evidence").onclick=()=>{try{const values=JSON.parse($("decoding_evidence_frames").value||'[]');if(!Array.isArray(values))throw new Error();$("decoding_evidence_frames").value=JSON.stringify([...new Set([...values,state.frame])].sort((a,b)=>a-b));state.dirty=true;$("saved-status").textContent='未保存';}catch{message('证据帧必须是数组。','error');}};
+$("save-draft").onclick=()=>operation(()=>save(false));$("complete").onclick=()=>operation(()=>save(true));
+$("check").onclick=()=>{if(!canLeave())return;operation(async()=>{const r=await post('check-review',{workspace:state.project.workspace,reviewer:$("reviewer").value});$("report").textContent=JSON.stringify(r,null,2);message(r.pass?'工程校验通过。':`尚有 ${r.errors.length} 个端点待处理。`,r.pass?'success':'error');});};
+$("finish").onclick=()=>{if(!canLeave())return;operation(async()=>{const r=await post('finish-review',{workspace:state.project.workspace,reviewer:$("reviewer").value});$("report").textContent=JSON.stringify(r,null,2);message(r.exported?`已导出：${r.training_file}`:'工程尚未完成，见下方逐行问题。',r.exported?'success':'error');});};
+$("export-q").onclick=()=>{if(!canLeave())return;operation(async()=>{const r=await post('export-q-all',{workspace:state.project.workspace});$("report").textContent=JSON.stringify(r,null,2);message(`已导出 ${r.frames} 个 Q 专项样本。`,'success');});};
+$("prepare").onclick=()=>{if(!state.session||!canLeave())return;operation(async()=>{const r=await post('prepare');message(`已准备 ${r.rows} 个端点，请导入已完成的 X-AnyLabeling 标注。`,'success');});};
+$("import").onclick=()=>{if(!state.session||!canLeave())return;if(!$("xany-complete").checked){message('请先完成 X-AnyLabeling 标注，再勾选完成声明。','error');return;}operation(async()=>{await post('import',{annotator:$("reviewer").value,completion_note:'用户在 V6 工作台确认全部 X-AnyLabeling 已完成',split:$("split").value,scenario_group:$("group").value});message('标注导入完成。请刷新并打开工程。','success');state.summary=await api(base());$("workspace").replaceChildren(...state.summary.projects.map(p=>new Option(p.name,p.path)));});};
+window.addEventListener('beforeunload',e=>{if(state.dirty){e.preventDefault();e.returnValue='';}});
+listSessions().then(sessions=>{const initial=sessions.find(s=>s.name==='20260908_210127_149560')||sessions[0];if(initial)selectSession(initial.name);else message('当前 raw 目录没有 session。');}).catch(e=>message(e.message,'error'));

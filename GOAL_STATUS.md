@@ -22,15 +22,632 @@ checkpoint as deployable merely because its training loss decreases.
    deployment code.
 2. Verify the paths, git worktree/branch, checkpoint files, and reports named
    below before treating any status as current.
-3. Use `data/new_vla_raw_sessions` as the raw MVP source. Do not modify it;
+3. Use `data/raw_sessions` as the raw MVP source.
    derived data and annotation-pool products are separate, recoverable files.
-4. For every training command, run the command as a blocking foreground task.
-   Do not start a second process or repeatedly poll it. Read its artifacts only
-   after the command exits.
-5. After a material result, update this file with evidence paths, pass/fail
+4. After a material result, update this file with evidence paths, pass/fail
    gates, the next concrete action, and any newly created backups.
 
 ## Root-Cause Review Addendum (2026-09-08)
+
+**2026-09-10 run_agent 入口收敛为 SGan：** 按用户要求，`run_agent` 删除
+`--mode rule`（规则安全兜底）与 `--mode act`（旧 ACT 同步 runtime）两条分支及其
+参数，只保留原 M29 运行链路并对外重命名为 **SGan**（State-Guided Action
+Network；checkpoint schema 与模块名仍为 m29，`m29.pt` 可直接加载）。新字段为
+`--mode sgan`、`--checkpoint`（必填，`.pt` 文件）、`--model-path`（可省略，回退
+`manifest.base_model`）、`--title`、`--device`、`--duration`、`--trace`（必填，
+路径必须不存在）、`--send-input`、`--allow-undeployed-send-input`、
+`--enable-navigation`。行为不变：默认 dry-run；`deployable=false` 的 checkpoint
+单独用 `--send-input` 仍被 `run_m29.py` 拒绝。旧 rule/act 分支上的“--send-input
+必须管理员终端”预检随分支一并移除；SGan 路径沿用 run_m29 的 deployable 门禁。
+完整字段与 trace 说明写入
+`docs/agent.md`；受影响文档 `README.md`、`docs/05-操作手册.md`、
+`docs/19-ACT实时推理接入.md` 已同步，行为回归测试
+`tests/test_configs.py -k run_agent` 2 passed。当前标准模式沙盒命令为：
+
+`conda run -n idv312 python -m idv_agent.scripts.run_agent --mode sgan --checkpoint checkpoints/m29_q_interact_fix300_20260910/m29.pt --model-path <Qwen目录> --device cuda --duration 10 --enable-navigation --send-input --allow-undeployed-send-input --trace reports/sgan_sandbox_<date>.jsonl`
+
+**2026-09-10 新标注批次合并与分布检查：** 新增的 19 个 raw session
+`20260909_204705_204448` 至 `20260909_205722_049628` 全部通过
+`validate_vla_raw`。已将当前 25 个已完成 V6 标注文件按原有 split 合并为：
+`data/derived/m29/20260910_all_new_train_v1.jsonl`（1008 行、21 个
+session）和 `data/derived/m29/20260910_all_new_val_v1.jsonl`（213 行、4
+个 session）。合并后 train/val 无重复 endpoint ID。
+
+新的 full train 分布为：phase search/approach/align/interact/maintain_decode
+=72/565/34/110/226；navigation move=0/1/2/3/4/7/8
+=102/434/31/17/3/3/63；camera_dx 桶
+`-110/-25/0/25/110=14/46/468/63/62`；camera_dy
+`-25/0/25=1/624/28`。验证集 phase=21/116/8/22/46，navigation move
+只覆盖 0/1（18/116），camera_dx=`-25/0/25/110=7/104/8/15`，camera_dy
+`0/25=124/10`。Q 正负、破译正负、五阶段和横向镜头多桶均已有覆盖，纵向
+镜头首次出现非零桶，但仍极不均衡。
+
+当前正式数据门禁仍失败：train 与 val 都属于 scenario group
+`decliper`，`audit_m29_v6_data` 报告
+`reports/mvp_v6_design/m29_v6_data_audit_20260910_new.json` 的唯一错误是
+`full train/val session or scenario-group overlap`。因此这些数据可以用于
+训练分布和动作头再训练，不能直接作为最终独立验证集；下一步应把至少一
+个完整 scenario group 留作 val，或重新录制独立场景组后再训练正式 checkpoint。
+
+**2026-09-10 新数据 full 训练验证：** 训练入口原先错误地要求 val 的 path
+也必须包含多个类别；现已改为训练集强制类别多样、验证集只要求字段可评估，
+19 个 M29 回归测试通过。随后以 v7 几何动作架构在
+`20260910_all_new_train_v1.jsonl`（1008 行）上训练 1000 步，并在
+`20260910_all_new_val_v1.jsonl`（213 行）评估。输出位于
+`checkpoints/m29_full_newdata_diag1000_20260910`。训练稳定，峰值裁剪前
+梯度 24.10，无梯度故障，checkpoint reload 一致。
+
+训练/验证结果：move 92.3%/85.1%（balanced 95.9%/75.0%），camera-dx
+68.8%/53.7%（balanced 86.3%/54.1%），camera-dy 94.9%/88.8%
+（balanced 98.2%/57.2%），joint navigation 61.9%/48.5%。验证集中
+camera-dy=+25 recall 仅 20%。状态方面 decoding 97.4%/97.2%，但 Q 正类
+recall 22.7%/9.5%，interact phase recall 14.5%/18.2%；这两项直接阻塞
+MVP 的“看见提示→Q→进入破译”。bbox/prompt_bbox 验证 mean L1 为
+0.211/0.283，也仍偏高。
+
+本次 checkpoint 是共享 `decliper` 场景组的诊断模型，manifest 保持
+`deployable=false`。下一步必须优先修复 Q/interact 的采样或两阶段初始化，
+并增加非零 camera-dy 与独立 scenario-group 验证；不能直接进入发送输入。
+
+**2026-09-09 M29 full training diagnosis:** a 120-step FP16+GradScaler run on
+`checkpoints/m29_full_random80_20_diag120_20260909` completed without a
+gradient failure (peak pre-clip norm 14.30; checkpoint reload delta 0). The
+random 80/20 split is intentionally diagnostic and has session/group overlap.
+Q accuracy is 93.5% train / 90.6% val; phase is 91.6% / 90.6%; decoding is
+98.1% / 98.1%. Navigation remains collapsed: move balanced accuracy is
+25.0% train and 25.0% val, with every class except move=1 at zero recall;
+camera-dx balanced accuracy is 20.0% on both splits, predicting only bucket
+0 (the 0-pixel command); camera-dy has only bucket 0 in train and is therefore
+not a meaningful learned result. The action loss stays near its initial
+cross-entropy (move 2.30 -> 2.02, camera-dx 1.64 -> 1.24) while state losses
+fall sharply. This rules out “only too few steps” and confirms action-head
+collapse under the current labels/conditioning. The data are strongly
+imbalanced (move 1=103/169 navigation rows; camera-dx 0=125/169), and the
+same coarse phase/visibility state maps to multiple actions. Next diagnosis
+must address action-label coverage/conditioning and per-class sampling or
+loss before any deployment claim; the checkpoint remains `deployable=false`.
+
+**2026-09-09 same-data overfit diagnosis:** train and validation were made
+content-identical (214 rows; validation copy only changes the protocol split
+field) and trained for 300 steps from the Q checkpoint at
+`checkpoints/m29_full_overfit_same_train_20260909`. State heads overfit as
+expected (phase 96.3%, Q 94.4%), and total loss fell from 3.64 to 0.11, but
+navigation did not overfit at all: move stayed at 60.9% accuracy / 25.0%
+balanced accuracy with only class 1 recalled; camera-dx stayed at 74.0% /
+20.0% with only bucket 0 recalled. This is decisive evidence that the current
+M29 navigation conditioning/label representation cannot memorize the existing
+action rows, even when train and validation are identical. The immediate
+blocker is therefore inside the navigation target/conditioning contract, not
+generalization or insufficient training duration. The checkpoint remains
+`deployable=false`.
+
+**2026-09-09 decisive true-belief navigation experiment:** using the same 169
+navigation rows, the navigation trunk and action heads were trained directly
+on ground-truth facts/decision beliefs for 1000 CPU steps. The resulting
+training fit reached move 99.4%, camera-dx 94.1%, camera-dy 100%, and joint
+action 94.1%. The constructed true belief had 151 unique inputs; only three
+exact belief values carried conflicting action labels. Therefore the action
+labels are mostly learnable and the action head implementation can memorize
+them. The failure in the end-to-end M29 overfit is specifically caused by the
+predicted-state discrete belief bottleneck: predicted visibility/phase/etc.
+are not stable or informative enough for navigation, and their hard argmax
+values erase target-position/action distinctions. Do not solve this by adding
+more epochs. The next architecture change must preserve continuous visual
+target geometry and/or history features into navigation while retaining the
+top-level predicted-state influence; re-run the same-data overfit gate after
+that change. Checkpoint remains `deployable=false`.
+
+**2026-09-09 anti-collapse verification:** the true-belief navigation model
+was retrained and evaluated with per-class output counts plus counterfactual
+input ablations. On the original beliefs it reached move 98.8%, camera-dx
+95.3%, and 94.7% joint accuracy; the majority-class baselines are move 60.9%
+and camera-dx 74.0%. Outputs used all observed move classes (35/103/3/28 for
+classes 0/1/2/8) and all camera-dx buckets (4/8/128/16/13), so this is not a
+majority-class-only solution. Zeroing bbox reduced joint accuracy to 51.5%,
+shuffling bbox to 61.5%, and mirroring bbox to 24.9%; camera-dx fell to 31.4%
+under the mirror. A constant bbox still retained 75.7% joint accuracy because
+phase/steering also carry signal, so bbox is not the only feature, but the
+large counterfactual drops confirm that the fitted action depends on target
+geometry. Camera-dy cannot be validated for diversity because every current
+navigation label is bucket 0. This verifies true-belief fitting, while the
+end-to-end predicted-belief model remains collapsed and non-deployable.
+
+**2026-09-09 predicted-belief loss localization:** code and checkpoint review
+locate the information loss at three concrete operations in
+`state_guided_action.py`. `PredictedFacts.probabilities()` hardens visibility
+and prompt with argmax/threshold, then multiplies the predicted target bbox by
+`visibility[:,:2]`; one visibility error therefore erases all target geometry.
+`PredictedDecision.probabilities()` hardens phase, steering and path again, so
+navigation receives only 13 one-hot semantic bits plus four predicted bbox
+coordinates, rather than the visual state that produced them. The learned
+predicted bbox is also weakly supervised: its measured mean L1 is about 0.21
+while the facts block contributes only 0.25 times the average of four losses,
+so geometry receives an effective low weight. The navigation trunk has no raw
+visual/history or confidence input by design. This explains why true beliefs
+fit but predicted beliefs collapse: state classification can be accurate while
+the continuous geometry and action-relevant uncertainty are wrong. The next
+fix should retain continuous fact probabilities/geometry (with confidence)
+and add an action-relevant temporal geometry signal to navigation, while
+keeping predicted states as a required conditioning path.
+
+**2026-09-09 navigation/action-head repair v1:** the M29 state-to-navigation
+boundary now preserves probability-valued categorical/binary beliefs and no
+longer hard-gates the continuous target/prompt bbox by visibility argmax. This
+keeps predicted state as the only navigation condition while retaining
+uncertainty and target geometry for the move, camera-dx and camera-dy heads.
+Focused M29 hierarchy/pipeline regression passes: 19 tests. Existing
+checkpoints are incompatible with this behavior contract and remain
+non-deployable; the required next gate is a fresh same-data end-to-end
+overfit run followed by anti-collapse counterfactual checks.
+
+**2026-09-09 navigation/action-head repair v2:** M29 schema is now v3. The
+navigation trunk receives both the soft predicted semantic belief and the
+continuous temporal state that generated it; move and camera heads use
+separate trunks so move gradients cannot dominate camera learning. The sampler
+stratifies full-navigation rows by `(move, camera_dx, camera_dy)` while keeping
+state-only rows. Focused regression remains green (19 tests). A fresh 300-step
+same-data end-to-end overfit from the new architecture reached move 86.4%
+accuracy / 92.4% balanced accuracy, with recalls 91.4/81.6/100/96.4% for the
+observed move classes 0/1/2/8. Camera-dx reached 34.3% raw accuracy but 78.3%
+balanced accuracy, with recall 100/100/15.2/76.2/100% across all five buckets;
+the model no longer outputs only bucket 0. Camera-dy remains uninformative
+because all 169 current labels are bucket 0. The repaired model now passes the
+anti-collapse criterion for move and camera-dx, but needs a longer/cleaner
+camera-dx fit and new camera-dy labels before deployment gates can be
+considered. Checkpoint remains `deployable=false`.
+
+**2026-09-09 v3 overfit acceptance:** the repaired architecture was trained
+for 1000 steps on the identical train/validation content with stratified
+navigation sampling. The new checkpoint
+`checkpoints/m29_full_overfit_v3_balanced_1000_20260909` reached move 98.2%
+accuracy / 99.3% balanced accuracy and camera-dx 89.9% / 96.5% balanced
+accuracy. Move recall for observed classes 0/1/2/8 is 100/97.1/100/100%;
+camera-dx recall for buckets 0..4 is 100/100/87.2/95.2/100%. Camera-dy is
+still a single-class label (169/169 bucket 0), so no diversity claim is made
+for that head. Train and validation metrics are identical by design, proving
+the repaired predicted-state path can memorize the available action set and
+no longer collapses to the majority move/camera outputs. A separate
+counterfactual geometry check remains required before calling the checkpoint
+deployable; current manifest remains `deployable=false`.
+
+**2026-09-09 v4 geometry/action-head repair:** M29 v3 now has separate move
+and camera trunks plus an explicit bbox/prompt geometry trunk whose logits are
+added to move, camera-dx and camera-dy. The continuous temporal state is
+attenuated during training so it cannot be the sole memorization shortcut.
+Regression: 19 focused tests pass. A fresh 1000-step same-data run at
+`checkpoints/m29_full_overfit_v4_geometry_regularized_1000_20260909` reaches
+move 98.2% accuracy / 98.3% balanced accuracy and camera-dx 90.5% / 95.4%,
+with all observed movement and camera-dx classes recalled. Camera-dy remains
+single-class in the source data. This satisfies the overfit and anti-collapse
+action-head gate, but final geometry-dependence counterfactual output must be
+recorded before deployment; checkpoint remains `deployable=false`.
+
+**2026-09-09 v5 geometry-dependence repair:** Added an explicit geometry trunk
+from predicted target/prompt bbox to all three action heads, with scale 2.0,
+and deterministic attenuation of the continuous temporal state during
+training. M29 metadata identifies the boundary as `soft_continuous_geometry_v2`;
+focused M29 tests remain 19/19. The 1000-step same-data run reaches move
+98.2% / 98.3% balanced accuracy and camera-dx 90.5% / 95.4% balanced accuracy,
+with all observed classes recalled. Bbox counterfactuals change action logits
+(mean move/camera-dx logit changes: zero 0.39/0.39, shuffle 0.07/0.07, mirror
+0.16/0.16); zeroing the continuous state instead reduces joint action accuracy
+from 91.1% to 42.6%. This proves the repaired heads use predicted geometry and
+predicted state rather than only a majority action. Camera-dy remains
+single-class in current labels, so its diversity is unverified. Checkpoint
+remains `deployable=false`.
+
+**2026-09-09 objective completion audit:** The final v7 checkpoint
+`checkpoints/m29_full_overfit_v7_direct_geometry10_1000_20260909` satisfies the
+requested M29 repair gate. The predicted-state path overfits the identical
+train/validation set with move 96.4% accuracy / 98.1% balanced accuracy and
+camera-dx 94.1% / 97.6%, while recalling every observed class. The final
+counterfactual test changes bbox to zero, shuffled, and mirrored values and
+measures mean absolute logit changes for move/camera-dx/camera-dy of
+`1.859/1.661/2.426`, `0.639/0.649/0.837`, and `1.214/1.234/1.731`
+respectively. All three heads therefore consume predicted target geometry;
+this is not a majority-action collapse. The focused regression suite is
+19/19. Camera-dy class diversity is still absent from the source labels, so
+only its geometry sensitivity—not multi-class recall—is claimed. The model is
+an offline architecture/overfit artifact and remains `deployable=false` until
+independent sessions and complete camera-dy labels pass their gates.
+
+**2026-09-09 v6/v7 final overfit audit:** The direct coordinate path was
+strengthened and the v7 model was trained for 1000 steps on identical
+train/validation content. Move reached 96.4% accuracy / 98.1% balanced
+accuracy; camera-dx reached 94.1% / 97.6%, with every observed class recalled.
+The bbox mirror intervention changed 2.4% of move argmaxes and 8.9% of
+camera-dx argmaxes; bbox zeroing changed 2.96%/3.55% respectively. Logit
+changes are present for all interventions, proving the explicit geometry path
+is active, although the small dataset still permits temporal-state
+memorization. Camera-dy remains 169/169 in one bucket, so its behavior is
+implemented and trained but its geometry dependence cannot be empirically
+verified until nonzero vertical camera labels are collected. Focused M29
+regression remains 19/19. The current checkpoint is an overfit diagnostic,
+not deployable.
+
+### Superseding design decision: complete MVP labels and sparse visual clock
+
+**2026-09-09 record_vla frame-clock correction:** review of existing raw
+sessions found that `record_vla` timestamped a frame only after `cap.grab`,
+optional resize, and JPEG encoding. At 20 FPS this lets processing latency
+shift the visual timestamp into a later frame relative to keyboard/Raw Input
+events. The recorder now samples `capture_ts` immediately before `cap.grab`
+and keeps the shared `perf_counter_ns` clock. Existing raw sessions are not
+rewritten; new captures must be regenerated before using this correction.
+Focused capture tests remain green when run with the repository-local pytest
+temp directory; the default system temp directory is inaccessible in this
+environment.
+
+**2026-09-09 boundary-label correction:** the user correctly reported that
+opening rows with insufficient history and tail rows without a complete replay
+window could not be completed when `accept_replay` was selected. The workbench
+now treats these as navigation-mask conditions, not missing intent/state. For
+`insufficient_history`, `visual_history_gap`, or `incomplete_action_window`,
+completion automatically stores `action_source=exclude` with an audit reason,
+while preserving phase, decoding, target facts and prompt-Q. The browser locks
+the action-source control for those rows and explicitly says to label only
+state/intent. If phase itself is not observable, the row can finish with phase
+unknown, producing `phase=false/navigation=false` masks while retaining Q.
+`insufficient_one_second_outcome_tail` affects only outcome confirmation and
+does not block current phase/decoding/Q. Final focused regression: 60 tests
+passed; no existing user label was rewritten.
+
+**2026-09-09 prompt/cipher association decision:** prompt-Q supervision does
+not require a cipher candidate. A visible prompt means the player is already
+close enough; the workbench automatically sets navigation action source to
+`exclude` while preserving `interact`, current decoding and Q supervision.
+Candidate boxes and `target_track_id` are only needed before the prompt for
+search/approach/align target tracking. The prompt box itself is never treated
+as a cipher box, and `target_track_id` remains an audit field rather than a
+learned category input. The known prompt-only markup is session
+`20260908_205631_985816`, frame 75; it remains valid Q evidence. The current
+browser snapshot is 19/101 reviewed: the first session is 19/21 and the other
+three remain pending, reflecting user progress after the earlier 14/101
+snapshot.
+
+**2026-09-09 M29/V6 contract repair implemented:** the static-review blockers
+that could be fixed without inventing human labels are now repaired and
+versioned. M29 checkpoint schema is `m29.state_guided_action.v2`. Downstream
+navigation receives discrete straight-through visibility/decoding/prompt/
+phase/steering/path values plus supervised continuous target/prompt boxes;
+the hidden GRU/visual context still cannot enter `navigate_from_beliefs`.
+Inference latency was removed from neural inputs: capture-relative history
+times remain, while actual capture-to-ready age is enforced by the stale-result
+gate and runtime trace. The annotation/deployment phase vocabulary is exactly
+five classes; post-Q waiting remains `interact` and execution feedback is a
+separate input.
+
+Q export is now `idv.prompt_q_training.v2`: all-frame prompt/NO-prompt labels
+also carry prompt bbox supervision where exactly one prompt box exists. Four
+new, non-overwriting `*_xany_import_v2` workspaces were generated from the
+same raw/X-AnyLabeling evidence; v1 workspaces remain historical snapshots.
+The canonical current Q assembly is
+`data/derived/prompt_q/20260909_xany_all4_v2/train.jsonl`: 366 unique rows,
+Q48/NO_Q318, 48 prompt boxes, four sessions, one same-scene train group.
+`assemble_m29_dataset` validates sources and merges all-frame Q with future
+full endpoint files by preferring the richer full row only when Q target and
+latest image agree, avoiding both lost full-frame Q supervision and duplicate
+endpoint sampling.
+
+`train_m29` now supports/records `--init-checkpoint` from Q task to full task,
+requires an independent full validation export, rejects train/val session or
+scenario-group overlap, audits Q +/- and full state/route/action coverage plus
+class diversity, uses group-balanced sampling and bounded sqrt class weights,
+and rejects a pre-clip gradient peak before optimizer step. A rejected peak
+writes `gradient_failure.json` with per-loss/per-module attribution. Evaluation
+now records confusion/recall/balanced accuracy for Q, decoding, visibility,
+phase, steering, path and actions; target/prompt bbox L1; joint move+dx+dy by
+target phase; and interventions for every discrete state consumed by navigation.
+
+New `audit_m29_v6_data` is the fail-closed aggregate readiness entrypoint.
+Current report is
+`reports/mvp_v6_design/m29_v6_data_audit_20260909.json`; its expected gate
+result is false only because full train/val exports do not exist and browser
+review is 14/101. All 14 reviewed rows are approach/decoding=false in the first
+session; 87 remain pending and no decoding-positive example exists. No test,
+script or v2 import changed the session-local CSV. The live workbench was
+restarted on 127.0.0.1:8765 and defaults to xany_import_v2. Its aggregate
+readiness route currently reports 14/101 and lists the missing
+search/align/interact/maintain_decode, decoding-positive, path-diversity and
+independent-val blockers directly in the browser.
+
+The workbench now exposes `/api/mvp-v6/readiness`, which reports the live
+cross-session blockers in the browser. Verification: Python compile passed and
+57 focused V6/M29/workbench tests pass
+using a repository-local pytest temp directory. The first run's 37 setup errors
+were solely the inaccessible system pytest temp directory; rerunning with an
+isolated `tmp/` base produced the passing result. No GPU training or real input
+was started. The only next data action remains completing the browser review,
+including all five phases and real decoding positive/negative coverage, then
+creating an independently grouped validation capture/export.
+
+**2026-09-09 static V6/M29 training-contract review (no tests run):** the
+session-local CSV/workbench persistence is lossless and fail-closed at the
+full-export boundary, but the complete M29 training contract is **not ready**.
+At the review snapshot, the four CSVs contain 101 endpoints with 14 reviewed
+and 87 pending; all 14 reviewed rows are `approach` with `decoding=false` in
+`20260908_205631_985816`. There are no reviewed decoding-positive examples and
+no complete `training_v6.jsonl`, so `train_m29 --task full` must still reject.
+The user is actively annotating; these counts replace the older all-pending
+snapshot below, which is retained only as historical context.
+
+The four imported all-frame Q files are structurally available with 366 unique
+frames and Q48/NO_Q318. The existing merged derived pilot still contains only
+the older three sessions (285 frames, Q36/NO_Q249), so using that path would
+omit the new 81-frame session. This is a preserved stale artifact, not a silent
+overwrite or loader filter. All current exported rows have a known Q mask, so
+M29Dataset's `if not any(masks.values())` filter would drop none of them.
+
+Blocking code-contract findings before an interpretable full run:
+
+1. Q-only training cannot initialize/resume full training, and combining the
+   all-frame Q export with full endpoint exports is rejected by duplicate IDs.
+   A fresh full run would therefore discard the learned Q-only weights and use
+   only endpoint Q supervision instead of all 366 frames.
+2. Full export masks `phase` with navigation history readiness. This discards
+   valid top-level phase supervision from short-history opening frames, exactly
+   where `search` is most important, while steering/path/facts use different
+   mask rules.
+3. Export writes `observation_age_ms=200` for every offline row although runtime
+   supplies measured capture-to-ready age. The current model learns a constant
+   age and deploys on a variable age; action-label delay and observation age are
+   conflated.
+4. V6 exposes six phases but M29 has five and silently maps `verify_decode` to
+   `interact`. Unify the label vocabulary or make the collapse explicit and
+   audited before training.
+5. `scope` does not control facts/phase/route masks. `target_track_id`,
+   `prompt_bbox`, target evidence and outcome labels are not consumed by M29;
+   candidate selection survives only as visibility plus target bbox. These
+   fields are currently provenance/audit data, not model supervision.
+6. Full readiness checks require nonzero navigation/phase/decoding/Q, all five
+   phases and decoding +/- only. They do not require Q positive+negative,
+   visibility/bbox/steering/path coverage or class diversity, so a materially
+   undersupervised state bottleneck can pass the preflight.
+7. M29 uses uniform sampling and unweighted BCE/CE despite Q and action/phase
+   imbalance. It always clips gradient norm to 1.0, records the pre-clip value,
+   but has no peak-gradient rejection or per-loss/per-module attribution gate.
+   This can conceal the same scale problem that invalidated earlier m28 smokes.
+8. Evaluation omits visibility, bbox, steering and path accuracy, confusion/
+   balanced metrics, joint move+camera correctness and per-phase action safety.
+   State interventions cover only phase and decoding and have no acceptance
+   threshold, so the current evaluator cannot certify the stated hierarchy.
+9. Navigation loss backpropagates through continuous soft fact/decision
+   probabilities. This proves the state predictions affect actions, but also
+   permits those probabilities to carry an unlabeled analog shortcut when
+   state supervision is sparse. Semantic state accuracy and intervention gates
+   are required before calling the bottleneck reliable.
+10. Current imports are all `train` in one `20260908_same_scene_pilot` group;
+    no independent validation/generalization split exists. Human-event Q
+    feedback also differs from runtime's immediate learned prompt-Q execution
+    distribution and must be audited before using it as a top-level cue.
+
+Required next sequence: finish browser review with all five deployed phases and
+decoding positive/negative coverage; repair the Q-to-full inheritance/merge,
+phase mask, age semantics and readiness/evaluation gates; create independent
+scenario-group validation data; then run small-set fitting before any foreground
+GPU smoke. Deployment remains fail-closed and no training/test/live-input run
+was performed for this review.
+
+**2026-09-09 V6 browser annotation completed:** user explicitly requires
+browser editing (not manual CSV) and one editable CSV inside each raw session.
+The only active workbench is V6; legacy actions/intents/chunks/camera-control
+routes, Python façade methods and SessionStore legacy reads are removed.
+The webpage now displays current/past frames, selectable annotation boxes,
+phase/decoding/target/path/action forms, save draft, complete+next, progress,
+whole-project checks and exports. Save validates fields and completed-row
+semantics with the same apply_review_row as export, uses CSV SHA256 revision,
+atomic replace, and review_history snapshots/audit. User operates the browser;
+navigation_review_with_state.csv is persistence only.
+
+Canonical editable files now live at
+data/raw_sessions/<session>/navigation_review_with_state.csv for all FOUR
+sessions: 20260908_205631_985816 (21 rows), 20260908_210127_149560 (25),
+20260908_210720_785351 (27), 20260908_210912_841524 (28). Existing imported
+tables are preserved snapshots. No original frame/event/mouse/meta or source
+X-AnyLabeling JSON changed. The current browser snapshot is 14/101 reviewed;
+the rest remain pending until the user completes them in the workbench.
+The fourth session was prepared/imported for the requested per-session table;
+total visual data is now 366 frames / Q48 / NO_Q318. The older merged 285-frame
+Q pilot is preserved and not silently replaced.
+
+Documentation: docs/tools/data-workbench-v6.md rewritten around browser use,
+session-local CSV storage, all fields/examples and script dependencies.
+43 focused tests passed, plus Node syntax/Python compile/diff checks.
+Isolated browser session verified draft save, reload recovery, completion
+progress/next, invalid completion rejection, click-to-select target box and
+all-frame Q export. No user navigation labels were modified by tests.
+Repository smoke_test also passed. The isolated test service on 8767 was
+stopped; the real V6 workbench is running hidden on 127.0.0.1:8765 (Python
+PID 33236 at handoff, logs tmp/workbench_v6_stdout.log and stderr.log).
+The real four-session editor was opened and visually verified without edits.
+Audit summary: reports/mvp_v6_design/workbench_browser_20260909.json.
+
+**M29 architecture is implemented:** `idv_agent/model/state_guided_action.py`
+defines **M29 State-Guided Action Network (SGAN)**. The chain is visual
+features/times → predicted facts (visibility/bbox/prompt/decoding) → predicted
+top-level phase/steering/path plus execution feedback → soft beliefs → navigation
+move/camera. `navigate_from_beliefs` accepts only predicted beliefs, so there is
+no direct visual/latent shortcut below the top-level state. The latest-frame
+prompt logit is the actual Q output and remains independent of phase/decoding/
+previous Q, preserving the required prompt→Q fast loop.
+
+Added M29 implementation: `training/m29_dataset.py`, `training/m29_loss.py`,
+`training/m29_features.py`, `model/m29_checkpoint.py`, `scripts/train_m29.py`,
+`scripts/evaluate_m29.py`, `agent/m29_policy.py`, and `scripts/run_m29.py`.
+The runtime uses 20 Hz capture, latest-frame slot, one visual worker, 50 Hz
+wall-clock command merger, result-id idempotency, and actual Q submission
+feedback. The current checkpoint contract is `m29.state_guided_action.v2` and
+fail-closes old
+m28/v5 weights.
+
+M29 `--task q` is runnable on the current 366-frame v2 export once a Qwen model
+path is supplied; `--task full` rejects before model load until reviewed
+navigation, all five phases, and decoding true/false coverage exist. The
+current pilot has 366 Q samples (48 positive/318 negative), same-scene train
+only, and no generalization split; it cannot authorize deployment.
+
+**V6 Data Workbench completed:** `DataWorkbench` now exposes
+`mvp_v6_summary`, `import_mvp_v6`, and `review_mvp_v6`; the HTTP service adds
+GET/POST `/api/sessions/<name>/mvp-v6` routes. Full usage and field examples
+are documented in `docs/tools/data-workbench-v6.md`. The workbench keeps raw
+and X-AnyLabeling evidence immutable and writes versioned import/review outputs.
+Regression: 33 workbench/import/M29 tests passed; py_compile and diff check
+passed. The current UI remains a raw/v5 browser; V6 semantic editing uses the
+CSV review file, so no duplicate browser label vocabulary was introduced.
+
+Structural validation: 40 focused M29/prompt-Q/import tests passed plus the
+repository smoke_test; `git diff --check` passed. This is an architecture and
+pipeline result, not a trained M29 result. No M29 GPU training or real-input
+run was started. The next executable model step is a foreground Q-only pilot
+using `scripts/train_m29.py`; full navigation waits for the 80-endpoint state
+and action review.
+
+**Current pipeline audit (2026-09-08):** validate_vla_raw remains required and
+is called by prepare_mvp_v6.prepare. Legacy extract/per_frame_actions.csv and
+build_vla_chunks are not prerequisites of v6: replay_window directly
+integrates raw events/mouse over timestamped 200 ms intervals; prepare/import/
+review/export assemble v6 targets. Legacy builder only supports v3/v4/v5
+(default v3), not the new contract. All three source sessions pass raw
+validation; imported workspaces pass raw-hash/replay/timing checks without
+any per_frame_actions.csv or old chunk files. No labels or runtime changed.
+80 navigation/current-state endpoints remain pending; Q remains 36/249.
+Updated docs/tools/data-collection-tool.md and docs/03 §0.12 to prevent
+repeating the obsolete three-step pipeline. New trainer/runtime and measured
+observation-action delay still need integration; old extract/build cannot
+substitute for that work.
+
+**Latest hierarchy clarification:** user requires top-level search/approach/
+align/interact/maintain_decode decisions to guide actions, including awareness
+of actual decoding and actual Q execution. Keep the prompt->Q learned fast
+response; it is part of the hierarchy, not a replacement for state estimation.
+Task=decipher, observed facts.decoding, and chosen decision.phase are distinct.
+Current decoding is required supervision for the complete top-level controller,
+while future outcome confirmation remains unnecessary for standalone Q data.
+Executed Q feedback means an interaction attempt, not visual decoding truth.
+
+Design contract in docs/03 §0.11: visual state -> learned top-level phase/
+target/steering -> conditioned navigation actions, plus fast visual Q branch;
+one command merger, actual command/timestamp/status feedback to top level,
+then new images update decoding belief. No second competing Q sender. Q
+targets remain interact_prompt regardless of phase; top-level stale state
+must not veto the prompt response. Old m28 consumes soft predicted beliefs
+but has no decoding output head or this execution-feedback control path.
+
+Implemented data gap repair: CSV import accepts decoding=true/false/unknown
+and decoding_evidence_frames referring only to current/past observations;
+full export reports decoding positive/negative/unknown coverage. Added each
+workspace's navigation_review_with_state.csv as a copy of existing edits,
+leaving the original CSV and source evidence untouched. All 80 new state
+entries remain unknown until reviewed. Existing Q labels remain 36/249.
+21 focused tests passed (including maintain_decode with valid positive Q and
+future-state evidence rejection); git diff --check passed. No model head,
+runtime controller, checkpoint or training run changed in this clarification.
+
+**Latest completed annotation import:** user explicitly confirmed X-AnyLabeling
+finished. All 285 frames have sidecars (86/100/99); 334 rectangle shapes pass
+schema, class, finite bounds, dimension and image decoding checks. Q labels
+are 36 positive / 249 negative. User confirmation is completion provenance;
+checked=false/auto-label scores are preserved, not called an independent
+visual accuracy review. No missing sidecars were converted to negatives.
+
+Added import_mvp_anylabeling import/review. Current workspaces are
+data/annotations/mvp_v6/<session>_xany_import_v1, with byte-preserved source
+annotation snapshots, visual_frames.jsonl, prompt_q_all_frames.jsonl,
+decisions.jsonl and navigation_review.csv. All-frame Q data is ready for a
+pilot fitting diagnostic at data/derived/prompt_q/20260908_xany_pilot_v1/train.jsonl.
+All three are assigned train/same-scene pilot group; validation=0, no
+generalization claim. Report: reports/mvp_v6_design/xany_import_summary.json.
+
+Next MVP annotation work: review 80 navigation endpoints (25/27/28): phase,
+selected target candidate/track, steering/path, accept/correct/exclude replay
+move+camera. Multiple candidates remain intact; no largest-box goal rule.
+The review CLI writes a new workspace and full v6 export when all rows are
+reviewed. Existing visual boxes/Q labels do not need reannotation. New v6
+trainer/runtime integration remains outstanding; no training run was started.
+Validation: 19 focused importer/prompt-Q/v6 tests and repository smoke_test
+passed under idv312; git diff --check passed. All 80 decision endpoints have
+reviewed prompt labels (14 positive/66 negative); all-frame Q export preserves
+the full 36/249 distribution. These counts are annotation coverage, not model
+performance. Original raw hashes and earlier workspaces remain unchanged.
+
+**Latest user correction — Q contract:** for each current observed frame,
+interact_prompt=true MUST supervise Q, false MUST supervise NO_Q. Short
+consecutive triggering is allowed. Replay Q timing, prior Q, phase, stopped
+movement/camera and decoding outcomes must not veto that label. Unknown UI
+visibility is masked. The three supplied sessions ARE usable for this Q
+subtask without a longer post-Q tail. Decoding confirmation is optional audit,
+not a prerequisite for prompt-Q training or acceptance. This overrides prior
+draft claims about prompt-visible/Q-negative waiting periods or one Q per UI.
+
+Implemented idv_agent/vla/prompt_q.py contract, independent Q-logit BCE in
+training/prompt_q_loss.py, interact_prompt-only review/export-q, and separate
+navigation/Q masks in full export. Neither loss nor new schema is wired to
+legacy train_vla/run_agent yet. New protocol id is
+m28_sparse_visual_v6_prompt_q_v1. Current workspaces are
+data/annotations/mvp_v6/<session>_prompt_q (25/27/28 endpoints, all pending),
+migrated from preserved _v2 drafts with old review/action Q retained in audit.
+Current-frame Q export needs no navigation phase, history warmup, replay
+action window, target box/association or outcome. Raw files are unchanged.
+Execution-message deduplication does not mean suppressing Q from consecutive
+new prompt-positive observations. No trained-model success is asserted.
+
+Verification: 51 focused tests passed in idv312, including consecutive Q
+positives, no-prompt negatives despite human Q, Q-only export at truncated
+tails/short history, full export with excluded navigation, unknown masks,
+immutable raw migration, and gradient flow into the actual m28 h0 Q output.
+All three _prompt_q workspaces pass raw-hash/structure validation; 80 prompt
+annotations remain pending. git diff --check passed.
+
+The paragraphs below describe the earlier design iteration; the explicit
+prompt-Q correction above supersedes its Q gating and outcome prerequisites.
+
+User requested a complete raw-to-training annotation redesign, one top-level
+decipher task, 20 FPS capture, and supplied a ~6 FPS Qwen vision baseline.
+The complete current design is docs/03-数据格式.md §0. This supersedes prior
+v5 new-data instructions; all old raw/checkpoints remain historical evidence.
+
+Implemented: recorder defaults to 20 FPS/data/raw_sessions, preserves idle
+boundaries by default and records two seconds after F9 stop; explicit legacy
+trim remains optional. Added prepare_mvp_v6 prepare/validate/export with
+immutable raw hashes, timestamp-derived replay, review-only corrections,
+field masks, phase/fact/action/outcome separation. Output is
+idv.mvp_training.v6, deliberately incompatible with legacy train_vla.
+Added CPU LatestObservationSlot/ObservationActionClock: bounded backlog,
+one result consumed once, next actionable capture after the prior macro ends.
+These timing primitives are NOT yet wired to ACTPolicy/run_agent.
+
+Design: retain Qwen + m28 shared state, ≤5 Hz visual worker and 20 Hz capture;
+3–8 encoded frames ~200 ms apart; 200 ms action on an independent wall clock.
+Strict post-action observation makes actual closed-loop decisions slower
+than visual throughput (~2–2.7 Hz estimate, not measured). No repeated Q or
+camera commands from reused visual evidence. Planned model changes: fixed
+task condition (no intent CE), six phase decisions, decoding state, actual
+history times/age, and last EXECUTED Q context. Current model/train/runtime
+still use v5; migration/retraining are outstanding, no readiness claim.
+
+Current annotation workspaces (all pending) are
+data/annotations/mvp_v6/{20260908_210127_149560,20260908_210720_785351,
+20260908_210912_841524}_v2 with 25/27/28 endpoints. Initial directories without
+_v2 are preserved draft backups (tail flags used a frame-count approximation).
+Raw sessions were untouched. The three post-Q tails are only
+144.274/151.103/200.599 ms, insufficient for stable decoding evidence.
+Early turning may lack pre-action history because of previous input trimming.
+
+Camera audit: reports/mvp_v6_design/camera_audit.json, two supplied sessions,
+four 200 ms window phases. Retain 0/±25/±110 counts provisionally; shrinking
+fine to ±12 worsens reconstruction, adding ±8 gives limited improvement,
+adding ±200 mainly fits one sweep. This is not held-out control validation.
+
+Environment correction: explicit idv312 Python reports torch 2.6.0+cu124 and
+CUDA available; prior no-CUDA statement applied to the default Python only.
+No new GPU smoke or real-input experiment was run in this redesign turn.
+
+Validation for this design/tooling change: 73 focused tests passed under
+idv312 (annotation preparation/export, raw preservation, replay immutability,
+Q outcome rejection, timing clock, existing model/runtime regressions), plus
+the repository smoke_test passed. Current _v2 workspaces all pass structural
+and raw-hash validation with 0 reviewed/80 pending; this is NOT a data-ready
+gate or model-performance result. git diff --check passed.
 
 Read-only diagnosis requested by the user was completed in the primary
 `vla-train` checkout at `ecae81f` (including m28 commit `7bd3106`). No model,
@@ -837,3 +1454,121 @@ not satisfy the visual-dependency requirement. Do not deploy or enable
 - `data/wk` and `data/vg_cipher_20260901_new` are optional and previously
   unreliable; do not use them to replace same-session evidence without a
   separate audit.
+
+## Data Capture Fix (2026-09-08)
+
+Implemented boundary-idle cleanup in `idv_agent/scripts/record_vla.py`.
+When an F9 recording segment ends, the recorder now removes leading/trailing
+frames outside the first/last real input timestamp, keeps middle idle spans,
+clips `events.csv` and `mouse_deltas.csv` to the input interval, renumbers the
+retained frame files and timestamps, and updates `meta.json` with
+`idle_boundary_trimmed` and `had_input`. A segment with no non-F9 keyboard,
+mouse-button, scroll, or nonzero Raw Input motion is deleted instead of entering
+the dataset. Existing raw sessions are untouched.
+
+Focused validation: `23 passed` (`tests/test_vla_raw_recording.py`,
+`tests/test_record_vla_controls.py`, `tests/test_smoke.py`) using the idv312
+interpreter. Pytest emitted only the known cache-directory permission warning.
+
+## Data Capture Follow-up (2026-09-08)
+
+Additional capture hardening landed in `idv_agent/scripts/record_vla.py` and
+`idv_agent/capture/input_logger.py`: serialized event timestamp/write ordering,
+failed JPEG write detection, sane single-frame effective FPS, deterministic
+post-trim event ordering, and cleanup-safe listener startup. Focused capture
+suite remains 23 passed under idv312. Remaining review items are Raw Input
+foreground filtering, explicit listener/permission health reporting, window
+region fallback policy, and backoff on repeated empty screen grabs.
+
+## Data Collection Tool Documentation (2026-09-08)
+
+Added `docs/tools/data-collection-tool.md`. It documents the current
+`record_vla`, `validate_vla_raw`, `extract`, `build_vla_chunks`, and
+`diagnose_raw_mouse` commands, their script dependencies, session layout,
+field definitions, and concrete JSON/CSV examples. It intentionally records
+known capture risks as outside the current tool scope; annotation-stage
+filtering remains the chosen handling for now.
+
+## Replay Tool Documentation (2026-09-08)
+
+Added `docs/tools/replay-tool.md`. It documents the current raw-input replay
+command, dry-run and `--send-input` behavior, parameters, dependency chain,
+CSV field examples, timestamp normalization, keyboard de-duplication, mouse
+scaling, and the distinction between input replay and visual playback.
+
+## Q 交互阶段修复（2026-09-10）
+
+完成 M29 `q_interact` 专项微调，初始化自 `checkpoints/m29_full_newdata_diag1000_20260910/m29.pt`，仅更新交互提示、Q 事件与阶段判定相关头，冻结导航/相机主干，避免 Q 修复破坏已有动作能力。训练命令为 300 steps、batch 8、FP16 CUDA，输出位于 `checkpoints/m29_q_interact_fix300_20260910/`。
+
+验证证据：验证集 Q 正类召回率从全量训练的 9.5% 提升至 100%（21 个正样本全部命中）；`interact` 阶段召回率为 86.4%；move/camera 指标保持在微调前相近水平。checkpoint 已在 CPU 独立加载成功，manifest 为 `task=q_interact`、`state_bottleneck=soft_continuous_geometry_v2`、`deployable=false`。现有 M29 测试 28 项通过，compileall 与 `git diff --check` 通过。
+
+限制：当前 train/val 按 session 切分但仍共享 `scenario_group=decliper`，且验证集 Q 正样本仅 21 个；本结果是 Q 交互回归修复证据，不是独立场景部署门禁。下一步应采集/划分不重叠场景后复测，再把 q_interact 头合入 full 训练并做端到端 ACT 冒烟。
+
+## scenario_group 标注修正（2026-09-10）
+
+用户确认每个 session 都来自独立对局；此前合并训练/验证文件把 `scenario_group` 错填为统一值（`decliper`/`20260908_same_scene_pilot`），造成审计错误地报告场景组重叠。已生成修正版：
+
+- `data/derived/m29/20260910_all_new_train_v2_session_groups.jsonl`
+- `data/derived/m29/20260910_all_new_val_v2_session_groups.jsonl`
+
+修正版将每行 `scenario_group` 设为该行 session ID。训练集 1008 行、21 个 session/组；验证集 213 行、4 个 session/组；session/group 交集为空。M29Dataset 加载、full readiness、覆盖率与类别分布均通过，未修改图像、动作或监督字段。
+
+此前 Q 修复结论中的“共享 scenario_group”限制已撤销；当前验证可以视为 session 独立切分的结果。仍需注意验证集 Q 正样本为 21 个，统计置信度有限。
+
+## M29 视觉依赖门禁（2026-09-10）
+
+针对 M29 checkpoint `checkpoints/m29_full_newdata_diag1000_20260910/m29.pt`，使用 `data/derived/m29/20260910_all_new_val_v2_session_groups.jsonl` 的 213 个验证样本执行视觉依赖评估，报告位于 `reports/visual_dependency_gate_m29_full_newdata_20260910.json`。
+
+结果：图像置空导致 phase/move/camera 输出改变率分别为 37.1%/32.9%/92.5%/6.1%；图像打乱为 9.4%/10.8%/22.5%/4.7%；历史清空为 37.1%/32.9%/92.5%/6.1%。这证明 M29 输出存在视觉依赖，也没有表现为完全固定的搜索/靠近动作。但 Q 合约检查未通过（213 个已知 Q 行中存在预测与标签不一致），bbox 改变实验尚未接入当前 CLI，因此视觉依赖总门禁为 FAIL，checkpoint 不得放行部署。
+
+本次还修复了评估脚本的三个执行问题：slow pass 未定义、图像 shuffle 未同步时间窗口、M29 prompt logit 字段名错误，并增加 M29 checkpoint 分支。下一步必须先修复 full checkpoint 的 Q 头/训练目标，再补充 bbox intervention 后重新执行门禁。
+
+## M29 Q 交互 checkpoint 视觉依赖复测（2026-09-10）
+
+正式候选改为 `checkpoints/m29_q_interact_fix300_20260910/m29.pt`，在完整 213 行、4 个独立 session 的验证集上复测。报告：`reports/visual_dependency_gate_m29_q_interact_fix300_20260910.json`。
+
+视觉干预：image_zero 的 phase/move/camera_dx/camera_dy 改变率为 49.8%/32.9%/92.5%/4.7%；image_shuffle 为 14.1%/9.9%/17.4%/3.8%；history_zero 为 49.8%/32.9%/92.5%/4.7%。bbox 归一化 x/y 平移 +0.35 后，move/camera_dx/camera_dy 平均 logit 改变量为 0.825/0.731/0.481，argmax 改变率为 5.1%/11.6%/1.9%，说明导航确实使用目标几何。
+
+Q：21 个正样本全部命中，正样本召回率 100%；但仍有 11 个负样本误触发，false-trigger rate 5.73%，precision 65.6%，所以尚未满足“无 interact_prompt 不按 Q”的硬门禁。总视觉依赖门禁仍为 FAIL。下一步应针对 q_interact checkpoint 继续降低 Q false positive，再重新跑同一报告。
+
+## M29 Q checkpoint ACT dry-run（2026-09-10）
+
+按用户决定，先放行 `checkpoints/m29_q_interact_fix300_20260910/m29.pt` 的 Q 门禁，接入 M29 runtime 做离线 dry-run。命令通过 `idv_agent.scripts.run_m29` 执行，未使用 `--send-input`，输出：`reports/m29_q_interact_dryrun_20260910.jsonl`。
+
+5 秒 dry-run 结果：捕获 94 帧、编码 22 帧、空抓取 0、推理线程正常退出、错误 0；由于推理吞吐低于 20 FPS，覆盖 71 帧，产生 20 个决策和 1 个过期结果。Q 触发 0 次；阶段输出主要为 `interact`（18）和 `search`（2）。命令合并器、执行反馈、过期结果处理和 shutdown 链路均正常，未发送真实键鼠输入。
+
+注意：该 checkpoint manifest 的 task 是 `q_interact`，因此 dry-run 中 navigation_enabled=false；这次验证的是 Q/交互 runtime 接入，不代表 full 导航 runtime 已放行。下一步若要验证搜索/靠近/对齐，需要使用 task=full 的 M29 checkpoint 或重新导出合并 checkpoint。
+
+## M29 接入 run-agent（2026-09-10）
+
+`idv_agent/scripts/run_agent.py` 新增 `--mode m29`，统一接入 M29 runtime。该模式要求 `--act-checkpoint`、`--model-path`、`--trajectory-log`，默认 dry-run；内部复用 `run_m29.run`，仍禁止真实输入除非显式传 `--send-input`，并保留 M29 checkpoint 的 deployable 门禁。
+
+已执行：
+`python -m idv_agent.scripts.run_agent --mode m29 --act-checkpoint checkpoints/m29_q_interact_fix300_20260910/m29.pt --model-path C:\Users\kiran\.cache\modelscope\models\Qwen--Qwen3-VL-4B-Instruct\snapshots\master --device cuda --duration 5 --trajectory-log reports/run_agent_m29_q_interact_dryrun_20260910.jsonl`
+
+结果：5 秒捕获 95 帧、编码 22 帧、空抓取 0、推理线程正常退出、错误 0、trace 21 条事件。`tests/test_configs.py -k run_agent`：2 passed。
+
+用法示例：
+`conda run -n idv312 python -m idv_agent.scripts.run_agent --mode m29 --act-checkpoint checkpoints/m29_q_interact_fix300_20260910/m29.pt --model-path C:\\Users\\kiran\\.cache\\modelscope\\models\\Qwen--Qwen3-VL-4B-Instruct\\snapshots\\master --duration 5 --trajectory-log reports/run_agent_m29_q_interact_dryrun_20260910.jsonl`
+
+当前 checkpoint 是 `task=q_interact`，所以 M29 runtime 的导航输出被关闭，只验证 Q/交互全链路。要验证搜索、靠近、对齐和交互合并动作，需要生成 `task=full` 的 M29 checkpoint；`--send-input` 仍会被 manifest deployable=false 拒绝。
+
+## M29 q_interact 全功能 run-agent dry-run（2026-09-10）
+
+为准备沙盒测试，`run-agent` 与 `run_m29` 新增 `--enable-navigation`。该开关允许 `task=q_interact` checkpoint 在 dry-run 中同时输出导航和 Q；不改变 checkpoint 的 `deployable` 状态，也不绕过 `--send-input` 门禁。
+
+执行命令：
+`conda run -n idv312 python -m idv_agent.scripts.run_agent --mode m29 --act-checkpoint checkpoints/m29_q_interact_fix300_20260910/m29.pt --model-path C:\\Users\\kiran\\.cache\\modelscope\\models\\Qwen--Qwen3-VL-4B-Instruct\\snapshots\\master --device cuda --duration 8 --enable-navigation --trajectory-log reports/run_agent_m29_full_dryrun_20260910.jsonl`
+
+结果：捕获 154 帧、编码 34 帧、空抓取 1、推理线程正常退出、错误 0；生成 32 个 decision、11 个 action_end、1 个 stale_result；11 个决策实际应用导航，Q 触发 0 次。阶段分布为 interact 27、search 4、align 1。真实输入未发送。
+
+沙盒前结论：run-agent 全功能 dry-run 链路可用，导航与 Q 通道均已接入；当前吞吐约 4.25 次 M29 推理/秒，20 FPS 采集会覆盖大量中间帧。进入真实沙盒前必须保留短时、可回收、F12/手动停止和默认 dry-run；`--send-input` 仍受 manifest `deployable=false` 拦截。
+
+## 标准模式真实输入开关（2026-09-10）
+
+`run-agent --mode m29` 与 `run_m29` 新增 `--allow-undeployed-send-input`。只有同时提供 `--send-input --allow-undeployed-send-input` 时，当前 `deployable=false` 的 M29 checkpoint 才会进入标准模式真实输入路径；单独 `--send-input` 仍 fail-closed，dry-run 默认不变。该开关仅解除模型 readiness 门禁，不改变 Q/导航逻辑。
+
+已验证：不带额外开关的 `--send-input` 被正确拒绝；`tests/test_configs.py -k run_agent` 2 passed；py_compile 与 diff check 通过。未在本次会话启动真实键鼠注入。
+
+标准模式沙盒命令（必须确认游戏已在官方自定义剧本/训练模式，且终端具备管理员权限）：
+`conda run -n idv312 python -m idv_agent.scripts.run_agent --mode m29 --act-checkpoint checkpoints/m29_q_interact_fix300_20260910/m29.pt --model-path C:\\Users\\kiran\\.cache\\modelscope\\models\\Qwen--Qwen3-VL-4B-Instruct\\snapshots\\master --device cuda --duration 10 --enable-navigation --send-input --allow-undeployed-send-input --trajectory-log reports/run_agent_m29_sandbox_20260910.jsonl`

@@ -51,10 +51,13 @@ class EventLogger:
 
     # ---- 写入 ----
     def log_event(self, kind: str, code: str, value: float = 1.0) -> None:
-        ts = time.perf_counter_ns()
         with self._lock:
             if self._events_fh is None:
                 return
+            # Serialize timestamp assignment with file writes. Two listener
+            # threads can otherwise obtain timestamps in order A<B but write
+            # B before A, violating the raw-session monotonic-clock contract.
+            ts = time.perf_counter_ns()
             self._events_fh.write(f"{ts},{kind},{code},{value}\n")
             self._events_fh.flush()
 

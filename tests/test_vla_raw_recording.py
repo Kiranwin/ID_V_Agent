@@ -1,7 +1,59 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+from idv_agent.capture.raw_input_mouse import MouseDelta
+from idv_agent.scripts.record_vla import _trim_idle_boundaries
 from idv_agent.scripts.validate_vla_raw import validate
+
+
+def test_trim_idle_boundaries_keeps_context_and_middle_idle(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for frame_id in range(8):
+        (frames / f"{frame_id:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n350,key_down,key:w,1\n550,key_up,key:w,1\n",
+        encoding="utf-8",
+    )
+    (session / "mouse_deltas.csv").write_text(
+        "timestamp_ns,dx,dy\n350,0,0\n550,2,0\n",
+        encoding="utf-8",
+    )
+    timestamps = [(i, 100 + i * 100) for i in range(8)]
+    raw = SimpleNamespace(deltas=[MouseDelta(350, 0, 0), MouseDelta(550, 2, 0)])
+
+    kept, had_input = _trim_idle_boundaries(
+        session_dir=session, frame_timestamps=timestamps, raw_mouse=raw,
+    )
+
+    assert had_input is True
+    assert [ts for _, ts in kept] == [400, 500, 600]
+    assert [p.name for p in sorted(frames.glob("*.jpg"))] == [f"{i:08d}.jpg" for i in range(3)]
+    assert "350" in (session / "events.csv").read_text(encoding="utf-8")
+    assert "550" in (session / "events.csv").read_text(encoding="utf-8")
+    assert "350,0,0" in (session / "mouse_deltas.csv").read_text(encoding="utf-8")
+
+
+def test_trim_idle_boundaries_returns_empty_for_no_input(tmp_path: Path):
+    session = tmp_path / "ep"
+    frames = session / "frames"
+    frames.mkdir(parents=True)
+    for frame_id in range(3):
+        (frames / f"{frame_id:08d}.jpg").write_bytes(b"jpg")
+    (session / "events.csv").write_text(
+        "timestamp_ns,kind,code,value\n", encoding="utf-8"
+    )
+    raw = SimpleNamespace(deltas=[MouseDelta(100, 0, 0)])
+
+    kept, had_input = _trim_idle_boundaries(
+        session_dir=session, frame_timestamps=[(i, i * 100) for i in range(3)],
+        raw_mouse=raw,
+    )
+
+    assert kept == []
+    assert had_input is False
 
 
 def test_validate_vla_raw_session(tmp_path: Path):

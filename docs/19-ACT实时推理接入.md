@@ -1,6 +1,25 @@
 # ACT 实时推理接入协议
 
-`idv_agent.scripts.run_agent --mode act` 接入 M3_ACT 动作块 checkpoint。运行器只使用官方自定义剧本/训练营，默认 `dry-run`，`--send-input` 仍要求管理员权限。
+> **2026-09-10 状态：** `run_agent` 的 `--mode act` 与 `--mode rule` 已移除，实时入口
+> 只剩 SGan（`--mode sgan`，原 M29），见 [agent.md](agent.md)。本文件以下 ACT 协议
+> 仅作历史记录，不再对应可运行的 CLI。
+
+> 2026-09-08：以下命令仍对应旧 v5/m28 同步 runtime。用户新定的 20 FPS 采集与
+> 约 6 FPS Qwen 视觉需要 [03 §0](03-数据格式.md) 的异步协议；当前仅落地 CPU
+> 单槽/结果消费时序组件，尚未接入本 CLI，不可仅传 --fps 20 复用旧 checkpoint。
+> Q 的新验收是“看见 interact_prompt 输出 Q，没看见不输出”，允许短时间连续
+> 触发。不以等待 decoding、过去按过 Q 或精确匹配人类 down 边沿作为输出条件。
+> 执行器按模型 token 翻译键位；不能读取人工标签绕过视觉学习。
+
+M29 的实时入口为 `idv_agent.scripts.run_m29`：20 FPS 采集、单槽覆盖积压、单一
+Qwen 视觉 worker（约 5 FPS 上限）、独立 50 Hz 命令时钟。它要求 M29 checkpoint，
+不接受旧 m28/v5 checkpoint；默认 dry-run，且 checkpoint 的 `deployable` 必须显式
+通过全部门禁才允许 `--send-input`。运行前先用 `train_m29 --task q` 做 Q 专项；full
+训练必须通过 `--init-checkpoint <Q阶段m29.pt>` 继承该视觉提示头，并同时输入全帧 Q
+v2 与 full V6 文件。重复端点仅保留 full 行，不会重复采样。M29 v2 不把推理耗时
+输入神经网络；实际 capture→ready 延迟由陈旧结果门禁和 runtime trace 负责。
+
+`idv_agent.scripts.run_agent --mode act`（已移除）曾接入 M3_ACT 动作块 checkpoint。运行器只使用官方自定义剧本/训练营，默认 `dry-run`。
 
 ## 时序协议
 
@@ -12,7 +31,7 @@
 - 特征年龄超过 `--max-feature-age-s` 时清空 pending、停止执行并释放所有按键。
 - v5 `duration_frames` 固定为 6；部署不使用未按 variable-duration 协议训练的 duration head。
 
-## 示例
+## 示例（历史，`--mode act` 已不可用）
 
 ```powershell
 python -m idv_agent.scripts.run_agent `

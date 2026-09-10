@@ -33,6 +33,109 @@ from idv_agent.training.checkpoint_manifest import load_manifest
 from idv_agent.training.vla_dataset import VLASequenceCollator, VLASequenceDataset
 
 
+def _evaluate_m29_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dict[str, Any]:
+    """M29 visual dependency gate for the state-guided action network."""
+    from idv_agent.model.m29_checkpoint import load_m29_checkpoint
+    from idv_agent.model.state_guided_action import M29_SCHEMA
+    from idv_agent.training.m29_features import load_m29_encoder
+    from idv_agent.training.m29_dataset import M29Dataset, collate_m29
+    from idv_agent.scripts.train_m29 import label_distributions
+    from torch.utils.data import DataLoader
+
+    device = torch.device(args.device)
+    dataset = M29Dataset(args.data)
+    if len(dataset) < 2:
+        raise ValueError("M29 visual dependency gate 至少需要两个样本")
+    if args.max_samples > 0 and len(dataset) > args.max_samples:
+        indices = torch.linspace(0, len(dataset) - 1, args.max_samples).long().tolist()
+        samples = [dataset.samples[i] for i in indices]
+    else:
+        samples = list(dataset.samples)
+    saved_core, manifest = load_m29_checkpoint(checkpoint, device=device)
+    encoder = load_m29_encoder(args.model_path, device)
+    core = saved_core.eval()
+
+    def run(condition: str):
+        outputs, rows = [], []
+        bbox_deltas = []
+        for start in range(0, len(samples), max(1, int(args.batch_size))):
+            batch_samples = samples[start:start + max(1, int(args.batch_size))]
+            if condition == "history_zero":
+                # M29's history is the visual frame window. Keep its shape and
+                # timestamps, but replace every frame with a zero image feature.
+                batch_samples = [dict(s) for s in batch_samples]
+            if condition == "image_shuffle":
+                batch_samples = [dict(s,
+                                      paths=list(samples[(start + i + 1) % len(samples)]["paths"]),
+                                      times=list(samples[(start + i + 1) % len(samples)]["times"]))
+                                  for i, s in enumerate(batch_samples)]
+            def encode(paths):
+                if condition in {"image_zero", "history_zero"}:
+                    from PIL import Image
+                    return torch.cat([encoder.adapter.project_raw_visual_features(
+                        encoder.adapter.encode_raw_frames([Image.new("RGB", (224, 224), (0, 0, 0))], micro_batch_size=1)
+                    ).float().cpu() for _ in paths])
+                return encoder(paths)
+            inputs, targets, masks = collate_m29(batch_samples, encode, device=device)
+            with torch.no_grad():
+                out = core(**inputs)
+                shifted = out.facts.bbox.clone()
+                shifted[:, :2] = (shifted[:, :2] + 0.35).clamp(0, 1)
+                shifted_facts = type(out.facts)(out.facts.visibility_logits, shifted,
+                                                out.facts.prompt_bbox, out.facts.decoding_logits,
+                                                out.facts.prompt_logits)
+                shifted_beliefs = torch.cat((shifted_facts.probabilities(), out.decision.probabilities()), -1)
+                shifted_nav = core.navigate_from_beliefs(shifted_beliefs, out.top_level_context)
+                bbox_deltas.append({
+                    "move": float((out.navigation.move_logits - shifted_nav.move_logits).abs().mean().cpu()),
+                    "camera_dx": float((out.navigation.camera_dx_logits - shifted_nav.camera_dx_logits).abs().mean().cpu()),
+                    "camera_dy": float((out.navigation.camera_dy_logits - shifted_nav.camera_dy_logits).abs().mean().cpu()),
+                    "move_flip": float((out.navigation.move_logits.argmax(-1) != shifted_nav.move_logits.argmax(-1)).float().mean().cpu()),
+                    "camera_dx_flip": float((out.navigation.camera_dx_logits.argmax(-1) != shifted_nav.camera_dx_logits.argmax(-1)).float().mean().cpu()),
+                    "camera_dy_flip": float((out.navigation.camera_dy_logits.argmax(-1) != shifted_nav.camera_dy_logits.argmax(-1)).float().mean().cpu()),
+                })
+            pred = {"q": (out.facts.prompt_logits > 0).long(), "phase": out.decision.phase_logits.argmax(-1),
+                    "move": out.navigation.move_logits.argmax(-1), "camera_dx": out.navigation.camera_dx_logits.argmax(-1),
+                    "camera_dy": out.navigation.camera_dy_logits.argmax(-1)}
+            rows.extend(zip(batch_samples, pred["q"].cpu().tolist(), pred["phase"].cpu().tolist(),
+                             pred["move"].cpu().tolist(), pred["camera_dx"].cpu().tolist(), pred["camera_dy"].cpu().tolist()))
+            outputs.append({k: v.detach().cpu() for k, v in {
+                "q": out.facts.prompt_logits, "phase": out.decision.phase_logits,
+                "move": out.navigation.move_logits, "camera_dx": out.navigation.camera_dx_logits,
+                "camera_dy": out.navigation.camera_dy_logits}.items()})
+        logits = {k: torch.cat([x[k] for x in outputs]) for k in outputs[0]}
+        return logits, rows, bbox_deltas
+
+    normal, normal_rows, normal_bbox = run("normal")
+    degraded = {name: run(name)[0] for name in ("image_zero", "image_shuffle", "history_zero")}
+    def flips(other):
+        return {k: float((normal[k].argmax(-1) != other[k].argmax(-1)).float().mean())
+                for k in ("phase", "move", "camera_dx", "camera_dy")}
+    q_rows = [r for r in normal_rows if bool(r[0]["masks"]["q"])]
+    q_tp = sum(int(q == 1 and bool(s["targets"]["q"])) for s, q, *_ in q_rows)
+    q_fp = sum(int(q == 1 and not bool(s["targets"]["q"])) for s, q, *_ in q_rows)
+    q_pos = sum(int(bool(s["targets"]["q"])) for s, *_ in q_rows)
+    q_neg = len(q_rows) - q_pos
+    q_prompt_ok = q_fp == 0
+    bbox_summary = {k: sum(x[k] for x in normal_bbox) / max(1, len(normal_bbox))
+                    for k in normal_bbox[0]} if normal_bbox else {}
+    return {"schema": "vla.m29_visual_dependency_gate.v1", "checkpoint": str(Path(checkpoint).resolve()),
+            "checkpoint_schema": M29_SCHEMA, "data": str(args.data), "samples": len(samples),
+            "distributions": label_distributions(dataset),
+            "output_change": {k: flips(v) for k, v in degraded.items()},
+            "q_contract": {"known_q_rows": len(q_rows), "tp": q_tp, "fp": q_fp,
+                           "positive_recall": q_tp / q_pos if q_pos else None,
+                           "false_trigger_rate": q_fp / q_neg if q_neg else None,
+                           "precision": q_tp / (q_tp + q_fp) if q_tp + q_fp else None,
+                           "normal_q_matches_label": q_prompt_ok,
+                           "prompt_only_contract": "Q target is supervised only when interact_prompt is true"},
+            "bbox_intervention": {"status": "measured", "shift": "+0.35 normalized x/y", "output_change": bbox_summary,
+                                  "pass": any(bbox_summary.get(k, 0.0) > 0 for k in ("move", "camera_dx", "camera_dy"))},
+            "history_zero": {"output_change": flips(degraded["history_zero"]),
+                             "fixed_search_approach": flips(degraded["history_zero"])["phase"] < 0.95},
+            "visual_dependency_gate_pass": all(max(flips(v).values()) >= 0.05 for v in degraded.values()) and q_prompt_ok}
+
+
 REQUIRED_METRICS = ("move_accuracy", "camera_accuracy", "intent_accuracy")
 CONDITIONS = ("normal", "image_zero", "image_shuffle", "history_zero")
 GROUNDING_SIDES = ("none", "left", "center", "right")
@@ -283,10 +386,11 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
             condition_state = core.initial_condition(features.shape[0], device=device, mode_id=0)
             condition_state.mode_id = model_batch["mode_id"]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                fast_pass = core(features, condition_state,
+                slow_pass = core(features, condition_state,
                                  valid_mask=model_batch["frame_valid_mask"],
                                  visual_frame_features=visual_features,
-                                 history_actions=model_batch["history_actions"], run_slow=False)
+                                 history_actions=model_batch["history_actions"], run_slow=True)
+            fast_pass = slow_pass
             sample_mask = model_batch["fast_loss_mask"] > 0
             # m25 executes a single six-frame macro action before observing a
             # new image.  Gate accuracy must assess exactly that deployed
@@ -398,6 +502,9 @@ def _condition_metrics(adapter: torch.nn.Module, core: SharedFastSlowVLA,
 
 def evaluate_checkpoint(checkpoint: str | Path, args: argparse.Namespace) -> dict[str, Any]:
     """Evaluate one M3_ACT checkpoint under all four dependency conditions."""
+    saved_header = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if saved_header.get("schema") == "m29.state_guided_action.v3":
+        return _evaluate_m29_checkpoint(checkpoint, args)
     device = torch.device(args.device)
     amp_enabled = device.type == "cuda"
     dataset = VLASequenceDataset(_dataset_paths(args.data), verify_images=True,
